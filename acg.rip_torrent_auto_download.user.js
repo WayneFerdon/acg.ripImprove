@@ -5,15 +5,31 @@
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include        *acg.rip*
-// @updateURL https://github.com/WayneFerdon/HVUT/raw/refs/heads/main/acg.rip_auto_download.user.user.js
+// @updateURL https://github.com/WayneFerdon/acg.rip_torrent_auto_download/raw/refs/heads/main/acg.rip_torrent_auto_download.user.user.js
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
 // ==/UserScript==
 
 const tracking = GM_getValue('tracking', [
-  /\[ANi\]( Tsue to Tsurugi no Wistoria \/)* 杖與劍的魔劍譚 Season 2 - /,
+  /\[ANi\]( Kirio Fan( C|c)lub \/)* 霧尾粉絲後援會 - /,
+  '[ANi] 關於我在無意間被隔壁的天使變成廢柴這件事 2 - ',
   '[ANi] 關於我轉生變成史萊姆這檔事 第四季 - ',
+  /\[ANi\]( I Want to End This Love Game \/)* 想結束這場「我愛你」的遊戲 - /,
+  /\[ANi\]( Tsue to Tsurugi no Wistoria \/)* 杖與劍的魔劍譚 Season 2 - /,
+  /\[ANi\]( Marikas Love *Meter Malfunction \/)* 茉莉花同學的好感度壞得很徹底 - /,
+  /\[ANi\]( The Beginning After the End (S02 )*\/)* 終末起點 第(二| 2 )季 - /,
+  /\[ANi\] 木頭風紀委員和迷你裙 JK 的故事 - /,
+  '[ANi] 女神「異世界轉生想成為什麼」我「勇者的肋骨」 - ',
+  '[ANi] 黑貓與魔女的教室 - ',
+  '[ANi] The Food Diary of Miss Maid / 女僕小姐的貪吃日常 - ',
+  '[ANi] 女騎士成為蠻族新娘 - ',
+  '[ANi] Mistress Kanan Is Devilishly Easy / 容易對付的惡魔大人 - ',
+  '[ANi] KILL BLUE / 殺手青春 - ',
+  '[ANi] Pardon the Intrusion Im Home / 我回來了，他又來打擾了！ - ',
+  '[ANi] Ichijyoma Mankitsu Gurashi / 一疊間漫畫咖啡廳日常 - ',
+  '[ANi] Magical Sisters LuluttoLilly / 魔法姊妹露露特莉莉 - ',
+  '【极影字幕·毁片党】灰原的第二轮青春新游戏 ',
 ]);
 
 const $ajax = initAjax();

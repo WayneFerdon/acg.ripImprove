@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      2026.05.15
+// @version      2026.06.03
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include        *acg.rip*
@@ -11,17 +11,24 @@
 // @grant        GM_xmlhttpRequest
 // ==/UserScript==
 
-const tracking = GM_getValue('tracking').map(t => t.match(/^\/.*\/$/) ? new RegExp(t.replace(/^\/|\/$/g, '')) : t);
+const _1s = 1000;
+const _1m = 60 * _1s;
+const _1h = 60 * _1m;
+const _1d = 24 * _1h;
 
+const trackingItems = GM_getValue('tracking') ?? {};
+const tracking = Object.keys(trackingItems).map(t => t.match(/^\/.*\/$/) ? new RegExp(t.replace(/^\/|\/$/g, '')) : t);
 const $ajax = initAjax();
 const colors = { last: 'palegreen', tracking: 'crimson', downloaded: 'rebeccapurple' }
 let last = GM_getValue('last', null);
+let lastDownload = GM_getValue('lastDownload')
 let downloaded = GM_getValue('downloaded', {});
 Object.keys(downloaded).forEach(k => {
   if (tracking.map(t=>t.source ?? t).includes(k)) return;
   delete downloaded[k];
 });
 
+autoReload();
 onHandle();
 new MutationObserver(mutations => mutations.forEach(onHandle)).observe(document.documentElement, { childList: true });
 
@@ -87,6 +94,7 @@ async function asyncDownloadTorrents () {
       console.log('download:', href, title, item, gE('.action>a', item));
       window.open(href + '.torrent');//, '_self');
       (downloaded[found] ??= []).push(href);
+      GM_setValue('lastDownload', found);
     });
   }
 
@@ -96,7 +104,48 @@ async function asyncDownloadTorrents () {
   }
   GM_setValue('downloaded', downloaded);
   onHandleItems(setDisplayHighlight);
+}
 
+async function autoReload() {
+  const date = new Date();
+  let [d,h,m,s] = [date.getDay(), date.getHours(), date.getMinutes(), date.getSeconds()];
+  const current = (((d*24+h)*60+m)*60+s)*_1s;
+  let min = Infinity;
+  let mini = undefined;
+  const index = gE('.post-index');
+  const parent = index.parentNode;
+  const display = cE('span');
+  parent.insertBefore(display, index);
+
+  for (const item in trackingItems) {
+    let time = trackingItems[item];
+    if (!time) continue;
+    if (lastDownload === item) continue;
+    time = Math.floor(time/10000)*24*_1h+Math.floor((time/100)%100)*_1h+time%100*_1m;
+    const passed = current-time;
+    if (passed >= 30*_1m) continue;
+    if (passed < 0) {
+      min = Math.min(-passed, min);
+      mini = min === -passed ? item : mini;
+      continue;
+    }
+    display.style.color='red';
+    min = passed;
+    mini = item;
+    break;
+  };
+
+  let remain, waited = 0;
+  while ((remain=(min-waited)) > 0 && waited < _1h) {
+    display.innerText = `\n ${pad2(Math.floor(remain/_1h),' ')}:${pad2(Math.floor(remain%_1h/_1m))}:${pad2(Math.floor(remain%_1m/_1s))} ${mini}`;
+    waited+=_1s;
+    await pauseAsync(_1s);
+  }
+  window.location = window.location.href;
+}
+
+function pad2(num, pad='0') {
+  return num.toString().padStart(2, pad);
 }
 
 function onHandleItems(method, doc) {
@@ -116,6 +165,9 @@ function $doc(h) {
   const doc = document.implementation.createHTMLDocument('');
   doc.documentElement.innerHTML = h;
   return doc;
+}
+function cE(name) { // 创建元素
+  return document.createElement(name);
 }
 function gE(ele, mode, parent) { // 获取元素
   if (typeof ele === 'object') {

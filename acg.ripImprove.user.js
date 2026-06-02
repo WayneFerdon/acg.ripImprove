@@ -137,7 +137,9 @@ async function autoReload() {
 
   let remain, waited = 0;
   while ((remain=(min-waited)) > 0 && waited < _1h) {
-    display.innerText = `\n ${pad2(Math.floor(remain/_1h),' ')}:${pad2(Math.floor(remain%_1h/_1m))}:${pad2(Math.floor(remain%_1m/_1s))} ${mini}`;
+    const time = `${pad2(Math.floor(remain/_1h),' ')}:${pad2(Math.floor(remain%_1h/_1m))}:${pad2(Math.floor(remain%_1m/_1s))}`;
+    document.title = time;
+    display.innerText = `\n ${time} ${mini}`;
     waited+=_1s;
     await pauseAsync(_1s);
   }

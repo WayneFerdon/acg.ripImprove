@@ -117,9 +117,10 @@ async function autoReload() {
   const display = cE('span');
   parent.insertBefore(display, index);
 
-  for (const item in trackingItems) {
+  for (let item in trackingItems) {
     let time = trackingItems[item];
     if (!time) continue;
+    item = item.match(/^\/.*\/$/) ? item.replace(/^\/|\/$/g, '') : item;
     if (lastDownload === item) continue;
     time = Math.floor(time/10000)*24*_1h+Math.floor((time/100)%100)*_1h+time%100*_1m;
     const passed = current-time;

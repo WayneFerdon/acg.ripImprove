@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      2026.06.03
+// @version      2026.06.04
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include        *acg.rip*
@@ -22,7 +22,7 @@ const $ajax = initAjax();
 const colors = { last: 'palegreen', tracking: 'crimson', downloaded: 'rebeccapurple' }
 let last = GM_getValue('last', null);
 let lastDownload = GM_getValue('lastDownload')
-let downloaded = GM_getValue('downloaded', {});
+let downloaded = GM_getValue('trackingDownloaded', );
 Object.keys(downloaded).forEach(k => {
   if (tracking.map(t=>t.source ?? t).includes(k)) return;
   delete downloaded[k];
@@ -102,7 +102,7 @@ async function asyncDownloadTorrents () {
   if (url2num(newLast) > url2num(last)) {
     GM_setValue('last', newLast);
   }
-  GM_setValue('downloaded', downloaded);
+  GM_setValue('trackingDownloaded', downloaded);
   onHandleItems(setDisplayHighlight);
 }
 

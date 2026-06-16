@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      2026.06.12
+// @version      2026.06.16
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include        *acg.rip*
@@ -17,6 +17,16 @@ const _1m = 60 * _1s;
 const _1h = 60 * _1m;
 const _1d = 24 * _1h;
 const colors = { last: 'palegreen', tracking: 'crimson', downloaded: 'rebeccapurple' }
+const timeOpt = {
+  timeZone: "Asia/Shanghai",
+  year: "numeric",
+  month: "2-digit",
+  day: "2-digit",
+  hour: "2-digit",
+  minute: "2-digit",
+  second: "2-digit",
+  hour12: false
+};
 const $ajax = initAjax();
 let trackingItems, tracking, downloaded, last, lastDownload;
 
@@ -42,17 +52,8 @@ function onHandle() {
 function setTimeHover() {
   for (const timeObj of gE('time', 'all')) {
     if (gE('.local', timeObj)) continue;
-    const opt = {
-      timeZone: "Asia/Shanghai",
-      year: "numeric",
-      month: "2-digit",
-      day: "2-digit",
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-      hour12: false
-    };
     const gap = timeObj.innerHTML.match(`(分)|(时)|(天)|(月)|(年)`)?.reverse().findIndex(x=>x);
+    let opt = JSON.parse(JSON.stringify(timeOpt));
     if (gap >= 3) opt.day = undefined;
     if (gap >= 2) opt.month = undefined;
     if (gap >= 1) opt.year = undefined;
@@ -119,11 +120,14 @@ async function autoReload() {
   })();
 
   let remain, waited = 0, miniPrev=mini, minPrev=min;
+  let opt = JSON.parse(JSON.stringify(timeOpt));
+  [opt.year, opt.month, opt.day]=[];
+  const start = (new Date()).toLocaleString("zh-CN", opt);
   while ((remain=(minPrev-waited)) > 0) {
     if (mini !== miniPrev) [minPrev, miniPrev, waited] = [min, mini, 0];
     const time = `${pad(Math.floor(remain/_1h),' ')}:${pad(Math.floor(remain%_1h/_1m))}:${pad(Math.floor(remain%_1m/_1s))}`;
     document.title = time;
-    display.innerText = `\n ${time} ${mini}`;
+    display.innerText = `\n@${start}\n${time} ${mini}`;
     waited += _1s;
     await pauseAsync(_1s);
   }

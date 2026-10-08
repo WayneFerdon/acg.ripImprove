@@ -4567,20 +4567,16 @@ function showEditDialog() {
   });
   dialog.querySelector('#openBgmBtn').addEventListener('click', () => {
     const rows = getSelectedRows(); if (!rows.length) { showToast('请先选择行'); return; }
-    let opened = 0;
+    let opened = 0, skipped = 0;
     for (const tr of rows) {
       const row = tr._row;
       const bgmId = getBgmIdFromBGMID(row.BGMID);
-      let url = '';
-      if (bgmId) url = `https://bangumi.tv/subject/${bgmId}`;
-      else {
-        const res = expandResourceUrl(String(row.资源 ?? '').trim(), row);
-        const rule = expandResourceUrl(String(row.规则 ?? '').trim(), row);
-        if (isHttpUrl(res)) url = res; else if (isHttpUrl(rule)) url = rule;
-      }
-      if (url) { window.open(url, '_blank', 'noopener'); opened++; }
+      if (!bgmId) { skipped++; continue; }
+      window.open(`https://bangumi.tv/subject/${bgmId}`, '_blank', 'noopener');
+      opened++;
     }
-    if (!opened) showToast('无BGM链接');
+    if (!opened) showToast(skipped ? `无BGM链接（跳过 ${skipped} 行）` : '无BGM链接');
+    else if (skipped) showToast(`已打开 ${opened} 条${skipped ? `，跳过 ${skipped} 条` : ''}`);
   });
   dialog.querySelector('#openBgmIdLinkBtn').addEventListener('click', () => {
     const rows = getSelectedRows(); if (!rows.length) { showToast('请先选择行'); return; }

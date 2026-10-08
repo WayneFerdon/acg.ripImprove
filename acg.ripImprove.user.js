@@ -27,6 +27,7 @@ const WEEKDAY_LABEL = ['日七', '月一', '火二', '水三', '木四', '金五
 const KANJI_MONTH = { 1: '一', 4: '四', 7: '七', 10: '十' };
 const UPDATED_KEY = 'updated', LAST_KEY = 'last', BANGUMI_INTERVAL = 24 * 3600 * 1000;
 const DRAFT_KEY = 'acgrip_draft_edit';
+const IS_ACGRIP_PAGE = /acg\.rip/i.test(location.hostname);
 
 let trackingItems = {}, tracking = [], downloaded = {};
 let last, lastDownload, lastViewed;
@@ -45,8 +46,9 @@ const PANEL_OPEN_KEY = 'acgrip_panel_open';
 const $ajax = initAjax();
 onHandle();
 new MutationObserver(muts => muts.forEach(onHandle)).observe(document.documentElement, { childList: true });
-/* 页面加载后恢复上次的面板打开状态 */
+/* 页面加载后恢复上次的面板打开状态（仅 acg.rip 页面；其他页面只能通过按钮打开） */
 (function restorePanelOpenState() {
+  if (!IS_ACGRIP_PAGE) return;
   const tryRestore = () => {
     try {
       if (localStorage.getItem(PANEL_OPEN_KEY) === '1') {
@@ -60,6 +62,38 @@ new MutationObserver(muts => muts.forEach(onHandle)).observe(document.documentEl
     setTimeout(tryRestore, 400);
   } else {
     window.addEventListener('DOMContentLoaded', () => setTimeout(tryRestore, 400), { once: true });
+  }
+})();
+/* ---- 非 acg.rip 页面：注入打开编辑面板的按钮（Esc 不触发打开，仅面板内 Esc 可关闭） ---- */
+(function setupExternalPanelButton() {
+  if (IS_ACGRIP_PAGE) return;
+  const mount = () => {
+    if (!document.body || document.getElementById('acgrip-open-editor-btn')) return;
+    const btn = cE('button');
+    btn.id = 'acgrip-open-editor-btn';
+    btn.type = 'button';
+    btn.textContent = '⚙ 编辑数据';
+    btn.title = '打开 acg.ripImprove 数据编辑面板';
+    btn.style.cssText = [
+      'position:fixed', 'right:14px', 'bottom:14px', 'z-index:9998',
+      'background:#2d2d2d', 'color:#d4d4d4', 'border:1px solid #555',
+      'border-radius:6px', 'padding:6px 12px', 'font-size:13px',
+      'line-height:1.4', 'font-family:system-ui,sans-serif',
+      'cursor:pointer', 'box-shadow:0 2px 10px rgba(0,0,0,0.45)',
+      'opacity:.85', 'transition:opacity .15s'
+    ].join(';');
+    btn.addEventListener('mouseenter', () => { btn.style.opacity = '1'; });
+    btn.addEventListener('mouseleave', () => { btn.style.opacity = '.85'; });
+    btn.addEventListener('click', (e) => {
+      e.preventDefault(); e.stopPropagation();
+      showEditDialog();
+    });
+    document.body.appendChild(btn);
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', mount, { once: true });
+  } else {
+    mount();
   }
 })();
 /* 并排判定 + 浮标位置刷新（窗口变化时统一处理） */
@@ -88,9 +122,10 @@ function handleGlobalResize() {
 }
 window.addEventListener('resize', handleGlobalResize);
 
-/* 界面关闭时按 Esc：打开编辑界面 */
+/* 界面关闭时按 Esc：打开编辑界面（仅 acg.rip 页面） */
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
+  if (!IS_ACGRIP_PAGE) return;   // ★ 其他页面 Esc 不打开，只能靠按钮
   // 界面已打开 → 由内部 handler 处理
   if (_gmEditOverlay && _gmEditOverlay.style.display !== 'none') return;
   // 导入子窗口已打开 → 由内部处理
@@ -4810,7 +4845,9 @@ function showEditDialog() {
         tr._originalValues = snapshotRowValues(tr._row);
         refreshTempEditedMark(tr);
       }
-      if (newRuleKeys.size && lastViewed) setTimeout(() => { downloadSince(lastViewed, newRuleKeys).catch(err => console.error(err)); }, 100);
+      if (IS_ACGRIP_PAGE && newRuleKeys.size && lastViewed) {
+        setTimeout(() => { downloadSince(lastViewed, newRuleKeys).catch(err => console.error(err)); }, 100);
+      }
     } catch (err) { alert('数据错误，请检查：' + err.message); }
   });
 

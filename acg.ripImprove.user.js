@@ -1,16 +1,22 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include      *acg.rip*
 // @match        https://bangumi.tv/subject/*
 // @match        https://bgm.tv/subject/*
+// @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.user.js
+// @updateURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.user.js
 // @connect      bangumi.tv
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_xmlhttpRequest
+// @grant        GM_openInTab
+// @grant        GM_registerMenuCommand
+// @grant        GM_addValueChangeListener
+// @grant        unsafeWindow
 // ==/UserScript==
 
 const _1s = 1000, _1m = 60 * _1s, _1h = 60 * _1m, _1d = 24 * _1h;
@@ -260,6 +266,36 @@ function loadDatas() {
     lastViewed = idToHref(lastData.viewed);
   } else { last = lastDownload = lastViewed = undefined; }
 }
+/** 从 bangumiData.delay 里查延周（不依赖面板 DOM，可在无 UI 环境调用） */
+function lookupDelayFromData(row, parsed, delayData) {
+  const keys = [
+    String(effective(row, '中文', parsed) || '').trim(),
+    String(effective(row, '名称', parsed) || '').trim(),
+  ].filter(Boolean);
+  if (!keys.length || !delayData || !Array.isArray(delayData.rows)) {
+    return { total: 0, matched: false };
+  }
+  const currentEP = Number(row.下集) || 0;
+  let total = 0, matched = false;
+  for (const dr of delayData.rows) {
+    const name = String(dr.名称 || '').trim();
+    const exclude = String(dr.排除 || '').trim();
+    if (!name || !keys.includes(name) || exclude) continue;
+    matched = true;
+    const episodes = Array.isArray(dr.episodes) ? dr.episodes : [];
+    const weeks = Array.isArray(dr.weeks) ? dr.weeks : [];
+    for (let i = 0; i < episodes.length; i++) {
+      const ep = Number(episodes[i]);
+      if (!Number.isFinite(ep) || ep <= 0) continue;
+      if (currentEP >= ep) {
+        const wkRaw = weeks[i];
+        const wk = (wkRaw === '' || wkRaw == null) ? 1 : Number(wkRaw);
+        if (Number.isFinite(wk)) total += wk;
+      }
+    }
+  }
+  return { total, matched };
+}
 function saveBangumiData() {
   const bd = getValue('bangumiData') ?? { rows: [], delay: { rows: [] } };
   if (!Array.isArray(bd.rows)) bd.rows = [];
@@ -273,6 +309,18 @@ function saveBangumiData() {
     if (list) row.已下载 = parseDownloadedToList(list);
   }
   for (const row of bd.rows) cleanRowObject(row);
+  // ★ 新增：为每行预计算播出时间戳，供外部脚本复用
+  const delayData = (bd.delay && Array.isArray(bd.delay.rows)) ? bd.delay : { rows: [] };
+  for (const row of bd.rows) {
+    try {
+      const parsed = parseBGMID(row.BGMID);
+      const delayGetter = (r, p) => lookupDelayFromData(r, p, delayData);
+      const air = getAirDate(row, parsed, delayGetter);
+      row._airDate = air ? air.getTime() : 0;
+    } catch (e) {
+      row._airDate = 0;
+    }
+  }
   setValue('bangumiData', bd);
 }
 
@@ -291,7 +339,25 @@ function onHandle() {
     autoUpdateFromBangumi().catch(e => console.error(e));
     autoUpdateQuarter().catch(e => console.error(e));
     asyncDownloadTorrents();
+    precomputeAirDatesGlobal();
   }
+}
+
+function precomputeAirDatesGlobal() {
+  try {
+    const bd = getValue('bangumiData');
+    if (!bd || !Array.isArray(bd.rows)) return;
+    const delayData = (bd.delay && Array.isArray(bd.delay.rows)) ? bd.delay : { rows: [] };
+    let changed = false;
+    for (const row of bd.rows) {
+      const parsed = parseBGMID(row.BGMID);
+      const delayGetter = (r, p) => lookupDelayFromData(r, p, delayData);
+      const air = getAirDate(row, parsed, delayGetter);
+      const newTs = air ? air.getTime() : 0;
+      if (row._airDate !== newTs) { row._airDate = newTs; changed = true; }
+    }
+    if (changed) setValue('bangumiData', bd);
+  } catch (e) { /* ignore */ }
 }
 
 /* ---- 悬浮显示 ---- */
@@ -374,7 +440,7 @@ function createViewedButton() {
 function updateViewedButton(btn) {
   btn = btn ?? document.getElementById('acgrip-view-button');
   if (!btn) return;
-  btn.textContent = lastViewed ? `标记已查看（至 ${url2num(lastViewed)}）` : '标记已查看';
+  btn.textContent = '标记已查看';
 }
 
 /* ---- 时间悬浮 ---- */
@@ -1866,29 +1932,30 @@ function showEditDialog() {
   Alt+点击链接：选中该行而非打开链接
   Backspace / Delete（非编辑态）：清空该格
   Shift+方向键（非编辑态）：扩展行选择
-">ⓘ</span></h2>
+">ⓘ</span>
     <div style="display:flex;gap:6px;flex-wrap:wrap;">
       <button type="submit">保存</button>
       <button type="button" id="gmEditCancel">关闭</button>
       <button type="button" id="discardChangesBtn" style="color:#e88;">放弃更改</button>
-      <button type="button" id="addUnifiedRow">+ 添加番組</button>
-      <button type="button" id="importTableBtn">从表格导入</button>
-      <button type="button" id="openResourceBtn">打开资源</button>
-      <button type="button" id="openBgmBtn">打开BGM</button>
-      <button type="button" id="openBgmIdLinkBtn">打开链接</button>
-      <button type="button" id="deleteSelectedBtn" style="color:#e88;">删除选中</button>
-      <button type="button" id="resetBangumiUpdate">重置Bangumi计时</button>
-      <button type="button" id="resetInferredTimes">重置调度匹配</button>
-      <button type="button" id="openAiredResourceBtn" title="打开所有播出时间已过、且有资源链接的条目">打开已播出资源</button>
-    </div>
-<div id="unifiedTableHost" style="margin-top:6px;max-height:calc(100vh - 160px);overflow:auto;border:1px solid #333;background:#1a1a1a;padding-right:4px;"></div>
+      <button type="button" id="addUnifiedRow">+ 添加</button>
+      <button type="button" id="importTableBtn">导入</button>
+      <button type="button" id="openResourceBtn">资源</button>
+      <button type="button" id="openBgmBtn">BGM</button>
+      <button type="button" id="openBgmIdLinkBtn">链接</button>
+      <button type="button" id="deleteSelectedBtn" style="color:#e88;">删除</button>
+      <button type="button" id="resetBangumiUpdate" title="重置从Bangumi更新的计时">重置更新</button>
+      <button type="button" id="resetInferredTimes" title="重置调度匹配计时">重置匹配</button>
+      <button type="button" id="openAiredResourceBtn" title="打开所有播出时间已过、且有资源链接的条目">已播出</button>
+    </div></h2>
+    <div id="unifiedTableHost" style="margin-top:6px;max-height:calc(100vh - 160px);overflow:auto;border:1px solid #333;background:#1a1a1a;padding-right:4px;"></div>
     <div style="margin-top:10px;border:1px solid #3a3a3a;border-radius:4px;padding:6px 8px;background:#242424;">
       <div style="margin-bottom:10px;padding-bottom:8px;border-bottom:1px dashed #3a3a3a;">
         <label><strong>延周计算</strong>：</label>
-        <div class="hint" style="margin:2px 0 4px 0;">奇数行为需要延时的集数，偶数行为对应的周数（默认 1）。名称匹配表格“名称”列。</div>
+        <span class="hint" style="margin:2px 0 4px 0;">奇数行为需要延时的集数，偶数行为对应的周数（默认 1）。名称匹配表格"名称"列。</span>
         <div id="delayTableHost" style="overflow:auto;border:1px solid #3a3a3a;background:#1a1a1a;"></div>
         <button type="button" id="addDelayRow" style="margin-top:4px;">+ 添加延周行</button>
       </div>
+
       <div id="lastTableHost">
         <table>
           <thead><tr>
@@ -2911,15 +2978,19 @@ function showEditDialog() {
     const ctxCopy = (e) => {
       const el = e.target.closest('input, textarea, .u-bgmid, [contenteditable]');
       if (!el) return;
-      let text = '';
+      let text = '', isDefault = false;
       if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
-        text = el.value === '' ? (el.placeholder || '') : '';
+        if (el.value !== '') text = el.value;
+        else if (el.placeholder) { text = el.placeholder; isDefault = true; }
       } else if (el.isContentEditable || el.classList.contains('u-bgmid')) {
-        text = (el.textContent || '').trim() === '' ? (el.placeholder || '') : '';
+        const content = (el.textContent || '').trim();
+        if (content !== '') text = content;
+        else if (el.placeholder) { text = el.placeholder; isDefault = true; }
       }
       if (!text) return;
       e.preventDefault();
-      navigator.clipboard.writeText(text).then(() => showToast('已复制默认值: ' + text))
+      navigator.clipboard.writeText(text)
+      .then(() => showToast((isDefault ? '已复制默认值: ' : '已复制: ') + text))
       .catch(() => showToast('复制失败'));
     };
     host.addEventListener('contextmenu', ctxCopy);
@@ -3191,7 +3262,6 @@ function showEditDialog() {
           ttr.classList.add('row-selected');
         }
         updateSelectionBorders();
-        shiftAnchorTr = null; shiftFocusIdx = -1;
 
         const targetCanEdit = !target.isDisplayOnly;
         if (wasEditing && targetCanEdit) {
@@ -3387,7 +3457,6 @@ function showEditDialog() {
             clearRowSelection();
             tr.classList.add('row-selected');
             selAnchorTr = tr;
-            shiftAnchorTr = null; shiftFocusIdx = -1;
             updateSelectionBorders();
             const firstCell = getRowCells(tr)[0];
             if (firstCell && firstCell.host && firstCell.host.focus) try { firstCell.host.focus(); } catch {}
@@ -3420,7 +3489,6 @@ function showEditDialog() {
             clearRowSelection();
             tr.classList.add('row-selected');
             selAnchorTr = tr;
-            shiftAnchorTr = null; shiftFocusIdx = -1;
             updateSelectionBorders();
             const firstCell = getRowCells(tr)[0];
             if (firstCell && firstCell.host && firstCell.host.focus) try { firstCell.host.focus(); } catch {}
@@ -4706,6 +4774,7 @@ function showEditDialog() {
       refreshLastEditedMark();
       loadDatas();
       onHandleItems(setDisplayHighlight);
+      try { window.dispatchEvent(new CustomEvent('acgrip-bangumi-saved')); } catch {}
       const newRuleKeys = new Set(Object.keys(collectTrackingFromRows(newRows)).filter(k => !oldTrackingKeys.has(k)));
 
       // 删除 UI 上所有空行（保留最后一个作为输入位，由 ensureTrailingEmpty 补）
@@ -5061,4 +5130,28 @@ function initAjax() {
   };
   window.addEventListener('unhandledrejection', (e) => { console.error($ajax.error, e); });
   return $ajax;
+}
+
+/* =====================================================================
+ *  供 其他脚本在acg.rip调用
+ *  暴露面保持最小：只读 bangumiData、刷新 _airDate、通用 GM 存取
+ * ===================================================================== */
+if (/^acg\.rip$/i.test(location.hostname)) {
+  unsafeWindow.acgripApi = {
+    version: '1.2',
+
+    /** 读取 bangumiData（含原脚本已写入的 _airDate 字段） */
+    getBangumiData: () => getValue('bangumiData'),
+
+    /** 刷新 _airDate 后返回最新 bangumiData（幂等） */
+    refreshAirDates: () => {
+      try { precomputeAirDatesGlobal(); } catch (e) { console.error('[acgripApi] refreshAirDates:', e); }
+      return getValue('bangumiData');
+    },
+
+    /** 通用存取：桥接可读写自己的 GM 键，无需引入 GM_* 权限 */
+    getValue,
+    setValue,
+  };
+  console.log('[acgripApi] 已暴露 v1.2');
 }

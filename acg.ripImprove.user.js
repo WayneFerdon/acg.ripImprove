@@ -3059,6 +3059,18 @@ function showEditDialog() {
     const editing = cell._editing;
     const tr = cell.tr;
     const isDisplayOnly = !!cell.isDisplayOnly;
+    // Ctrl+A / Cmd+A（非编辑态）：选中表格内全部行
+    if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (key === 'a' || key === 'A') && !editing) {
+      e.preventDefault(); e.stopPropagation();
+      const allTrs = getMainTrs();
+      if (allTrs.length) {
+        for (const t of allTrs) t.classList.add('row-selected');
+        // 当前行作为锚点，方便之后 Shift+方向键继续扩展
+        selAnchorTr = tr;
+        updateSelectionBorders();
+      }
+      return;
+    }
     // Ctrl+Shift+方向键：按内容跳格到目标行，区间选中（anchor → 目标）
     if (e.ctrlKey && e.shiftKey && !e.altKey && !editing && ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(key)) {
       e.preventDefault(); e.stopPropagation();

@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.0
+// @version      1.1
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include      *acg.rip*
+// @match        https://bangumi.tv/subject/*
+// @match        https://bgm.tv/subject/*
 // @connect      bangumi.tv
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -18,6 +20,7 @@ const url2num = url => 1 * `${url ?? ''}`.replace('/t/', '');
 const WEEKDAY_LABEL = ['日七', '月一', '火二', '水三', '木四', '金五', '土六'];
 const KANJI_MONTH = { 1: '一', 4: '四', 7: '七', 10: '十' };
 const UPDATED_KEY = 'updated', LAST_KEY = 'last', BANGUMI_INTERVAL = 24 * 3600 * 1000;
+const DRAFT_KEY = 'acgrip_draft_edit';
 
 let trackingItems = {}, tracking = [], downloaded = {};
 let last, lastDownload, lastViewed;
@@ -25,18 +28,34 @@ let inferredTimes = {}, display, downloadInProgress = false;
 let _gmEditOverlay = null, _gmEditShow = null, _gmEditHide = null;
 let inferredTimesCache = {}, _inferredCacheLoaded = false, _inferScannedThisSession = false;
 let inferenceStatus = { phase: 'idle', pending: 0, found: 0, page: 0, message: '', scanning: false };
-
 const IMPORT_HEADER_ALIASES = {
   '下集':'下集','中文':'中文','名称':'名称','年':'年','开播':'开播','放送':'放送','最大':'最大',
   '初始':'初始','前季':'前季','更新':'更新','BGMID':'BGMID','资源':'资源','规则':'规则',
   '延周':'延周','延日':'延日','已下载':'已下载','记录':'已下载',
 };
 let _gmEditRelayout = null;
+const PANEL_OPEN_KEY = 'acgrip_panel_open';
 
 const $ajax = initAjax();
 onHandle();
 new MutationObserver(muts => muts.forEach(onHandle)).observe(document.documentElement, { childList: true });
-
+/* 页面加载后恢复上次的面板打开状态 */
+(function restorePanelOpenState() {
+  const tryRestore = () => {
+    try {
+      if (localStorage.getItem(PANEL_OPEN_KEY) === '1') {
+        showEditDialog();
+      }
+    } catch (e) {
+      console.error('[restorePanelOpenState]', e);
+    }
+  };
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    setTimeout(tryRestore, 400);
+  } else {
+    window.addEventListener('DOMContentLoaded', () => setTimeout(tryRestore, 400), { once: true });
+  }
+})();
 /* 并排判定 + 浮标位置刷新（窗口变化时统一处理） */
 let _globalResizeTimer = null;
 function handleGlobalResize() {
@@ -95,6 +114,12 @@ function saveLastData() {
   const idVal = (last != null && !Number.isNaN(url2num(last))) ? url2num(last) : '';
   const viewedVal = (lastViewed != null && !Number.isNaN(url2num(lastViewed))) ? url2num(lastViewed) : '';
   setValue(LAST_KEY, { id: idVal, match: lastDownload ?? '', viewed: viewedVal });
+
+  // 面板打开时同步 last 三个输入框（未手动修改的字段）
+  if (_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none'
+      && typeof _gmEditOverlay._refreshLastInputs === 'function') {
+    _gmEditOverlay._refreshLastInputs();
+  }
 }
 function idToHref(v) {
   if (v == null || v === '') return undefined;
@@ -257,6 +282,11 @@ function onHandle() {
   try { autoReload().catch(e => console.error('autoReload error:', e)); } catch (e) { console.error(e); }
   onHandleItems(setDisplayHighlight);
   setTimeHover();
+  // Bangumi 条目详情页：更新对应行
+  if (/^https?:\/\/(bangumi\.tv|bgm\.tv)\/subject\/\d+/.test(window.location.href)) {
+    updateFromBangumiSubjectPage().catch(e => console.error('[SubjectPage] error:', e));
+    return;
+  }
   if (window.location.href.replace('page/1', '').endsWith('.rip/')) {
     autoUpdateFromBangumi().catch(e => console.error(e));
     autoUpdateQuarter().catch(e => console.error(e));
@@ -407,7 +437,10 @@ document.addEventListener('click', function (e) {
     lastDownload = found;
     saveLastData();
   }
-  if (found) syncNextEpisode(key, title);
+  if (found) {
+    console.log('[手动下载] 尝试同步下集', { key, title });
+    syncNextEpisode(key, title);
+  }
   if (key && !trackingItems[key]) {
     const timeEl = item.querySelector('time');
     if (timeEl) {
@@ -452,7 +485,10 @@ async function asyncDownloadTorrents() {
         list.push(href); saveBangumiData();
         if (url2num(href) <= url2num(latest)) return;
         latest = href; lastDownload = found; saveLastData();
-        if (found) syncNextEpisode(key, title);
+        if (found) {
+          console.log('[自动下载] 尝试同步下集', { key, title });
+          syncNextEpisode(key, title);
+        }
         if (key && !trackingItems[key]) {
           const timeEl = item.querySelector('time');
           if (timeEl) {
@@ -504,7 +540,10 @@ async function downloadSince(sinceUrl, onlyRules = null) {
       if (!list) { list = []; downloaded[found] = list; }
       list.push(href); saveBangumiData();
       lastDownload = found; saveLastData();
-      if (found) syncNextEpisode(key, title);
+      if (found) {
+        console.log('[downloadSince] 尝试同步下集', { key, title });
+        syncNextEpisode(key, title);
+      }
       if (key && !trackingItems[key]) {
         const timeEl = item.querySelector('time');
         if (timeEl) {
@@ -957,19 +996,82 @@ async function buildInferredTimes() {
   return { ...inferredTimesCache };
 }
 function syncNextEpisode(key, title) {
-  if (!key || !key.startsWith('/') || !key.endsWith('/') || key.length < 3) return false;
+  if (!key) { console.log('[syncNextEpisode] 空 key'); return false; }
   try {
-    const m = title.match(new RegExp(key.slice(1, -1)));
-    if (!m || m[1] == null) return false;
-    const ep = parseInt(m[1], 10);
-    if (!Number.isFinite(ep)) return false;
-    const bd = getValue('bangumiData') ?? { rows: [] };
-    if (!Array.isArray(bd.rows)) return false;
-    let changed = false;
-    for (const r of bd.rows) if ((r.规则 || '').trim() === key && Number(r.下集) !== Number(ep)) { r.下集 = String(ep); changed = true; }
-    if (changed) setValue('bangumiData', bd);
-    return changed;
-  } catch { return false; }
+    if (!(key.startsWith('/') && key.endsWith('/') && key.length >= 3)) {
+      console.log('[syncNextEpisode] 非正则规则，跳过', { key });
+      return false;
+    }
+    const ep = extractEpisodeFromRule(key, title);
+    if (ep == null) {
+      console.log('[syncNextEpisode] 未能从标题提取集数', { key, title });
+      return false;
+    }
+
+    let newNextValue = null;
+    let hitInfo = null;
+
+    const bd = getValue('bangumiData');
+    if (bd && Array.isArray(bd.rows)) {
+      for (const r of bd.rows) {
+        if ((r.规则 || '').trim() !== key) continue;
+
+        const curNext = Number(r.下集) || 0;
+        const total = getTotalEpisodes(r);
+        const hitNext = (ep === curNext);
+        const hitTotal = (total > 0 && ep === total);
+
+        hitInfo = { key, ep, curNext, total, hitNext, hitTotal };
+        console.log('[syncNextEpisode] 检查', hitInfo);
+
+        if (hitNext || hitTotal) {
+          newNextValue = curNext + 1;
+          r.下集 = String(newNextValue);
+          setValue('bangumiData', bd);
+          console.log('[syncNextEpisode] 存储已更新', { key, old: curNext, new: newNextValue });
+        } else {
+          console.log('[syncNextEpisode] 未命中（ep≠下集 且 ep≠总集），不改', hitInfo);
+        }
+        break;
+      }
+    }
+
+    if (newNextValue == null) return false;
+
+    // 同步面板（如果打开）
+    if (_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none'
+        && typeof _gmEditOverlay._syncRowUpdate === 'function') {
+      _gmEditOverlay._syncRowUpdate(key, newNextValue);
+    }
+
+    // 同步草稿（如果存在），避免下次打开面板读到旧值
+    try {
+      const draftRaw = localStorage.getItem(DRAFT_KEY);
+      if (draftRaw) {
+        const draft = JSON.parse(draftRaw);
+        if (draft && Array.isArray(draft.rows)) {
+          let draftChanged = false;
+          for (const r of draft.rows) {
+            if ((r.规则 || '').trim() === key && String(r.下集 || '') !== String(newNextValue)) {
+              r.下集 = String(newNextValue);
+              draftChanged = true;
+              break;
+            }
+          }
+          if (draftChanged) {
+            draft.ts = Date.now();
+            localStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+            console.log('[syncNextEpisode] 草稿已同步', { key, new: newNextValue });
+          }
+        }
+      }
+    } catch {}
+
+    return true;
+  } catch (e) {
+    console.error('[syncNextEpisode] 出错', e, { key, title });
+    return false;
+  }
 }
 
 /* ---- 更新节奏 / 播出时间 ---- */
@@ -1063,24 +1165,54 @@ function computeAirTimeText(row, parsed, delayGetter) {
   const displayH = hh < 4 ? hh + 24 : hh;
   return `${base} ${pad(displayH)}:${pad(mm)}`;
 }
-function getBgByDate(airDate) {
-  if (!airDate) return '#2a2a2a';
+const BG_LEVELS = [
+  '#000000', // -1: 空值专用（= 标题栏纯黑），仅由 getBgByLevel(-1) 触发
+  '#121212', // 0: 今天 4:00 之前
+  '#1e1e1e', // 1: 今日已播出
+  '#2a2a2a', // 2: 今日稍后
+  '#363636', // 3: 明天
+  '#424242', // 4: 后天
+  '#4e4e4e', // 5: +3
+  '#5a5a5a', // 6: +4
+  '#666666', // 7: +5
+  '#727272', // 8: +6
+  '#7e7e7e', // 9: 7 天以后 / 未定
+];
+
+// 空值格的"上一时间段"下限允许到 -1（纯黑）
+const BG_EMPTY_MIN_LEVEL = -1;
+
+function getBgLevel(airDate) {
+  if (!airDate) return 9;
   const now = new Date();
   const today4 = new Date(now); today4.setHours(4, 0, 0, 0);
   if (now < today4) today4.setDate(today4.getDate() - 1);
-  const nowMs = now.getTime(), today4Ms = today4.getTime(), tomorrow4Ms = today4Ms + 86400000;
+  const nowMs = now.getTime();
+  const today4Ms = today4.getTime();
+  const tomorrow4Ms = today4Ms + 86400000;
   const t = airDate.getTime();
-  if (t < today4Ms) return '#3a3a3a';
-  if (t < nowMs) return '#1a1a1a';
-  if (t < tomorrow4Ms) return '#141414';
-  if (t < tomorrow4Ms + 1 * 86400000) return '#1e1e1e';
-  if (t < tomorrow4Ms + 2 * 86400000) return '#222222';
-  if (t < tomorrow4Ms + 3 * 86400000) return '#262626';
-  if (t < tomorrow4Ms + 4 * 86400000) return '#2a2a2a';
-  if (t < tomorrow4Ms + 5 * 86400000) return '#2e2e2e';
-  if (t < tomorrow4Ms + 6 * 86400000) return '#323232';
-  if (t < tomorrow4Ms + 7 * 86400000) return '#363636';
-  return '#3a3a3a';
+  if (t < today4Ms) return 0;
+  if (t < nowMs) return 1;
+  if (t < tomorrow4Ms) return 2;
+  if (t < tomorrow4Ms + 1 * 86400000) return 3;
+  if (t < tomorrow4Ms + 2 * 86400000) return 4;
+  if (t < tomorrow4Ms + 3 * 86400000) return 5;
+  if (t < tomorrow4Ms + 4 * 86400000) return 6;
+  if (t < tomorrow4Ms + 5 * 86400000) return 7;
+  if (t < tomorrow4Ms + 6 * 86400000) return 8;
+  return 9;
+}
+
+function getBgByLevel(level, allowNegative) {
+  const minLevel = allowNegative ? -1 : 0;
+  if (level < minLevel) level = minLevel;
+  if (level > 9) level = 9;
+  // BG_LEVELS 索引 = level + 1（因为多了 -1 项）
+  return BG_LEVELS[level + 1];
+}
+
+function getBgByDate(airDate) {
+  return getBgByLevel(getBgLevel(airDate), false);
 }
 function darkerColor(hex) {
   if (!hex) return hex;
@@ -1292,7 +1424,38 @@ async function autoUpdateQuarter() {
   }
   if (changed) setValue('bangumiData', bd);
 }
+async function updateFromBangumiSubjectPage() {
+  const m = window.location.href.match(/\/subject\/(\d+)/);
+  if (!m) return;
+  const subjectId = m[1];
 
+  // 复用已有的解析器：从当前页面 HTML 提取最新信息
+  const info = parseBangumiSubject(document.documentElement.innerHTML, subjectId);
+
+  const bd = getValue('bangumiData');
+  if (!bd || !Array.isArray(bd.rows)) return;
+
+  let changed = false;
+  let rowCount = 0;
+  for (const row of bd.rows) {
+    const id = getBgmIdFromBGMID(row.BGMID);
+    if (id !== subjectId) continue;
+    rowCount++;
+    if (row.BGMID !== info.bgmId) {
+      row.BGMID = info.bgmId;
+      changed = true;
+    }
+  }
+
+  if (changed) {
+    setValue('bangumiData', bd);
+    console.log('[SubjectPage] 已更新 BGMID', subjectId, `(影响 ${rowCount} 行)`);
+    showToast(`已更新条目信息（${rowCount} 行）`);
+    // 若同浏览器其他标签打开了编辑面板，需手动关闭再打开以看到更新
+  } else {
+    console.log('[SubjectPage] 无需更新', subjectId);
+  }
+}
 /* ============ 编辑对话框 ============ */
 function showEditDialog() {
   if (_gmEditShow) { _gmEditShow(); return; }
@@ -1370,13 +1533,40 @@ function showEditDialog() {
     /* ---------- 主表 ---------- */
     #gmEditOverlay table.u-main-table { border-collapse: collapse; table-layout: fixed; width: max-content; }
     #gmEditOverlay table.u-main-table th {
-      padding:0 2px; border:1px solid #444; background:#2a2a2a; color:#cfcfcf;
+      padding:0 2px; border:1px solid #444; background:#000000; color:#cfcfcf;
       height:22px; white-space:nowrap; position:sticky; top:0; z-index:10;
       overflow:hidden; text-overflow:ellipsis; font-size: 12pt; line-height: 22px;
     }
-    #gmEditOverlay table.u-main-table thead th:first-child { left: 0; z-index: 15; }
-    #gmEditOverlay table.u-main-table tbody td.u-cell:first-child { position: sticky; left: 0; z-index: 2; }
-    #gmEditOverlay .divider-row td { position: sticky; left: 0; z-index: 4; }
+        #gmEditOverlay .divider-row td { border-left: 1px solid #444; }
+
+        #gmEditOverlay table.u-main-table thead th:first-child {
+      left: 0;
+      z-index: 15;
+      will-change: transform;
+      transform: translateZ(0);
+    }
+       #gmEditOverlay table.u-main-table tbody td.u-cell:first-child {
+      position: sticky;
+      left: 0;
+      z-index: 2;
+      will-change: transform;
+      transform: translateZ(0);
+    }
+        #gmEditOverlay .divider-row td { padding: 0; }
+    #gmEditOverlay .divider-row .divider-inner {
+      position: sticky;
+      left: 0;
+      z-index: 6;
+      display: block;
+      width: max-content;
+      padding: 2px 8px;
+      font-weight: bold;
+      font-size: 12pt;
+      line-height: 22px;
+      white-space: nowrap;
+      will-change: transform;
+      transform: translateZ(0);
+    }
 
     /* ---------- 单元格基础 ---------- */
     #gmEditOverlay .u-cell {
@@ -1392,7 +1582,9 @@ function showEditDialog() {
     #gmEditOverlay .u-cell input:focus { background:#2f2f2f; }
     #gmEditOverlay .u-cell.c-total, #gmEditOverlay .u-cell.c-air { text-align:center; font-weight:bold; }
     #gmEditOverlay .u-cell.c-downloaded { color: #9ac; }
-
+    #gmEditOverlay .u-cell input.u-extd.extd-formula {
+      font-weight: bold;
+    }
     /* ---------- 名称 / 中文 / 更新列：强制左对齐 ---------- */
     #gmEditOverlay .u-cell input.u-name,
     #gmEditOverlay .u-cell input.u-cn,
@@ -1462,27 +1654,32 @@ function showEditDialog() {
     }
     #gmEditOverlay .u-cell.editing-expand input,
     #gmEditOverlay .u-cell.editing-expand select,
-    #gmEditOverlay .u-cell.editing-expand .u-bgmid {
+    #gmEditOverlay .u-cell.editing-expand .u-bgmid,
+    #gmEditOverlay .u-cell.u-focus-expand .u-bgmid {
       position: absolute;
-      left: 0;
+      right: 0;
+      left: auto;
       top: 0;
-      height: 22px;
-      line-height: 20px;
+      height: auto;
+      min-height: 22px;
+      max-height: 40vh;
       background: #1e1e1e;
       border: 1px solid #4a9eff;
       border-radius: 3px;
       box-shadow: 0 2px 10px rgba(0,0,0,0.8);
       box-sizing: border-box;
-      padding: 0 4px;
+      padding: 2px 4px;
       z-index: 30;
       color: #d4d4d4;
       font-size: 12pt;
       font-family: inherit;
       outline: none;
-      overflow: hidden;
-      text-overflow: ellipsis;
-      /* 宽度/最大宽度由 JS autoResize* 动态设置 */
+      overflow: auto;
+      text-overflow: clip;
+      white-space: pre-wrap;
+      word-break: break-all;
     }
+    #gmEditOverlay .u-cell.c-bgmid { overflow: visible; }
     #gmEditOverlay .u-cell.editing-expand textarea {
       position: absolute;
       left: 0;
@@ -1510,9 +1707,13 @@ function showEditDialog() {
     }
     #gmEditOverlay .u-cell.editing-expand .u-bgmid {
       display: block;
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
+      white-space: pre-wrap;
+      word-break: break-all;
+      overflow: auto;
+      text-overflow: clip;
+      height: auto;
+      min-height: 22px;
+      max-height: 40vh;
       /* 宽度/最大宽度由 JS autoResizeInput 动态设置 */
     }
 
@@ -1539,7 +1740,6 @@ function showEditDialog() {
     #gmEditOverlay tr.row-selected.sel-top .u-cell:not(:first-child):not(:last-child) { box-shadow: inset 0 2px 0 0 #4a9eff; }
     #gmEditOverlay tr.row-selected.sel-bottom .u-cell:not(:first-child):not(:last-child) { box-shadow: inset 0 -2px 0 0 #4a9eff; }
     #gmEditOverlay tr.row-selected.sel-top.sel-bottom .u-cell:not(:first-child):not(:last-child) { box-shadow: inset 0 2px 0 0 #4a9eff, inset 0 -2px 0 0 #4a9eff; }
-
     /* ---------- 展示列聚焦样式 ---------- */
     #gmEditOverlay .u-cell.c-disp:focus,
     #gmEditOverlay .u-cell.c-total:focus,
@@ -1603,13 +1803,18 @@ function showEditDialog() {
       text-align: left;
       /* 宽度/最大宽度由 JS autoResizeTextarea 动态设置 */
     }
+    /* ---------- 临时编辑过的格子：深蓝背景 ---------- */
+    #gmEditOverlay .u-cell.cell-temp-edited { background: #1a2f5a !important; }
+    #gmEditOverlay .u-cell.cell-temp-edited textarea.u-downloaded { background: transparent !important; }
 
     /* ---------- last 表 ---------- */
     #gmEditOverlay #lastTableHost { background:#242424; border:1px solid #3a3a3a; border-radius:4px; padding:6px 8px; }
     #gmEditOverlay #lastTableHost table { border-collapse:collapse; width:100%; }
     #gmEditOverlay #lastTableHost th { background:#2a2a2a; color:#cfcfcf; border:1px solid #444; padding:2px 6px; font-size:12pt; text-align:left; }
     #gmEditOverlay #lastTableHost td { border:1px solid #333; padding:2px; }
-
+    #gmEditOverlay #lastTableHost input.last-temp-edited {
+      background: #1a2f5a !important;
+    }
     /* ---------- 延周表 ---------- */
     #gmEditOverlay #delayTableHost { background:#1a1a1a; border:1px solid #3a3a3a; }
     #gmEditOverlay #delayTableHost th { background:#2a2a2a !important; color:#cfcfcf !important; border:1px solid #444 !important; padding: 2px 4px; }
@@ -1648,7 +1853,20 @@ function showEditDialog() {
   const form = cE('form');
   form.id = 'gmEditForm';
   form.innerHTML = `
-    <h2>编辑数据<span class="info-icon" title="快捷键：Esc 退出（编辑中则取消编辑，多行选中则恢复单选），Ctrl+S 保存，F2 切换编辑。Alt+点击链接 = 选中行。">ⓘ</span></h2>
+        <h2>编辑数据<span class="info-icon" title="资源/规则列：@ 表示当前下集（1、2、10、101），@@ 表示补零两位（01、02、10、101）。
+延日列：支持算式与函数，@ 表示当前下集数字。如 @*2、@+7、@-5；
+或 =SUM((@&gt;={8,10,12,14,16})*-1) 表示下集达到 8,10,12,14,16 时各提前 1 天，并累计。
+开播列：输入 &lt;100 的数字视为月份，自动转换为该月 1 号（如 10 → 1001）。
+
+快捷键：
+  Esc：退出编辑（编辑中则取消编辑，多行选中则恢复单选，未打开时打开面板）
+  Ctrl+S：保存
+  F2：切换编辑/非编辑
+  Ctrl+方向键：按内容跳格（跳过空格，连续非空格落到末尾）
+  Alt+点击链接：选中该行而非打开链接
+  Backspace / Delete（非编辑态）：清空该格
+  Shift+方向键（非编辑态）：扩展行选择
+">ⓘ</span></h2>
     <div style="display:flex;gap:6px;flex-wrap:wrap;">
       <button type="submit">保存</button>
       <button type="button" id="gmEditCancel">关闭</button>
@@ -1690,40 +1908,130 @@ function showEditDialog() {
   dialog.appendChild(form);
   overlay.appendChild(dialog);
   document.body.appendChild(overlay);
+  // ---- last 三个输入框的临时修改跟踪 ----
+  const inpLastViewed = dialog.querySelector('#inpLastViewed');
+  const inpLast = dialog.querySelector('#inpLast');
+  const inpLastDownload = dialog.querySelector('#inpLastDownload');
+  const lastModified = { viewed: false, id: false, match: false };
 
+  function refreshLastEditedMark() {
+    if (inpLastViewed) inpLastViewed.classList.toggle('last-temp-edited', lastModified.viewed);
+    if (inpLast) inpLast.classList.toggle('last-temp-edited', lastModified.id);
+    if (inpLastDownload) inpLastDownload.classList.toggle('last-temp-edited', lastModified.match);
+  }
+
+  inpLastViewed.addEventListener('input', () => {
+    const expected = lastViewed != null && !Number.isNaN(url2num(lastViewed)) ? String(url2num(lastViewed)) : '';
+    lastModified.viewed = inpLastViewed.value !== expected;
+    refreshLastEditedMark();
+  });
+  inpLast.addEventListener('input', () => {
+    const expected = last != null && !Number.isNaN(url2num(last)) ? String(url2num(last)) : '';
+    lastModified.id = inpLast.value !== expected;
+    refreshLastEditedMark();
+  });
+  inpLastDownload.addEventListener('input', () => {
+    const expected = lastDownload ?? '';
+    lastModified.match = inpLastDownload.value !== expected;
+    refreshLastEditedMark();
+  });
+
+  overlay._refreshLastInputs = () => {
+    if (!lastModified.viewed) {
+      inpLastViewed.value = (lastViewed != null && !Number.isNaN(url2num(lastViewed))) ? String(url2num(lastViewed)) : '';
+    }
+    if (!lastModified.id) {
+      inpLast.value = (last != null && !Number.isNaN(url2num(last))) ? String(url2num(last)) : '';
+    }
+    if (!lastModified.match) {
+      inpLastDownload.value = lastDownload ?? '';
+    }
+  };
   const host = dialog.querySelector('#unifiedTableHost');
   const tbody = cE('tbody');
   const delayHost = dialog.querySelector('#delayTableHost');
   const delayTbody = cE('tbody');
+  // ---- 快照基准：以存储中的行为准，草稿里的行与之对比 ----
+  const storedRowsForBaseline = (() => {
+    const bd = getValue('bangumiData');
+    return (bd && Array.isArray(bd.rows)) ? bd.rows : [];
+  })();
+
+  const storedIndex = (() => {
+    const map = new Map();
+    for (const r of storedRowsForBaseline) {
+      const id = getBgmIdFromBGMID(String(r.BGMID ?? ''));
+      if (id) map.set('id:' + id, r);
+      const rule = String(r.规则 ?? '').trim();
+      if (rule) map.set('rule:' + rule, r);
+      const cn = String(r.中文 ?? '').trim();
+      if (cn) map.set('cn:' + cn, r);
+      const nm = String(r.名称 ?? '').trim();
+      if (nm) map.set('nm:' + nm, r);
+    }
+    return map;
+  })();
+
+  const EMPTY_SNAPSHOT = {
+    资源: '', 规则: '', 下集: '', 延周: '', 延日: '', BGMID: '',
+    名称: '', 中文: '', 年: '', 开播: '', 放送: '', 最大: '',
+    更新: '', 初始: '', 前季: '', 已下载: '[]',
+  };
+
+  /** 存储基准快照：按 BGMID → 规则 → 中文 → 名称 匹配；找不到返回空快照 */
+  function storedRowSnapshot(row) {
+    // 1) BGMID 的 id 最稳定，优先
+    const id = getBgmIdFromBGMID(String(row.BGMID ?? ''));
+    if (id && storedIndex.has('id:' + id)) return snapshotRowValues(storedIndex.get('id:' + id));
+    // 2) 规则
+    const rule = String(row.规则 ?? '').trim();
+    if (rule && storedIndex.has('rule:' + rule)) return snapshotRowValues(storedIndex.get('rule:' + rule));
+    // 3) 中文
+    const cn = String(row.中文 ?? '').trim();
+    if (cn && storedIndex.has('cn:' + cn)) return snapshotRowValues(storedIndex.get('cn:' + cn));
+    // 4) 名称
+    const nm = String(row.名称 ?? '').trim();
+    if (nm && storedIndex.has('nm:' + nm)) return snapshotRowValues(storedIndex.get('nm:' + nm));
+    return { ...EMPTY_SNAPSHOT };
+  }
   const measureCanvas = document.createElement('canvas');
   const measureCtx = measureCanvas.getContext('2d');
   function measureTextWidth(text, font = '16px sans-serif') {
     measureCtx.font = font;
     return measureCtx.measureText(text || '').width;
   }
-  let selAnchor = null, selDragging = false;
-  let shiftAnchorTr = null, shiftFocusIdx = -1;
+  function setBgmidMultiline(div, expand) {
+    if (!div) return;
+    if (expand) {
+      if (div.dataset.multilineExpanded === '1') return;
+      const walker = document.createTreeWalker(div, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        node.nodeValue = node.nodeValue.replace(/,/g, ',\n');
+      }
+      div.dataset.multilineExpanded = '1';
+    } else {
+      if (div.dataset.multilineExpanded !== '1') return;
+      const walker = document.createTreeWalker(div, NodeFilter.SHOW_TEXT);
+      let node;
+      while ((node = walker.nextNode())) {
+        node.nodeValue = node.nodeValue.replace(/,?\n/g, ',');
+      }
+      delete div.dataset.multilineExpanded;
+    }
+  }
+  let selAnchorTr = null;    // 唯一的锚点：Shift 系列的固定端
+  let selDragging = false;
   let refreshTimer = null;
   let pendingEditMode = false;
   let _restoringSelection = false;
-  const DRAFT_KEY = 'acgrip_draft_edit';
   let draftSaveTimer = null;
   let _suppressDraft = false;
 
   function scheduleDraftSave() {
     if (_suppressDraft) return;
-    if (draftSaveTimer) clearTimeout(draftSaveTimer);
-    draftSaveTimer = setTimeout(() => {
-      draftSaveTimer = null;
-      flushDraftSave();
-    }, 300);
-  }
 
-  function clearDraft() {
-    try { localStorage.removeItem(DRAFT_KEY); } catch {}
-  }
-  function flushDraftSave() {
-    if (draftSaveTimer) { clearTimeout(draftSaveTimer); draftSaveTimer = null; }
+    // 同步判断状态，立即刷新按钮（不先亮后灰）
     try {
       const rows = collectUnifiedRows();
       const delay = collectDelayData();
@@ -1732,8 +2040,102 @@ function showEditDialog() {
         match: dialog.querySelector('#inpLastDownload').value,
         viewed: dialog.querySelector('#inpLastViewed').value,
       };
+      setDiscardBtnEnabled(hasAnyChange(rows, delay, last));
+    } catch (e) {
+      console.error('scheduleDraftSave check error', e);
+    }
+
+    if (draftSaveTimer) clearTimeout(draftSaveTimer);
+    draftSaveTimer = setTimeout(() => {
+      draftSaveTimer = null;
+      flushDraftSave();
+    }, 300);
+  }
+  function setDiscardBtnEnabled(enabled) {
+    const btn = dialog.querySelector('#discardChangesBtn');
+    if (!btn) return;
+    btn.disabled = !enabled;
+    btn.style.opacity = enabled ? '' : '0.5';
+    btn.style.cursor = enabled ? '' : 'not-allowed';
+  }
+
+  function normalizeRow(r) {
+    const out = {};
+    for (const k of Object.keys(r).sort()) {
+      if (k === '已下载') {
+        out[k] = parseDownloadedToList(r[k]);
+      } else {
+        const v = String(r[k] ?? '').trim();
+        if (v !== '') out[k] = v;
+      }
+    }
+    return out;
+  }
+
+  /** 与"格子/ last 输入框标记 + delay 与存储比对"一致的变化判定 */
+  function hasAnyChange(panelRows, panelDelay, panelLast) {
+    try {
+      // 1. 任何格子有 cell-temp-edited → 有变化
+      for (const tr of tbody.children) {
+        if (!tr._row) continue;
+        for (const td of tr.children) {
+          if (td.classList && td.classList.contains('cell-temp-edited')) return true;
+        }
+      }
+      // 2. last 三个输入框有 last-temp-edited → 有变化
+      for (const sel of ['#inpLast', '#inpLastDownload', '#inpLastViewed']) {
+        const inp = dialog.querySelector(sel);
+        if (inp && inp.classList && inp.classList.contains('last-temp-edited')) return true;
+      }
+      // 3. delay 与存储比对
+      const bd = getValue('bangumiData') ?? {};
+      const storedDelay = bd.delay || { rows: [] };
+      const delayNorm = (d) => JSON.stringify({
+        rows: (d.rows || []).map(r => ({
+          名称: String(r.名称 || '').trim(),
+          排除: String(r.排除 || '').trim(),
+          episodes: (r.episodes || []).map(String),
+          weeks: (r.weeks || []).map(String),
+        })),
+      });
+      if (delayNorm(panelDelay) !== delayNorm(storedDelay)) return true;
+      return false;
+    } catch (e) {
+      console.error('hasAnyChange error', e);
+      return true;
+    }
+  }
+  function clearDraft() {
+    try { localStorage.removeItem(DRAFT_KEY); } catch {}
+  }
+  function flushDraftSave() {
+    if (draftSaveTimer) { clearTimeout(draftSaveTimer); draftSaveTimer = null; }
+    try {
+      // 先刷新格子标记（保证与 row 状态同步）
+      for (const tr of tbody.children) {
+        if (tr._row) refreshTempEditedMark(tr);
+      }
+
+      const rows = collectUnifiedRows();
+      const delay = collectDelayData();
+      const last = {
+        id: dialog.querySelector('#inpLast').value,
+        match: dialog.querySelector('#inpLastDownload').value,
+        viewed: dialog.querySelector('#inpLastViewed').value,
+      };
+
+      // 与存储对比：无变化 → 清草稿 + 灰按钮
+      if (!hasAnyChange(rows, delay, last)) {
+        try { localStorage.removeItem(DRAFT_KEY); } catch {}
+        setDiscardBtnEnabled(false);
+        return;
+      }
+
       localStorage.setItem(DRAFT_KEY, JSON.stringify({ rows, delay, last, ts: Date.now() }));
-    } catch (e) { console.error('draft save error', e); }
+      setDiscardBtnEnabled(true);
+    } catch (e) {
+      console.error('draft save error', e);
+    }
   }
 
   /* ---- 延周表 ---- */
@@ -1953,7 +2355,7 @@ function showEditDialog() {
   }
   function getSelectedRows() { return [...tbody.children].filter(tr => tr._row && tr.classList.contains('row-selected')); }
   function updateSelectionBorders() {
-    const mainRows = [...tbody.children].filter(tr => tr._row);
+    const mainRows = getMainTrs();
     for (let i = 0; i < mainRows.length; i++) {
       const tr = mainRows[i];
       if (!tr.classList.contains('row-selected')) { tr.classList.remove('sel-top', 'sel-bottom'); continue; }
@@ -1962,10 +2364,60 @@ function showEditDialog() {
       tr.classList.toggle('sel-top', !prevSel);
       tr.classList.toggle('sel-bottom', !nextSel);
     }
-    // 每次选中变化后立即持久化（除正在恢复期间）
+    for (const tr of mainRows) {
+      const isSel = tr.classList.contains('row-selected');
+      if (tr._lastSelectedState !== isSel) {
+        tr._lastSelectedState = isSel;
+        try { applyRowBackground(tr); } catch {}
+      }
+    }
     if (!_restoringSelection) {
       try { saveLastCellState(); } catch {}
     }
+  }
+  /* ===== 选择逻辑统一抽象 ===== */
+
+  function getMainTrs() {
+    return [...tbody.children].filter(tr => tr._row);
+  }
+
+  function indexOfTr(tr) {
+    return getMainTrs().indexOf(tr);
+  }
+
+  /** 当前焦点行（无则回退到 anchor） */
+  function getFocusTr() {
+    const ae = document.activeElement;
+    const tr = ae?.closest?.('tr');
+    if (tr && tr._row) return tr;
+    if (selAnchorTr && selAnchorTr.isConnected) return selAnchorTr;
+    return null;
+  }
+
+  /** 单行选中（无修饰键点击） */
+  function selectSingle(tr) {
+    for (const t of tbody.children) if (t._row) t.classList.remove('row-selected');
+    tr.classList.add('row-selected');
+    updateSelectionBorders();
+  }
+
+  /** 切换单行（Ctrl+点击） */
+  function toggleSelect(tr) {
+    tr.classList.toggle('row-selected');
+    updateSelectionBorders();
+  }
+
+  /** 区间选中：把 [baseTr, curTr] 区间内所有主行选中，其余取消 */
+  function setRangeSelection(baseTr, curTr) {
+    const trs = getMainTrs();
+    const a = trs.indexOf(baseTr);
+    const b = trs.indexOf(curTr);
+    if (a < 0 || b < 0) return;
+    const lo = Math.min(a, b), hi = Math.max(a, b);
+    for (let i = 0; i < trs.length; i++) {
+      trs[i].classList.toggle('row-selected', i >= lo && i <= hi);
+    }
+    updateSelectionBorders();
   }
   function toggleRowSelect(tr, add) {
     if (add) tr.classList.toggle('row-selected'); else tr.classList.add('row-selected');
@@ -2073,9 +2525,8 @@ function showEditDialog() {
     _restoringSelection = true;
     clearRowSelection();
     for (const tr of selectedTrs) tr.classList.add('row-selected');
-    selAnchor = selectedTrs[0];
+    selAnchorTr = selectedTrs[0];
     updateSelectionBorders();
-    shiftAnchorTr = null; shiftFocusIdx = -1;
     _restoringSelection = false;
 
     // 聚焦第一行的对应列
@@ -2189,36 +2640,68 @@ function showEditDialog() {
       _list: null, _editing: false, _original: null, _applyStyle: null,
       _enterEdit(clearFirst) {
         if (this._editing) return;
-        this._original = input.tagName === 'INPUT' || input.tagName === 'TEXTAREA'
-          ? (input.value ?? '')
-          : (input.innerHTML ?? '');
+        const isInput = (input.tagName === 'INPUT' || input.tagName === 'TEXTAREA');
+        this._original = isInput ? (input.value ?? '') : (input.innerHTML ?? '');
         this._editing = true;
         setReadOnly(input, false);
-
+        // 延日列：进入编辑态显式换为公式原文
+        if (input.classList && input.classList.contains('u-extd')) {
+          if (input.dataset.exprRaw != null) {
+            input.value = input.dataset.exprRaw;
+            delete input.dataset.exprRaw;
+          } else {
+            input.value = String(tr._row?.延日 ?? '');
+          }
+          // 编辑态保持公式加粗样式（若本身是公式）
+          const s = String(input.value || '').trim();
+          const isFormula = s !== '' && !/^-?\d+(\.\d+)?$/.test(s);
+          input.classList.toggle('extd-formula', isFormula);
+        }
         if (input.classList && (input.classList.contains('u-name') || input.classList.contains('u-cn') || input.classList.contains('u-update'))) {
           input.style.setProperty('text-align', 'left', 'important');
           input.style.setProperty('direction', 'ltr', 'important');
         }
 
+        // contenteditable 光标设置工具
+        const applyCursor = () => {
+          if (!input.isContentEditable) return;
+          try {
+            const range = document.createRange();
+            range.selectNodeContents(input);
+            range.collapse(clearFirst ? true : false);
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+          } catch {}
+        };
+
         if (document.activeElement === input) {
           if (this._applyStyle) this._applyStyle();
+          if (input.isContentEditable) {
+            requestAnimationFrame(() => { if (this._editing) applyCursor(); });
+          }
         } else {
           try { input.focus({ preventScroll: true }); } catch {}
-          // contenteditable 从 false → true 后立即 focus 可能无效，rAF 再补一次
           if (input.isContentEditable) {
+            // contenteditable 从 false → true 后需要等一次布局再设置光标
             requestAnimationFrame(() => {
-              if (this._editing && document.activeElement !== input) {
+              if (!this._editing) return;
+              if (document.activeElement !== input) {
                 try { input.focus({ preventScroll: true }); } catch {}
               }
+              applyCursor();
             });
           }
         }
 
         if (clearFirst) {
-          if (input.tagName === 'INPUT' || input.tagName === 'TEXTAREA') input.value = '';
+          if (isInput) input.value = '';
           else input.innerHTML = '';
           input.dispatchEvent(new Event('input', { bubbles: true }));
           if (input.setSelectionRange) { try { input.setSelectionRange(0, 0); } catch {} }
+          if (input.isContentEditable) {
+            requestAnimationFrame(() => { if (this._editing) applyCursor(); });
+          }
         }
       },
       _exitEdit(commit) {
@@ -2235,8 +2718,33 @@ function showEditDialog() {
         td.classList.remove('editing-expand');
         input.style.width = '';
         input.style.maxWidth = '';
-        if (commit) { updateDerived(tr); scheduleDraftSave(); }
-        // 焦点由调用者负责，不在此处恢复
+
+        const isBgmid = input.classList && input.classList.contains('u-bgmid');
+        const stillFocused = document.activeElement === input || td.contains(document.activeElement);
+
+        if (isBgmid) {
+          if (stillFocused) {
+            // 退出编辑但仍聚焦：保持多行显示，仅切换 class 与恢复只读
+            td.classList.add('u-focus-expand');
+            setBgmidMultiline(input, true);
+            requestAnimationFrame(() => autoResizeInput(input));
+          } else {
+            td.classList.remove('u-focus-expand');
+            setBgmidMultiline(input, false);
+            input.style.width = '';
+            input.style.maxWidth = '';
+          }
+        } else {
+          td.classList.remove('u-focus-expand');
+        }
+
+        if (commit) {
+          updateDerived(tr);
+          scheduleDraftSave();
+          setTimeout(() => {
+            if (document.activeElement !== input) updateDerived(tr);
+          }, 0);
+        }
       },
     };
     cell._list = [cell];
@@ -2251,10 +2759,17 @@ function showEditDialog() {
     const applyStyle = () => {
       if (cell.isCombined || isDisplayOnly) return;
       const isRecord = editor.classList && editor.classList.contains('u-downloaded');
+      const isBgmid = editor.classList && editor.classList.contains('u-bgmid');
       if (isRecord) {
         if (cell._editing) td.classList.add('editing-expand');
         else td.classList.add('u-focus-expand');
         requestAnimationFrame(() => autoResizeTextarea(editor));
+        return;
+      }
+      if (isBgmid) {
+        td.classList.add('editing-expand');
+        setBgmidMultiline(editor, true);
+        requestAnimationFrame(() => autoResizeInput(editor));
         return;
       }
       td.classList.add('editing-expand');
@@ -2307,21 +2822,15 @@ function showEditDialog() {
     if (editor !== host) editor.addEventListener('input', onInputResize);
     const onFocus = () => {
       const tr = cell.tr;
-      if (!cell._editing && !tr.classList.contains('row-selected')) {
-        clearRowSelection();
-        tr.classList.add('row-selected');
-        selAnchor = tr;
-      }
+      // 选中状态由 mousedown / 键盘导航逻辑管理，onFocus 不再重置
       updateSelectionBorders();
 
-      // 强制左对齐
       if (editor.classList && (editor.classList.contains('u-name') || editor.classList.contains('u-cn') || editor.classList.contains('u-update'))) {
         editor.style.setProperty('text-align', 'left', 'important');
         editor.style.setProperty('direction', 'ltr', 'important');
         editor.style.setProperty('unicode-bidi', 'plaintext', 'important');
       }
 
-      // 非编辑态：光标归零 + scrollLeft=0（键盘聚焦时浏览器默认可能把光标放末尾）
       if (!cell._editing && (editor.tagName === 'INPUT' || editor.tagName === 'TEXTAREA')) {
         try { editor.setSelectionRange(0, 0); } catch {}
         try { editor.scrollLeft = 0; } catch {}
@@ -2337,10 +2846,17 @@ function showEditDialog() {
       }
 
       const isRecord = editor.classList && editor.classList.contains('u-downloaded');
-      if (cell._editing) applyStyle();
-      else if (isRecord) {
+      const isBgmid = editor.classList && editor.classList.contains('u-bgmid');
+      if (cell._editing) {
+        applyStyle();
+      } else if (isRecord) {
         td.classList.add('u-focus-expand');
         requestAnimationFrame(() => autoResizeTextarea(editor));
+      } else if (isBgmid) {
+        // 非编辑聚焦态：多行展开
+        td.classList.add('u-focus-expand');
+        setBgmidMultiline(editor, true);
+        requestAnimationFrame(() => autoResizeInput(editor));
       }
     };
     if (!cell.skipHostKeydown) host.addEventListener('focus', onFocus);
@@ -2349,9 +2865,19 @@ function showEditDialog() {
     if (!isDisplayOnly) {
       const onBlur = () => {
         setTimeout(() => {
-          if (!cell._editing) return;
-          if (cell.td.contains(document.activeElement)) return;
-          cell._exitEdit(true);
+          if (cell._editing) {
+            if (cell.td.contains(document.activeElement)) return;
+            cell._exitEdit(true);
+            return;
+          }
+          // 非编辑态：处理 BGMID 聚焦态退出
+          const isBgmid = editor.classList && editor.classList.contains('u-bgmid');
+          if (isBgmid && !cell.td.contains(document.activeElement)) {
+            cell.td.classList.remove('u-focus-expand');
+            setBgmidMultiline(editor, false);
+            editor.style.width = '';
+            editor.style.maxWidth = '';
+          }
         }, 0);
       };
       if (editor !== host) editor.addEventListener('blur', onBlur);
@@ -2363,13 +2889,20 @@ function showEditDialog() {
       if (!a) return;
       if (e.altKey) {
         e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+        // 1) 若在编辑态：先退出（提交）
+        if (cell._editing) cell._exitEdit(true);
+        // 2) 单选当前行
         clearRowSelection();
         cell.tr.classList.add('row-selected');
-        selAnchor = cell.tr;
-        shiftAnchorTr = null; shiftFocusIdx = -1;
+        selAnchorTr = cell.tr;
         updateSelectionBorders();
-        const firstCell = getRowCells(cell.tr)[0];
-        if (firstCell && firstCell.host && firstCell.host.focus) try { firstCell.host.focus(); } catch {}
+        // 3) 聚焦点击的格子自身（非编辑态）
+        const target = cell.host;
+        if (target && typeof target.focus === 'function') {
+          if (target.tabIndex < 0) target.tabIndex = 0;
+          try { target.focus({ preventScroll: true }); } catch {}
+        }
+        updateSelectionBorders();
       }
     };
     host.addEventListener('click', linkClickCapture, true);
@@ -2404,37 +2937,49 @@ function showEditDialog() {
       row.规则 = '';
       if (cell.editor) cell.editor.value = '';
       if (cell._ruleCell && cell._ruleCell.editor) cell._ruleCell.editor.value = '';
+      // updateDerived 末尾已包含 refreshTempEditedMark + applyRowBackground
       updateDerived(tr);
-      scheduleRefresh();
+      scheduleDraftSave();
       return;
     }
 
     const editor = cell.editor;
     if (!editor) return;
 
-    // 记录列 textarea：清空已下载数组
+    // 记录列 textarea
     if (editor.classList && editor.classList.contains('u-downloaded')) {
       row.已下载 = [];
       editor.value = '';
       editor.style.height = '20px';
-      updateDerived(tr);
       adjustAdaptiveColumns();
-      scheduleRefresh();
+      refreshTempEditedMark(tr);
+      applyRowBackground(tr);
+      scheduleDraftSave();
+      return;
+    }
+
+    // BGMID（含非编辑态，contenteditable="false" 也走此分支）
+    const isBgmid = editor.classList && editor.classList.contains('u-bgmid');
+    if (isBgmid) {
+      editor.innerHTML = '';
+      row.BGMID = '';
+      refreshTempEditedMark(tr);
+      applyRowBackground(tr);
+      scheduleDraftSave();
       return;
     }
 
     // 普通 input / textarea
     if (editor.tagName === 'INPUT' || editor.tagName === 'TEXTAREA') {
       editor.value = '';
-    } else if (editor.isContentEditable) {
-      // BGMID contenteditable
-      editor.innerHTML = '';
     } else {
       return;
     }
 
     // 派发 input 事件，让各列的 handler 更新 row 对应字段
     editor.dispatchEvent(new Event('input', { bubbles: true }));
+    refreshTempEditedMark(tr);
+    applyRowBackground(tr);
     scheduleDraftSave();
   }
 
@@ -2443,22 +2988,28 @@ function showEditDialog() {
     const editing = cell._editing;
     const tr = cell.tr;
     const isDisplayOnly = !!cell.isDisplayOnly;
-    // Ctrl+方向键：按内容跳格
+    // Ctrl+Shift+方向键：按内容跳格到目标行，区间选中（anchor → 目标）
+    if (e.ctrlKey && e.shiftKey && !e.altKey && !editing && ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(key)) {
+      e.preventDefault(); e.stopPropagation();
+      const target = ctrlArrowTarget(cell, key);
+      if (target && target.tr) {
+        const base = (selAnchorTr && selAnchorTr.isConnected) ? selAnchorTr : cell.tr;
+        if (!selAnchorTr || !selAnchorTr.isConnected) selAnchorTr = base;
+        setRangeSelection(base, target.tr);
+        pendingEditMode = false;
+        setTimeout(() => { try { target.host.focus({ preventScroll: true }); } catch {} }, 0);
+      }
+      return;
+    }
+    // Ctrl+方向键：按内容跳格，单选目标行
     if (e.ctrlKey && !e.shiftKey && !e.altKey && !editing && ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(key)) {
       e.preventDefault(); e.stopPropagation();
       const target = ctrlArrowTarget(cell, key);
-      if (target) {
-        const ttr = target.tr;
-        if (!ttr.classList.contains('row-selected')) {
-          clearRowSelection();
-          ttr.classList.add('row-selected');
-        }
-        updateSelectionBorders();
-        shiftAnchorTr = null; shiftFocusIdx = -1;
+      if (target && target.tr) {
+        selectSingle(target.tr);
+        selAnchorTr = target.tr;
         pendingEditMode = false;
-        setTimeout(() => {
-          try { target.host.focus({ preventScroll: true }); } catch {}
-        }, 0);
+        setTimeout(() => { try { target.host.focus({ preventScroll: true }); } catch {} }, 0);
       }
       return;
     }
@@ -2473,7 +3024,20 @@ function showEditDialog() {
       if (['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(key)) {
         e.preventDefault(); e.stopPropagation();
         if (e.shiftKey && (key === 'ArrowUp' || key === 'ArrowDown')) {
-          extendRowSelection(tr, key === 'ArrowUp' ? -1 : 1);
+          const trs = getMainTrs();
+          const curIdx = trs.indexOf(tr);
+          if (curIdx < 0) return;
+          const base = (selAnchorTr && selAnchorTr.isConnected) ? selAnchorTr : tr;
+          if (!selAnchorTr || !selAnchorTr.isConnected) selAnchorTr = base;
+          const newIdx = curIdx + (key === 'ArrowUp' ? -1 : 1);
+          if (newIdx < 0 || newIdx >= trs.length) return;
+          setRangeSelection(base, trs[newIdx]);
+          // 焦点移到目标行的同列
+          const rowCells = getRowCells(tr);
+          const colIdx = rowCells.indexOf(cell);
+          const targetCells = getRowCells(trs[newIdx]);
+          const target = targetCells[Math.min(colIdx, targetCells.length - 1)] || targetCells[0];
+          if (target) try { target.host.focus({ preventScroll: true }); } catch {}
         } else if (!e.shiftKey) {
           pendingEditMode = false;
           navigateDirection(cell, key);
@@ -2570,7 +3134,7 @@ function showEditDialog() {
               clearRowSelection();
               targetTr.classList.add('row-selected');
             }
-            selAnchor = targetTr;
+            selAnchorTr = targetTr;
             updateSelectionBorders();
             pendingEditMode = true;
             setTimeout(() => {
@@ -2720,9 +3284,10 @@ function showEditDialog() {
     }
     if (!target) return;
     const tr = target.tr;
-    if (!tr.classList.contains('row-selected')) { clearRowSelection(); tr.classList.add('row-selected'); }
-    updateSelectionBorders();
-    shiftAnchorTr = null; shiftFocusIdx = -1;
+    if (!tr.classList.contains('row-selected')) {
+      selectSingle(tr);
+      selAnchorTr = tr;
+    }
 
     const targetCanEdit = !target.isDisplayOnly;
     if (keepEditing && targetCanEdit) {
@@ -2749,7 +3314,6 @@ function showEditDialog() {
     }
   }
   function navigateDirection(cell, key) {
-    shiftAnchorTr = null; shiftFocusIdx = -1;
     const allTrs = [...tbody.children].filter(t => t._row);
     const rowIdx = allTrs.indexOf(cell.tr);
     const rowCells = getRowCells(cell.tr);
@@ -2762,29 +3326,15 @@ function showEditDialog() {
       const targetCells = getRowCells(targetTr);
       const target = targetCells[Math.min(colIdx, targetCells.length - 1)];
       if (!target) return;
-      clearRowSelection(); targetTr.classList.add('row-selected');
-      updateSelectionBorders();
-      try { target.host.focus(); } catch {}
+      selectSingle(targetTr);
+      selAnchorTr = targetTr;
+      try { target.host.focus({ preventScroll: true }); } catch {}
     } else {
       const nCol = colIdx + (key === 'ArrowLeft' ? -1 : 1);
       if (nCol < 0 || nCol >= rowCells.length) return;
       const target = rowCells[nCol];
       if (target) try { target.host.focus(); } catch {}
     }
-  }
-  function extendRowSelection(currentTr, delta) {
-    const allTrs = [...tbody.children].filter(t => t._row);
-    const curIdx = allTrs.indexOf(currentTr);
-    if (curIdx < 0) return;
-    if (shiftAnchorTr === null) { shiftAnchorTr = currentTr; shiftFocusIdx = curIdx; }
-    const anchorIdx = allTrs.indexOf(shiftAnchorTr);
-    if (anchorIdx < 0) return;
-    const newFocusIdx = shiftFocusIdx + delta;
-    if (newFocusIdx < 0 || newFocusIdx >= allTrs.length) return;
-    shiftFocusIdx = newFocusIdx;
-    const lo = Math.min(anchorIdx, shiftFocusIdx), hi = Math.max(anchorIdx, shiftFocusIdx);
-    for (let i = 0; i < allTrs.length; i++) allTrs[i].classList.toggle('row-selected', i >= lo && i <= hi);
-    updateSelectionBorders();
   }
 
   /* ---- updateDerived ---- */
@@ -2813,13 +3363,7 @@ function showEditDialog() {
     const dlInput = tr.querySelector('.u-downloaded');
     if (dlInput) {
       const isFocused = document.activeElement === dlInput;
-      const rule = String(row.规则 || '').trim();
-      const m = rule.match(/^\/([\s\S]*)\/$/);
-      const foundForKey = m ? m[1] : rule;
-      const fromIdx = foundForKey ? getDownloadedList(foundForKey) : null;
-      const items = fromIdx
-        ? fromIdx.map(s => String(s).replace(/^\/t\//, '')).map(Number).filter(n => !isNaN(n))
-        : parseDownloadedToList(row.已下载);
+      const items = parseDownloadedToList(row.已下载);
       dlInput.title = items.join('\n');
       if (!isFocused) {
         dlInput.value = items.length === 0
@@ -2842,7 +3386,7 @@ function showEditDialog() {
             e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
             clearRowSelection();
             tr.classList.add('row-selected');
-            selAnchor = tr;
+            selAnchorTr = tr;
             shiftAnchorTr = null; shiftFocusIdx = -1;
             updateSelectionBorders();
             const firstCell = getRowCells(tr)[0];
@@ -2875,7 +3419,7 @@ function showEditDialog() {
             e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
             clearRowSelection();
             tr.classList.add('row-selected');
-            selAnchor = tr;
+            selAnchorTr = tr;
             shiftAnchorTr = null; shiftFocusIdx = -1;
             updateSelectionBorders();
             const firstCell = getRowCells(tr)[0];
@@ -2911,9 +3455,13 @@ function showEditDialog() {
       }
     }
     const extD = tr.querySelector('.u-extd');
-    if (extD && document.activeElement !== extD) {
+    const extDCell = extD ? extD._acgripCell : null;
+    // 只要不在编辑态就刷新（非编辑选中/未选中都显示计算值）
+    if (extD && !(extDCell && extDCell._editing)) {
       const manualD = String(row.延日 ?? '').trim();
-      if (manualD && !/^-?\d+(\.\d+)?$/.test(manualD)) {
+      const isFormula = manualD !== '' && !/^-?\d+(\.\d+)?$/.test(manualD);
+      extD.classList.toggle('extd-formula', isFormula);
+      if (isFormula) {
         const v = evalDelayFormula(manualD, row);
         if (Number.isFinite(v)) {
           extD.value = String(v);
@@ -2963,6 +3511,7 @@ function showEditDialog() {
         }
       }
     }
+    refreshTempEditedMark(tr);
     applyRowBackground(tr);
   }
 
@@ -3156,20 +3705,33 @@ function showEditDialog() {
       else extDInput.title = extDInput.value;
       updateDerived(tr); scheduleRefresh();
     });
-    extDInput.addEventListener('focus', () => {
-      if (extDInput.dataset.exprRaw != null) { extDInput.value = extDInput.dataset.exprRaw; delete extDInput.dataset.exprRaw; }
-      else extDInput.value = String(row.延日 ?? '');
-    });
     tdExtD.appendChild(extDInput);
     makeCell(tdExtD, extDInput, tr); initCell(tdExtD._acgripCell);
 
     /* 8. BGMID */
-    const tdBgmid = cE('td'); tdBgmid.className = 'u-cell';
+    const tdBgmid = cE('td'); tdBgmid.className = 'u-cell c-bgmid';
     row.BGMID = cleanBGMID(row.BGMID);
     const bgmidDiv = cE('div');
     bgmidDiv.contentEditable = 'false'; bgmidDiv.className = 'u-bgmid'; bgmidDiv.innerHTML = row.BGMID || '';
     bgmidDiv.tabIndex = 0;
-    bgmidDiv.addEventListener('input', () => { row.BGMID = bgmidDiv.innerHTML; updateDerived(tr); scheduleRefresh(); });
+    bgmidDiv.addEventListener('input', () => {
+      if (bgmidDiv.dataset.multilineExpanded === '1') {
+        const clone = bgmidDiv.cloneNode(true);
+        const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
+        let node;
+        while ((node = walker.nextNode())) {
+          node.nodeValue = node.nodeValue.replace(/,?\n/g, ',');
+        }
+        row.BGMID = clone.innerHTML;
+      } else {
+        row.BGMID = bgmidDiv.innerHTML;
+      }
+      // 不用 updateDerived / scheduleRefresh —— 它们会触发 rebuild，导致焦点丢失
+      bgmidDiv.title = bgmidDiv.textContent || '';
+      refreshTempEditedMark(tr);
+      applyRowBackground(tr);
+      scheduleDraftSave();
+    });
     tdBgmid.appendChild(bgmidDiv);
     makeCell(tdBgmid, bgmidDiv, tr); initCell(tdBgmid._acgripCell);
 
@@ -3270,22 +3832,20 @@ function showEditDialog() {
       scheduleRefresh();
     });
     dlInput.addEventListener('blur', () => {
-      // blur 只清理内联样式并显示摘要；真正数据提交由 _exitEdit 完成
-      tdDownloaded.classList.remove('u-focus-expand');
-      dlInput.style.height = '';
-      dlInput.style.width = '';
-      dlInput.style.maxWidth = '';
-      const rule = String(row.规则 || '').trim();
-      const m = rule.match(/^\/([\s\S]*)\/$/);
-      const foundForKey = m ? m[1] : rule;
-      const fromIdx = foundForKey ? getDownloadedList(foundForKey) : null;
-      const items = fromIdx
-        ? fromIdx.map(s => String(s).replace(/^\/t\//, '')).map(Number).filter(n => !isNaN(n))
-        : parseDownloadedToList(row.已下载);
-      dlInput.value = items.length === 0
-        ? ''
-        : (items.length === 1 ? String(items[0]) : `${items[items.length - 1]}+${items.length - 1}`);
-      dlInput.style.height = '20px';
+      setTimeout(() => {
+        if (dlInput._acgripCell && dlInput._acgripCell._editing) return;
+        if (tdDownloaded.contains(document.activeElement)) return;
+        tdDownloaded.classList.remove('u-focus-expand');
+        dlInput.style.height = '';
+        dlInput.style.width = '';
+        dlInput.style.maxWidth = '';
+        const items = parseDownloadedToList(row.已下载);
+        dlInput.value = items.length === 0
+          ? ''
+          : (items.length === 1 ? String(items[0]) : `${items[items.length - 1]}+${items.length - 1}`);
+        dlInput.style.height = '20px';
+        console.log('[记录列] blur 后显示摘要', { value: dlInput.value });
+      }, 0);
     });
     tdDownloaded.appendChild(dlInput);
     makeCell(tdDownloaded, dlInput, tr);
@@ -3298,6 +3858,7 @@ function showEditDialog() {
         row.已下载 = parseTextToDownloaded(dlInput.value);
       }
       originalExit(commit);
+
       dlInput.style.height = '';
       dlInput.style.width = '';
       dlInput.style.maxWidth = '';
@@ -3311,32 +3872,100 @@ function showEditDialog() {
         tdDownloaded.classList.add('u-focus-expand');
         requestAnimationFrame(() => autoResizeTextarea(dlInput));
       } else {
-        const rule = String(row.规则 || '').trim();
-        const m = rule.match(/^\/([\s\S]*)\/$/);
-        const foundForKey = m ? m[1] : rule;
-        const fromIdx = foundForKey ? getDownloadedList(foundForKey) : null;
-        const items = fromIdx
-          ? fromIdx.map(s => String(s).replace(/^\/t\//, '')).map(Number).filter(n => !isNaN(n))
-          : parseDownloadedToList(row.已下载);
-        dlInput.value = items.length === 0
-          ? ''
-          : (items.length === 1 ? String(items[0]) : `${items[items.length - 1]}+${items.length - 1}`);
-        dlInput.style.height = '20px';
-      }
-      if (wasEditing && commit) {
         updateDerived(tr);
         adjustAdaptiveColumns();
       }
+
+      // 兜底：Tab / 点击切换时焦点稍后才移走
+      setTimeout(() => {
+        const nowFocused = document.activeElement === dlInput;
+        const items = parseDownloadedToList(row.已下载);
+        if (nowFocused) {
+          if (!tdDownloaded.classList.contains('u-focus-expand')) {
+            tdDownloaded.classList.add('u-focus-expand');
+            dlInput.value = parseDownloadedToText(row.已下载);
+            autoResizeTextarea(dlInput);
+          }
+        } else {
+          tdDownloaded.classList.remove('u-focus-expand');
+          dlInput.value = items.length === 0
+            ? ''
+            : (items.length === 1 ? String(items[0]) : `${items[items.length - 1]}+${items.length - 1}`);
+          dlInput.style.height = '20px';
+        }
+      }, 0);
+
+      if (wasEditing && commit) {
+        adjustAdaptiveColumns();
+        console.log('[记录列] 编辑退出', { wasEditing, commit, value: dlInput.value });
+      }
     };
     initCell(dlCell);
-
+    tdCombined._editedKeys = ['资源', '规则'];
+    tdNext._editedKeys = ['下集'];
+    tdExtW._editedKeys = ['延周'];
+    tdExtD._editedKeys = ['延日'];
+    tdBgmid._editedKeys = ['BGMID'];
+    tdName._editedKeys = ['名称'];
+    tdCn._editedKeys = ['中文'];
+    tdYear._editedKeys = ['年'];
+    tdKai._editedKeys = ['开播'];
+    tdHou._editedKeys = ['放送'];
+    tdMax._editedKeys = ['最大'];
+    tdUpd._editedKeys = ['更新'];
+    tdInit._editedKeys = ['初始'];
+    tdPrev._editedKeys = ['前季'];
+    tdDownloaded._editedKeys = ['已下载'];
     tr.append(tdDisp, tdCombined, tdNext, tdTotal, tdAir, tdExtW, tdExtD,
               tdBgmid, tdName, tdCn, tdYear, tdKai, tdHou, tdMax,
               tdUpd, tdInit, tdPrev, tdDownloaded);
 
+    tr._updateDerived = () => updateDerived(tr);
+    tr._originalValues = storedRowSnapshot(row);
     tbody.appendChild(tr);
     updateDerived(tr);
     return tr;
+  }
+
+  function snapshotRowValues(row) {
+    return {
+      资源: String(row.资源 ?? ''),
+      规则: String(row.规则 ?? ''),
+      下集: String(row.下集 ?? ''),
+      延周: String(row.延周 ?? ''),
+      延日: String(row.延日 ?? ''),
+      // 面板里的 row.BGMID 已由 buildRow 做过 cleanBGMID；快照基准也必须统一清洗，
+      // 否则存储里的 <span> 包装会导致 BGMID 列永远被判为"已修改"
+      BGMID: cleanBGMID(String(row.BGMID ?? '')),
+      名称: String(row.名称 ?? ''),
+      中文: String(row.中文 ?? ''),
+      年: String(row.年 ?? ''),
+      开播: String(row.开播 ?? ''),
+      放送: String(row.放送 ?? ''),
+      最大: String(row.最大 ?? ''),
+      更新: String(row.更新 ?? ''),
+      初始: String(row.初始 ?? ''),
+      前季: String(row.前季 ?? ''),
+      已下载: JSON.stringify(parseDownloadedToList(row.已下载)),
+    };
+  }
+
+  function computeRowFieldValue(row, key) {
+    if (key === '已下载') return JSON.stringify(parseDownloadedToList(row.已下载));
+    if (key === 'BGMID') return cleanBGMID(String(row.BGMID ?? ''));
+    return String(row[key] ?? '');
+  }
+
+  function refreshTempEditedMark(tr) {
+    const orig = tr._originalValues;
+    const row = tr._row;
+    if (!orig || !row) return;
+    for (const td of tr.children) {
+      const keys = td._editedKeys;
+      if (!keys || !keys.length) continue;
+      const edited = keys.some(k => computeRowFieldValue(row, k) !== orig[k]);
+      td.classList.toggle('cell-temp-edited', edited);
+    }
   }
 
   /* ---- 表格骨架 ---- */
@@ -3370,10 +3999,15 @@ function showEditDialog() {
     mainRows.sort((a, b) => {
       const ra = a._row, rb = b._row;
       const pa = parseBGMID(ra.BGMID), pb = parseBGMID(rb.BGMID);
-      const maxA = Number(pa.最大) || 0, maxB = Number(pb.最大) || 0;
+      // 用 effective 取值，与 applyRowHighlight 的高亮判定一致
+      const maxA = Number(effective(ra, '最大', pa)) || 0;
+      const maxB = Number(effective(rb, '最大', pb)) || 0;
       const nextA = Number(ra.下集) || 0, nextB = Number(rb.下集) || 0;
-      const endA = maxA > 0 && nextA > maxA, endB = maxB > 0 && nextB > maxB;
-      if (endA !== endB) return endA ? 1 : -1;
+      // 与 applyRowHighlight 同一条件：下一集已超过最大集 → 视为 END
+      // 排序：严格大于最大集才算已完结
+      const endA = maxA > 1 && nextA > maxA;
+      const endB = maxB > 1 && nextB > maxB;
+      if (endA !== endB) return endA ? 1 : -1;    // END 行排末尾
       const da = getAirDate(ra, null, lookupDelay), db = getAirDate(rb, null, lookupDelay);
       const ta = da ? da.getTime() : Infinity, tb = db ? db.getTime() : Infinity;
       if (ta !== tb) return ta - tb;
@@ -3387,12 +4021,24 @@ function showEditDialog() {
   }
   function makeDividerRow(label, bgColor) {
     const tr = cE('tr'); tr.className = 'divider-row';
-    const td = cE('td'); td.colSpan = 18; td.textContent = label;
-    td.style.cssText = `padding:2px 8px;font-weight:bold;border:1px solid #444;background:${bgColor};color:#cfcfcf;font-size:12pt;line-height:22px;`;
-    tr.appendChild(td); return tr;
+    const td = cE('td'); td.colSpan = 18;
+    td.style.cssText = `padding:0;border:1px solid #444;background:${bgColor};color:#cfcfcf;font-weight:bold;font-size:12pt;line-height:22px;`;
+    const inner = cE('div');
+    inner.className = 'divider-inner';
+    // 背景同色覆盖在 td 上，保证 sticky 内容在滚动时不被行底干扰
+    inner.style.cssText = `background:${bgColor};color:#cfcfcf;`;
+    inner.textContent = label;
+    td.appendChild(inner);
+    tr.appendChild(td);
+    return tr;
   }
   function makeDayDivider(d) {
-    return makeDividerRow(`[${pad(d.getMonth() + 1)}${pad(d.getDate())} ${WEEKDAY_LABEL[d.getDay()]}]`, getBgByDate(d));
+    // d 是当天 0 点；getBgByDate 的边界是当天 4 点，需要加 4 小时才能命中正确的段
+    const d4 = new Date(d.getTime() + 4 * 3600 * 1000);
+    return makeDividerRow(
+      `[${pad(d4.getMonth() + 1)}${pad(d4.getDate())} ${WEEKDAY_LABEL[d4.getDay()]}]`,
+      getBgByDate(d4)
+    );
   }
   function makeQuarterDivider(d, year, month) {
     const season = month === 1 ? '冬' : month === 4 ? '春' : month === 7 ? '夏' : '秋';
@@ -3404,14 +4050,32 @@ function showEditDialog() {
     tbody.querySelectorAll('.divider-row').forEach(el => el.remove());
     const mainRows = [...tbody.children].filter(tr => tr._row);
     if (!mainRows.length) return;
-    const rowsByDate = new Map(), noDateRows = [];
+
+    const rowsByDate = new Map(), noDateRows = [], endRows = [];
     for (const tr of mainRows) {
-      const adj = getAirDateAdjusted(tr._row, lookupDelay);
+      const row = tr._row;
+
+      // END 判定优先使用"原始快照"（保存时的值），避免临时编辑触发重排
+      const orig = tr._originalValues;
+      const parsed = parseBGMID(row.BGMID);
+      const maxRaw = (orig && String(orig.最大 ?? '').trim())
+        ? orig.最大
+        : effective(row, '最大', parsed);
+      const nextRaw = (orig && String(orig.下集 ?? '').trim())
+        ? orig.下集
+        : row.下集;
+      const max = Number(maxRaw) || 0;
+      const next = Number(nextRaw) || 0;
+
+      if (max > 1 && next > max) { endRows.push(tr); continue; }
+
+      const adj = getAirDateAdjusted(row, lookupDelay);
       if (!adj) { noDateRows.push(tr); continue; }
       const k = dateKey(adj);
       if (!rowsByDate.has(k)) rowsByDate.set(k, []);
       rowsByDate.get(k).push(tr);
     }
+
     const today = new Date(); today.setHours(0, 0, 0, 0);
     const todayKey = dateKey(today);
     const endKey = dateKey(new Date(today.getTime() + 7 * 86400000));
@@ -3423,7 +4087,6 @@ function showEditDialog() {
     const frag = document.createDocumentFragment();
     const pastKeys = [...rowsByDate.keys()].filter(k => k < todayKey).sort();
     if (pastKeys.length) {
-      frag.appendChild(makeDividerRow('[已播出]', '#2a2a2a'));
       for (const k of pastKeys) { for (const tr of rowsByDate.get(k)) frag.appendChild(tr); rowsByDate.delete(k); }
     }
     const points = [];
@@ -3456,8 +4119,13 @@ function showEditDialog() {
       for (const tr of rowsByDate.get(k)) frag.appendChild(tr);
     }
     if (noDateRows.length) {
-      frag.appendChild(makeDividerRow('[未定]', '#2a2a2a'));
+      frag.appendChild(makeDividerRow('[未定]', '#7e7e7e'));
       for (const tr of noDateRows) frag.appendChild(tr);
+    }
+    // END 行统一放末尾
+    if (endRows.length) {
+      frag.appendChild(makeDividerRow('[已完结]', '#7e7e7e'));
+      for (const tr of endRows) frag.appendChild(tr);
     }
     tbody.innerHTML = ''; tbody.appendChild(frag); applyRowBackgrounds();
     if (selectedRows.size) for (const tr of tbody.children) if (tr._row && selectedRows.has(tr._row)) tr.classList.add('row-selected');
@@ -3466,26 +4134,47 @@ function showEditDialog() {
   function applyRowBackground(tr) {
     if (!tr._row) return;
     const row = tr._row, parsed = parseBGMID(row.BGMID);
-    const bg = getBgByDate(getAirDate(row, null, lookupDelay));
-    const bgDarker = darkerColor(bg);
+    const airDate = getAirDate(row, null, lookupDelay);
+    const level = getBgLevel(airDate);
+    const bg = getBgByLevel(level, false);
+    const bgEmpty = getBgByLevel(level - 1, true);
+    const isSelected = tr.classList.contains('row-selected');
+    const SELECTED_BG = '#2d3d52';
+    const SELECTED_EDIT_BG = '#1a2f5a';
+    const TEMP_EDIT_BG = '#1a2f5a';
+
     const tds = [...tr.children];
     for (const td of tds) {
       if (td.colSpan > 1) continue;
-      if (td.classList.contains('u-cell')) td.style.background = bg;
+      if (!td.classList.contains('u-cell')) continue;
+      const isTempEdit = td.classList.contains('cell-temp-edited');
+      let bgToUse;
+      if (isTempEdit) bgToUse = isSelected ? SELECTED_EDIT_BG : TEMP_EDIT_BG;
+      else if (isSelected) bgToUse = SELECTED_BG;
+      else bgToUse = bg;
+      td.style.setProperty('background', bgToUse, 'important');
       const ta = td.querySelector('textarea.u-downloaded');
-      if (ta && !ta.closest('.editing-expand') && !ta.closest('.u-focus-expand')) ta.style.background = 'transparent';
+      if (ta && !ta.closest('.editing-expand') && !ta.closest('.u-focus-expand')) {
+        ta.style.setProperty('background', 'transparent', 'important');
+      }
     }
-    const checkEmpty = [
-      [1, () => !String(row.资源 ?? '').trim() && !String(row.规则 ?? '').trim()],
-      [9, () => !String(effective(row, '中文', parsed)).trim()],
-      [10, () => !String(effective(row, '年', parsed)).trim()],
-      [11, () => !String(effective(row, '开播', parsed)).trim()],
-      [12, () => !String(row.放送 ?? '').trim()],
-      [13, () => !String(effective(row, '最大', parsed)).trim()],
-    ];
-    for (const [idx, isEmpty] of checkEmpty) {
-      if (!isEmpty()) continue;
-      const td = tds[idx]; if (td) td.style.background = bgDarker;
+    // 空值列覆盖：仅在未选中且非临时编辑时套用"上一时段色"
+    if (!isSelected) {
+      const checkEmpty = [
+        [1, () => !String(row.资源 ?? '').trim() && !String(row.规则 ?? '').trim()],
+        [9, () => !String(effective(row, '中文', parsed)).trim()],
+        [10, () => !String(effective(row, '年', parsed)).trim()],
+        [11, () => !String(effective(row, '开播', parsed)).trim()],
+        [12, () => !String(row.放送 ?? '').trim()],
+        [13, () => !String(effective(row, '最大', parsed)).trim()],
+      ];
+      for (const [idx, isEmpty] of checkEmpty) {
+        if (!isEmpty()) continue;
+        const td = tds[idx];
+        if (td && !td.classList.contains('cell-temp-edited')) {
+          td.style.setProperty('background', bgEmpty, 'important');
+        }
+      }
     }
   }
   function applyRowBackgrounds() { for (const tr of tbody.children) if (tr._row) applyRowBackground(tr); }
@@ -3615,14 +4304,70 @@ function showEditDialog() {
   function autoResizeInput(input) {
     const cls = input.classList;
     const isWide = cls && (cls.contains('u-name') || cls.contains('u-cn') || cls.contains('u-update'));
+    const avail = computeAvailableWidth(input, isWide);
 
-    // 空值时用 placeholder 参与宽度计算
+    // BGMID（含非编辑聚焦态 / 编辑态）：右对齐，通过离屏 clone 按 pre-wrap 计算最长行宽度
+    if (input.classList && input.classList.contains('u-bgmid')) {
+      const container = input.closest('#unifiedTableHost') || input.closest('#gmEditOverlay') || document.body;
+      const cRect = container.getBoundingClientRect();
+      const td = input.closest('td');
+      const tdRect = td ? td.getBoundingClientRect() : input.getBoundingClientRect();
+      const availRight = Math.max(60, tdRect.right - cRect.left - 12);
+
+      // 归一文本为"多行"形式（逗号后插入换行）
+      const raw = String(input.textContent ?? '');
+      let normalized;
+      if (raw.includes('\n')) {
+        normalized = raw;
+      } else {
+        const parts = raw.split(',');
+        normalized = parts.map((p, i) => i < parts.length - 1 ? p + ',\n' : p).join('');
+      }
+
+      // 离屏 clone 测量
+      const clone = document.createElement('div');
+      clone.textContent = normalized;
+      const cs = getComputedStyle(input);
+      Object.assign(clone.style, {
+        position: 'absolute',
+        visibility: 'hidden',
+        pointerEvents: 'none',
+        top: '-9999px',
+        left: '0',
+        width: 'max-content',
+        minWidth: '0',
+        maxWidth: availRight + 'px',
+        height: 'auto',
+        maxHeight: 'none',
+        padding: '2px 4px',
+        border: '0',
+        boxSizing: 'border-box',
+        whiteSpace: 'pre-wrap',
+        wordBreak: 'break-all',
+        overflow: 'visible',
+        fontFamily: cs.fontFamily,
+        fontSize: cs.fontSize,
+        fontWeight: cs.fontWeight,
+        fontStyle: cs.fontStyle,
+        lineHeight: '1.4',
+      });
+      document.body.appendChild(clone);
+      void clone.offsetWidth;
+      const measuredW = clone.getBoundingClientRect().width;
+      clone.remove();
+
+      // 冗余：padding 左右 8 + 边框 2 + 亚像素/字距缓冲 12
+      const targetW = Math.min(availRight, Math.max(tdRect.width, Math.ceil(measuredW) + 12));
+      input.style.setProperty('width', targetW + 'px', 'important');
+      input.style.setProperty('max-width', availRight + 'px', 'important');
+      input.style.setProperty('box-sizing', 'border-box', 'important');
+      return;
+    }
+    // input / textarea
     const rawValue = (input.value ?? input.textContent ?? '') || '';
     const placeholder = input.placeholder || '';
     const text = rawValue || placeholder;
     const textW = measureTextWidth(text, '16px sans-serif');
-
-    const avail = computeAvailableWidth(input, isWide);
     const baseMin = isWide ? 240 : 38;
     const minW = Math.max(baseMin, input.parentElement?.clientWidth || 0);
     const w = Math.max(minW, Math.min(avail, textW + 24));
@@ -3654,37 +4399,54 @@ function showEditDialog() {
     const tr = e.target.closest('tr'); if (!tr || !tr._row) return;
     const isControl = e.ctrlKey || e.metaKey;
     const isShift = e.shiftKey;
-    if (isControl || isShift) {
+
+    if (isShift) {
       e.preventDefault(); e.stopPropagation();
-      shiftAnchorTr = null; shiftFocusIdx = -1;
-      if (isShift && selAnchor) selectRange(selAnchor, tr);
-      else if (isControl) { toggleRowSelect(tr, true); selAnchor = tr; }
-      updateSelectionBorders();
+      // Shift+点击：从 anchor（或当前行）扩展到目标行
+      const base = (selAnchorTr && selAnchorTr.isConnected) ? selAnchorTr : tr;
+      if (!selAnchorTr || !selAnchorTr.isConnected) selAnchorTr = base;
+      setRangeSelection(base, tr);
       return;
     }
-    if (e.target.closest('input, textarea, button, a, [contenteditable="true"], .u-combined')) return;
+    if (isControl) {
+      e.preventDefault(); e.stopPropagation();
+      // Ctrl+点击：独立切换；anchor 更新为当前行
+      toggleSelect(tr);
+      selAnchorTr = tr;
+      return;
+    }
+
+    // 无修饰键
+    if (e.target.closest('input, textarea, button, a, [contenteditable], .u-combined')) {
+      const sel = getSelectedRows();
+      if (sel.length > 1 || !tr.classList.contains('row-selected')) {
+        selectSingle(tr);
+        selAnchorTr = tr;
+      }
+      return;
+    }
+
     e.preventDefault();
-    clearRowSelection();
-    tr.classList.add('row-selected');
-    selAnchor = tr;
+    selectSingle(tr);
+    selAnchorTr = tr;
     selDragging = true;
-    updateSelectionBorders();
+
     const td = e.target.closest('td.u-cell');
     if (td && td._acgripCell && !td._acgripCell.isCombined) {
-      const hasInput = td.querySelector('input, textarea, [contenteditable="true"]');
+      const hasInput = td.querySelector('input, textarea, [contenteditable]');
       if (!hasInput) {
         if (td.tabIndex < 0) td.tabIndex = 0;
-        try { td.focus(); } catch {}
+        try { td.focus({ preventScroll: true }); } catch {}
       }
     }
   });
   document.addEventListener('mousemove', (e) => {
-    if (!selDragging || !selAnchor) return;
+    if (!selDragging || !selAnchorTr) return;
     const el = document.elementFromPoint(e.clientX, e.clientY);
     const tr = el?.closest('#gmEditOverlay tr');
     if (!tr || !tr._row) return;
-    if (tr === selAnchor) { clearRowSelection(); tr.classList.add('row-selected'); }
-    else selectRange(selAnchor, tr);
+    if (tr === selAnchorTr) { clearRowSelection(); tr.classList.add('row-selected'); }
+    else selectRange(selAnchorTr, tr);
   });
   document.addEventListener('mouseup', () => { selDragging = false; });
   tbody.addEventListener('focusin', (e) => {
@@ -3693,7 +4455,7 @@ function showEditDialog() {
     if (!tr.classList.contains('row-selected')) {
       clearRowSelection();
       tr.classList.add('row-selected');
-      selAnchor = tr;
+      selAnchorTr = tr;
     }
     updateSelectionBorders();
   });
@@ -3794,31 +4556,93 @@ function showEditDialog() {
     function doImport(updateExisting) {
       const importedRows = importTableHtml(area.innerHTML);
       if (!importedRows.length) { alert('未识别到表格数据'); return; }
-      const currentRows = collectUnifiedRows();
-      function namesOfExisting(row) {
-        const p = parseBGMID(row.BGMID);
-        return new Set([String(row.中文 ?? '').trim(), String(row.名称 ?? '').trim(), String(p.中文 ?? '').trim(), String(p.名称 ?? '').trim()].filter(Boolean));
-      }
-      function namesOfImport(ir) { return new Set([String(ir['中文'] ?? '').trim(), String(ir['名称'] ?? '').trim()].filter(Boolean)); }
-      let updated = 0, added = 0;
-      for (const ir of importedRows) {
-        const importNames = namesOfImport(ir); if (!importNames.size) continue;
-        const match = currentRows.find(cr => { const s = namesOfExisting(cr); for (const k of importNames) if (s.has(k)) return true; return false; });
-        if (match && updateExisting) { for (const [k, v] of Object.entries(ir)) { if (v === '' || v == null) continue; match[k] = v; } updated++; }
-        else if (!match) {
-          currentRows.push({
-            下集: ir['下集'] || '', 中文: ir['中文'] || '', 名称: ir['名称'] || '', 年: ir['年'] || '', 开播: ir['开播'] || '', 放送: ir['放送'] || '',
-            最大: ir['最大'] || '', 初始: ir['初始'] || '', 前季: ir['前季'] || '', 更新: ir['更新'] || '', BGMID: ir['BGMID'] || '',
-            资源: ir['资源'] || '', 规则: ir['规则'] || '', 延周: ir['延周'] || '', 延日: ir['延日'] || '', 已下载: ir['已下载'] || '',
-          });
-          added++;
+
+      // 1. 从 UI 读当前快照（副本）+ 每行的原值元数据
+      const metas = [];
+      {
+        let idx = 0;
+        const allRowObjects = collectUnifiedRows(); // [{...row}]
+        for (const tr of tbody.querySelectorAll('tr')) {
+          if (!tr._row || rowIsEmpty(tr._row)) continue;
+          const copy = allRowObjects[idx] || { ...tr._row };
+          metas.push({ row: copy });
+          idx++;
         }
       }
+
+      // 2. 名称匹配工具
+      function namesOfRow(row) {
+        const p = parseBGMID(row.BGMID || '');
+        return new Set([
+          String(row.中文 ?? '').trim(),
+          String(row.名称 ?? '').trim(),
+          String(p.中文 ?? '').trim(),
+          String(p.名称 ?? '').trim(),
+        ].filter(Boolean));
+      }
+      function namesOfImport(ir) {
+        const p = parseBGMID(ir['BGMID'] || '');
+        return new Set([
+          String(ir['中文'] ?? '').trim(),
+          String(ir['名称'] ?? '').trim(),
+          String(p.中文 ?? '').trim(),
+          String(p.名称 ?? '').trim(),
+        ].filter(Boolean));
+      }
+
+      const newRows = [];
+      let updated = 0, added = 0;
+
+      for (const ir of importedRows) {
+        const importNames = namesOfImport(ir);
+        if (!importNames.size) continue;
+
+        let matchedMeta = null;
+        for (const meta of metas) {
+          const s = namesOfRow(meta.row);
+          let hit = false;
+          for (const k of importNames) if (s.has(k)) { hit = true; break; }
+          if (hit) { matchedMeta = meta; break; }
+        }
+
+        if (matchedMeta && updateExisting) {
+          // 修改的是副本 meta.row，后续重建时生效
+          for (const [k, v] of Object.entries(ir)) {
+            if (v === '' || v == null) continue;
+            matchedMeta.row[k] = v;
+          }
+          updated++;
+          console.log('[导入] 更新已有行', { name: [...importNames][0], fields: Object.keys(ir) });
+        } else if (!matchedMeta) {
+          const newRow = {
+            下集: ir['下集'] || '', 中文: ir['中文'] || '', 名称: ir['名称'] || '', 年: ir['年'] || '',
+            开播: ir['开播'] || '', 放送: ir['放送'] || '', 最大: ir['最大'] || '', 初始: ir['初始'] || '',
+            前季: ir['前季'] || '', 更新: ir['更新'] || '', BGMID: ir['BGMID'] || '',
+            资源: ir['资源'] || '', 规则: ir['规则'] || '', 延周: ir['延周'] || '', 延日: ir['延日'] || '',
+            已下载: ir['已下载'] || '',
+          };
+          newRows.push(newRow);
+          added++;
+          console.log('[导入] 新增行', { name: [...importNames][0] });
+        }
+      }
+
+      // 3. 重建 UI（编辑缓存，不写 bangumiData）
+      // buildRow 内部会用 storedRowSnapshot(row) 作为基准 → 已有行对比存储，新增行对比空
       tbody.innerHTML = '';
-      for (const r of currentRows) buildRow(r);
-      ensureTrailingEmpty(); sortMainRows();
+      for (const meta of metas) buildRow(meta.row);
+      for (const row of newRows) buildRow(row);
+
+      ensureTrailingEmpty();
+      rebuildDividerRows();
+      adjustAdaptiveColumns();
+      updateDelayNameHighlight();
+
+      // 4. 立即写草稿
+      flushDraftSave();
+
       ov.remove();
-      alert(`导入完成：更新 ${updated} 行，新增 ${added} 行`);
+      alert(`导入完成：更新 ${updated} 行，新增 ${added} 行（尚未保存，点"保存"写入实际数据）`);
     }
     importOnlyNew.addEventListener('click', () => doImport(false));
     importUpdate.addEventListener('click', () => doImport(true));
@@ -3869,16 +4693,46 @@ function showEditDialog() {
       delete bd.tracking; delete bd.trackingDownloaded;
       setValue('bangumiData', bd);
       clearDraft();
+      setDiscardBtnEnabled(false);
       setValue(LAST_KEY, {
         id: dialog.querySelector('#inpLast').value,
         match: dialog.querySelector('#inpLastDownload').value,
         viewed: dialog.querySelector('#inpLastViewed').value,
       });
+      // 保存后，三个输入框的临时修改标记清除
+      lastModified.viewed = false;
+      lastModified.id = false;
+      lastModified.match = false;
+      refreshLastEditedMark();
       loadDatas();
       onHandleItems(setDisplayHighlight);
       const newRuleKeys = new Set(Object.keys(collectTrackingFromRows(newRows)).filter(k => !oldTrackingKeys.has(k)));
+
+      // 删除 UI 上所有空行（保留最后一个作为输入位，由 ensureTrailingEmpty 补）
+      const emptyTrs = [];
+      for (const tr of tbody.children) {
+        if (tr._row && rowIsEmpty(tr._row)) emptyTrs.push(tr);
+      }
+      for (const tr of emptyTrs) tr.remove();
+      ensureTrailingEmpty();
+
+      // 关键：保存后先把快照重置为已保存值，再 sortMainRows
+      // 这样 rebuildDividerRows 的 END 判定使用新值，已完结→未完结的行能正确回到原位
+      for (const tr of tbody.querySelectorAll('tr')) {
+        if (!tr._row) continue;
+        tr._originalValues = snapshotRowValues(tr._row);
+        refreshTempEditedMark(tr);
+      }
+
       sortMainRows();
       showToast('已保存');
+
+      // 保存后重置快照，清除临时编辑标记
+      for (const tr of tbody.querySelectorAll('tr')) {
+        if (!tr._row) continue;
+        tr._originalValues = snapshotRowValues(tr._row);
+        refreshTempEditedMark(tr);
+      }
       if (newRuleKeys.size && lastViewed) setTimeout(() => { downloadSince(lastViewed, newRuleKeys).catch(err => console.error(err)); }, 100);
     } catch (err) { alert('数据错误，请检查：' + err.message); }
   });
@@ -3888,10 +4742,13 @@ function showEditDialog() {
   dialog.querySelector('#discardChangesBtn').addEventListener('click', () => {
     if (!confirm('将丢弃所有未保存的更改，恢复到上次保存的状态，确定？')) return;
     clearDraft();
+    setDiscardBtnEnabled(false);
     _gmEditShow = null;
     _gmEditOverlay = null;
     _gmEditHide = null;
+    _gmEditRelayout = null;
     if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+    try { localStorage.setItem(PANEL_OPEN_KEY, '1'); } catch {}  // 重建后保持打开
     showEditDialog();
   });
   /* ---- 全局 Esc / Ctrl+S ---- */
@@ -3906,13 +4763,10 @@ function showEditDialog() {
     const selected = getSelectedRows();
     if (selected.length > 1) {
       const activeTr = ae?.closest?.('tr');
-      let target = (activeTr && activeTr._row && selected.includes(activeTr)) ? activeTr : selAnchor;
+      let target = (activeTr && activeTr._row && selected.includes(activeTr)) ? activeTr : selAnchorTr;
       if (!target || !target._row) target = selected[0];
-      clearRowSelection();
-      target.classList.add('row-selected');
-      selAnchor = target;
-      updateSelectionBorders();
-      shiftAnchorTr = null; shiftFocusIdx = -1;
+      selectSingle(target);
+      selAnchorTr = target;
       e.preventDefault(); e.stopPropagation();
       return;
     }
@@ -3985,6 +4839,7 @@ function showEditDialog() {
     saveLastCellState();
     flushDraftSave();
     overlay.style.display = 'none';
+    try { localStorage.setItem(PANEL_OPEN_KEY, '0'); } catch {}
     document.body.classList.remove('acgrip-split');
     void document.body.offsetWidth;
     requestAnimationFrame(() => positionDisplay());
@@ -4019,22 +4874,56 @@ function showEditDialog() {
   window.addEventListener('resize', layoutResizeHandler);
   _gmEditShow = () => {
     overlay.style.display = 'flex';
+    try { localStorage.setItem(PANEL_OPEN_KEY, '1'); } catch {}
     document.removeEventListener('keydown', escKeyHandler, true);
     document.addEventListener('keydown', escKeyHandler, true);
     document.removeEventListener('keydown', saveKeyHandler, true);
     document.addEventListener('keydown', saveKeyHandler, true);
-    window.addEventListener('resize', layoutResizeHandler);
     selfAdaptiveTextarea();
+    // 打开时按当前草稿状态刷新按钮
+    setDiscardBtnEnabled(!!localStorage.getItem(DRAFT_KEY));
     requestAnimationFrame(() => {
-      // 第一帧：加入 acgrip-split class，触发原页面收缩
       layoutOverlay();
       requestAnimationFrame(() => {
-        // 第二帧：此时 session-bar 已移动到新的位置
         layoutOverlay();
-        // layoutOverlay 内部尾部已调度 positionDisplay 到下一个 rAF
         restoreLastCellState();
       });
     });
+  };
+  overlay._syncRowUpdate = (rule, newNext) => {
+    let changed = false;
+    for (const tr of tbody.querySelectorAll('tr')) {
+      const row = tr._row;
+      if (!row) continue;
+      if ((row.规则 || '').trim() !== rule) continue;
+
+      const oldVal = String(row.下集 ?? '');
+      // 无条件写入新值
+      row.下集 = String(newNext);
+
+      const nextInput = tr.querySelector('.u-next');
+      const cell = nextInput && nextInput._acgripCell;
+      const isEditing = !!(cell && cell._editing);
+
+      if (nextInput) {
+        if (isEditing) {
+          // 编辑态：更新 _original（避免 Esc 后回退到旧值），保留用户输入
+          if (cell) cell._original = nextInput.value;
+        } else {
+          // 非编辑态：立即更新显示为新的 pad2 值
+          nextInput.value = pad2Display(newNext);
+        }
+      }
+
+      // 强制刷新派生字段（播出时间、高亮、总集等）
+      if (typeof tr._updateDerived === 'function') tr._updateDerived();
+
+      scheduleDraftSave();
+      if (oldVal !== String(newNext)) changed = true;
+      console.log('[面板同步]', { rule, old: oldVal, new: newNext, editing: isEditing, changed });
+      break;
+    }
+    return changed;
   };
   _gmEditHide = hideDialog;
   _gmEditOverlay = overlay;

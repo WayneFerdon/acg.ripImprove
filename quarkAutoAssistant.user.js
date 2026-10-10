@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      5.1.0
-// @description  夸克网盘平台层：UI（按需挂载）+ DOM 工具 + 下载流程 + 保存原语
+// @version      5.2.2
+// @description  夸克网盘平台层：UI + DOM 工具 + 下载流程 + 保存原语 + 对比清理失效记录
 // @match        https://pan.quark.cn/*
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -249,23 +249,18 @@
   }
 
   /* ============================================================
-   *  下载记录（GM）
+   *  下载记录（GM） —— 只读，TTL 过滤交给 isFidDownloaded
    * ============================================================ */
   function loadDlRecords() {
-    const recs = gmGet(GM_DL_RECORDS, {}) || {};
-    const now = Date.now();
-    for (const k of Object.keys(recs)) {
-      const ts = typeof recs[k] === 'number' ? recs[k] : (recs[k].ts || 0);
-      if (now - ts > DL_TTL) delete recs[k];
-    }
-    return recs;
+    return gmGet(GM_DL_RECORDS, {}) || {};
   }
   function saveDlRecords(recs) { gmSet(GM_DL_RECORDS, recs); }
   function isFidDownloaded(fid) {
     if (!fid) return false;
     const recs = loadDlRecords();
     const r = recs[fid];
-    const ts = typeof r === 'number' ? r : (r && r.ts || 0);
+    if (!r) return false;
+    const ts = typeof r === 'number' ? r : (r.ts || 0);
     return ts > 0 && Date.now() - ts <= DL_TTL;
   }
   function markFidDownloaded(fid, info = {}) {
@@ -285,6 +280,19 @@
     saveDlRecords(recs);
   }
   function clearAllDlRecords() { saveDlRecords({}); }
+
+  /* 返回"已过期"的所有 fid（不改存储） */
+  function pickExpiredFids() {
+    const recs = loadDlRecords();
+    const now = Date.now();
+    const out = [];
+    for (const k of Object.keys(recs)) {
+      const r = recs[k];
+      const ts = typeof r === 'number' ? r : (r && r.ts || 0);
+      if (!ts || now - ts > DL_TTL) out.push(k);
+    }
+    return out;
+  }
 
   /* ============================================================
    *  置灰 + 进度
@@ -586,23 +594,164 @@
   }
 
   /* ============================================================
-   *  ★★★ 启动时自动下载（无条件，不看页面怎么打开）
+   *  ★ 对比清理失效记录（主逻辑）
+   *  记录里存在、但当前页文件列表里已无对应 fid → 视为失效，清掉记录
+   * ============================================================ */
+  function purgeMissingRecords() {
+    if (!isListPage()) return 0;
+    const files = scanFileRows();
+    if (!files.length) { log('对比清理：当前页无文件，跳过'); return 0; }
+
+    const pageFids = new Set(files.map(f => f.fid).filter(Boolean));
+    if (!pageFids.size) { log('对比清理：当前页无 fid，跳过'); return 0; }
+
+    const recs = loadDlRecords();
+    const stale = [];
+    for (const fid of Object.keys(recs)) {
+      if (!pageFids.has(fid)) stale.push(fid);
+    }
+    if (!stale.length) { log('对比清理：无失效记录'); return 0; }
+
+    clearDlRecordsFids(stale);
+    log(`★ 对比清理：移除 ${stale.length} 条失效记录（本页 ${pageFids.size} 个文件）`);
+    return stale.length;
+  }
+
+  /* ============================================================
+   *  底层 UI 删除工具（保留为可选 API，自动流程不再调用）
+   * ============================================================ */
+
+  /* 取消勾选所有行 */
+  async function clearAllSelection() {
+    const rows = document.querySelectorAll('tr.ant-table-row, [data-row-key]');
+    for (const row of rows) {
+      if (row.classList.contains('ant-table-row-selected')) {
+        const lbl = row.querySelector('label.ant-checkbox-wrapper');
+        if (lbl) { realClick(lbl); await sleep(60); }
+      }
+    }
+  }
+
+  /* 顶栏"删除"按钮（异步等待出现；勾选后才会被渲染） */
+  async function clickDeleteButton(timeout = 6000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      for (const btn of document.querySelectorAll('.btn-group button.btn-file, .btn-group button.ant-btn')) {
+        const txt = (btn.textContent || '').replace(/\s+/g, '');
+        if (txt === '删除' && isVisible(btn)) { realClick(btn); return true; }
+      }
+      for (const btn of document.querySelectorAll('button.btn-file, button.ant-btn')) {
+        const txt = (btn.textContent || '').replace(/\s+/g, '');
+        if (txt === '删除' && isVisible(btn)) { realClick(btn); return true; }
+      }
+      await sleep(150);
+    }
+    return false;
+  }
+
+  /* 确认删除弹窗：优先 .ant-btn-primary（"确认删除"） */
+  async function confirmDeleteDialog(timeout = 6000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      const modal =
+        document.querySelector('.base-confirm-modal .ant-modal') ||
+        document.querySelector('.ant-modal-root .ant-modal-wrap[role="dialog"] .ant-modal') ||
+        findVisibleModal();
+
+      if (modal && isVisible(modal)) {
+        const primary = modal.querySelector('.ant-modal-footer .ant-btn-primary');
+        if (primary && isVisible(primary)) {
+          const txt = (primary.textContent || '').replace(/\s+/g, '');
+          if (/确认删除|确定删除|^删除$|^确定$|^确认$/.test(txt)) {
+            realClick(primary);
+            return true;
+          }
+        }
+        for (const btn of modal.querySelectorAll('.ant-modal-footer button')) {
+          if (!isVisible(btn)) continue;
+          const txt = (btn.textContent || '').replace(/\s+/g, '');
+          if (/确认删除|确定删除|^删除$|^确定$|^确认$/.test(txt)) {
+            realClick(btn);
+            return true;
+          }
+        }
+      }
+      await sleep(200);
+    }
+    return false;
+  }
+
+  /* 等删除结果 */
+  async function waitDeleteResult(timeout = 8000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      let text = '';
+      try {
+        for (const sel of ['.ant-message-notice', '.ant-notification-notice', '.swal2-popup']) {
+          for (const el of document.querySelectorAll(sel)) {
+            if (isVisible(el)) text += ' ' + (el.textContent || '');
+          }
+        }
+      } catch {}
+      if (/删除成功|已删除|删除完成/.test(text)) return 'success';
+      if (/删除失败|操作失败|无法删除/.test(text)) return 'fail';
+      const stillConfirm = document.querySelector('.base-confirm-modal');
+      if (!stillConfirm || !isVisible(stillConfirm)) return 'success';
+      await sleep(300);
+    }
+    return 'unknown';
+  }
+
+  /* 用复选框删除指定 fid 集合（仅当前页能匹配到的） */
+  async function deleteRowsByFids(fids) {
+    if (!fids || !fids.length) return 0;
+    const fidSet = new Set(fids);
+
+    await clearAllSelection();
+    await sleep(300);
+
+    const rows = document.querySelectorAll('tr.ant-table-row[data-row-key]');
+    let picked = 0;
+    for (const row of rows) {
+      const fid = row.getAttribute('data-row-key');
+      if (!fid || !fidSet.has(fid)) continue;
+      const lbl = row.querySelector('label.ant-checkbox-wrapper');
+      const input = row.querySelector('input.ant-checkbox-input');
+      if (!lbl || !input) continue;
+      if (!input.checked) { realClick(lbl); await sleep(120); }
+      const recheck = row.querySelector('input.ant-checkbox-input');
+      if (recheck && recheck.checked) picked++;
+    }
+    if (!picked) { log('  目标 fid 在当前页未匹配到可勾选行'); return 0; }
+
+    await sleep(300);
+    if (!await clickDeleteButton()) { warn('  未找到顶栏删除按钮'); return 0; }
+    if (!await confirmDeleteDialog()) { warn('  未找到删除确认按钮'); return 0; }
+    const r = await waitDeleteResult();
+    log('  删除结果:', r);
+    await sleep(800);
+    return picked;
+  }
+
+  /* ============================================================
+   *  ★ 启动自动流程：先对比清理失效记录 → 再自动下载
    * ============================================================ */
   async function tryAutoDownloadOnBoot() {
-    if (downloadRunning) { log('★ 自动下载：已有任务，跳过'); return; }
-    // 桥接脚本正在转存 → 等它 reload 后再试
+    if (downloadRunning) { log('★ 自动流程：已有任务，跳过'); return; }
     if (sessionStorage.getItem(BUSY_KEY) === '1') {
-      log('★ 自动下载：桥接脚本转存中，跳过');
+      log('★ 自动流程：桥接脚本转存中，跳过');
       return;
     }
+
+    // ★ 先对比清理：记录里存在但当前页已无对应文件
+    purgeMissingRecords();
+
     log('★ 自动下载检查启动...');
 
-    // 1. 等下载助手
     const ok = await until(() => document.querySelector('.quark-button.pl-button'), 500, 20000);
     if (!ok) { log('  下载助手未就绪，跳过'); return; }
     await sleep(800);
 
-    // 2. 等表格稳定
     let files = [];
     const t0 = Date.now();
     let lastCount = -1, stableHits = 0;
@@ -617,16 +766,17 @@
       lastCount = files.length;
       await sleep(400);
     }
-    if (!files.length) { log('  列表无文件，跳过'); return; }
+    if (!files.length) { log('  列表无文件，跳过下载'); return; }
 
-    // 3. 有未下载 → 下载
     const pending = files.filter(f => f.fid && !isFidDownloaded(f.fid));
     log(`  列表 ${files.length} 个文件，未下载 ${pending.length} 个`);
-    if (!pending.length) { log('  无需下载，跳过'); return; }
-
-    log(`★ 启动自动下载（${pending.length} 个）`);
-    await autoDownloadWorkflow({ maxRounds: 3 });
-    log('★ 自动下载完成');
+    if (pending.length) {
+      log(`★ 启动自动下载（${pending.length} 个）`);
+      await autoDownloadWorkflow({ maxRounds: 3 });
+      log('★ 自动下载完成');
+    } else {
+      log('  无需下载，跳过');
+    }
   }
 
   /* ============================================================
@@ -663,8 +813,17 @@
       onclick: () => autoDownloadWorkflow(),
     });
     addBuiltinAction({
+      label: '🔍 清理失效记录', color: '#d46b08',
+      title: '对比本页实际文件，清掉"记录存在但文件已不存在"的下载记录',
+      onclick: () => {
+        const n = purgeMissingRecords();
+        refreshGray();
+        alert(`已清理 ${n} 条失效记录`);
+      },
+    });
+    addBuiltinAction({
       label: '🗑️ 清除下载记录', color: '#8c2f1f',
-      title: '清除本页/全部下载记录',
+      title: '清除本页/全部下载记录（只删记录，不删文件）',
       onclick: () => clearDlRecordsFlow(),
     });
   }
@@ -673,7 +832,7 @@
    *  对外 API
    * ============================================================ */
   unsafeWindow.quarkAssistant = {
-    version: '5.1.0',
+    version: '5.2.2',
     isReady: () => true,
     isListPage, isSharePage,
 
@@ -692,9 +851,18 @@
 
     loadDlRecords, saveDlRecords, isFidDownloaded,
     markFidDownloaded, clearDlRecordsFids, clearAllDlRecords,
+    pickExpiredFids,
 
     autoDownloadWorkflow, triggerApiDownload, handleApiDialog,
     waitForApiReady, clickRefresh,
+
+    // 对比清理（推荐入口）
+    purgeMissingRecords,
+
+    // 底层 UI 删除工具（自动流程不调用，可独立使用）
+    clearAllSelection, clickDeleteButton,
+    confirmDeleteDialog, waitDeleteResult,
+    deleteRowsByFids,
   };
 
   /* ============================================================
@@ -708,13 +876,14 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus('待机（个人页）');
-      log('平台层就绪（个人页）v5.1.0');
-      // ★ 无条件自动下载：延迟 3 秒启动
+      log('平台层就绪（个人页）v5.2.2');
+
+      // 启动后：先对比清理失效记录 → 再走自动下载
       setTimeout(() => { tryAutoDownloadOnBoot(); }, 3000);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v5.1.0');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v5.2.2');
     } else {
-      log('平台层就绪（其他页）v5.1.0');
+      log('平台层就绪（其他页）v5.2.2');
     }
 
     startGrayPolling();

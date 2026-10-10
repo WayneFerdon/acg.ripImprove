@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         acg.ripImprove.Bridge2QuarkPan
 // @namespace    http://tampermonkey.net/
-// @version      3.0.0
-// @description  acg.rip 桥接：夸克转存业务编排（下载完全交给 QuarkAutoAssistant）
+// @version      3.0.1
+// @description  acg.rip 桥接：夸克转存业务编排（下载完全交给 QuarkAutoAssistant；转存前按修改日期倒序）
 // @match        *://acg.rip/*
 // @match        https://pan.quark.cn/*
 // @grant        GM_setValue
@@ -42,7 +42,21 @@
 
   const log  = (...a) => console.log('[桥接]', ...a);
   const warn = (...a) => console.warn('[桥接]', ...a);
+
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  /* ============================================================
+   *  通用轮询：每隔 delay 检查一次 fn，返回首个真值；超时返回 null
+   * ============================================================ */
+  async function until(fn, delay = 200, timeout = 10000) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      const r = await fn();
+      if (r) return r;
+      await sleep(delay);
+    }
+    return null;
+  }
 
   function gmGet(key, def) {
     try {
@@ -55,9 +69,10 @@
   function gmRaw(key, def) {
     try { const v = GM_getValue(key); return v == null ? def : v; } catch { return def; }
   }
+
   /* ============================================================
- *  跨标签页通信：单 key Map，消费即删，读时清过期
- * ============================================================ */
+   *  跨标签页通信：单 key Map，消费即删，读时清过期
+   * ============================================================ */
   function _pruneByTTL(m, ttl) {
     const now = Date.now();
     let dirty = false;
@@ -105,13 +120,13 @@
     if (m[shareId]) { delete m[shareId]; gmSet(GM_RESULTS, m); }
   }
 
-  // 启动时清一次残留
   function cleanupBridgeComm() {
     const tasks = gmGet(GM_TASKS, {}) || {};
     if (_pruneByTTL(tasks, TASK_TTL)) gmSet(GM_TASKS, tasks);
     const results = gmGet(GM_RESULTS, {}) || {};
     if (_pruneByTTL(results, TAB_RESULT_TIMEOUT)) gmSet(GM_RESULTS, results);
   }
+
   function getFolderId() {
     const v = GM_getValue(GM_FOLDER, '');
     if (v == null) return '';
@@ -220,6 +235,84 @@
   }
 
   /* ============================================================
+   *  排序：确保按“修改日期”降序（全程 until 轮询）
+   * ============================================================ */
+  function findTimeSortHeader(doc = document) {
+    const ths = doc.querySelectorAll('th.td-file-sort');
+    for (const th of ths) {
+      const title = (th.querySelector('.ant-table-column-title')?.textContent || '').trim();
+      if (/修改日期|修改时间/.test(title)) return th;
+    }
+    return null;
+  }
+
+  function getThSortState(th) {
+    const el = th && th.querySelector('.table-order');
+    if (!el) return 'none';
+    if (el.classList.contains('order-desc')) return 'desc';
+    if (el.classList.contains('order-asc'))  return 'asc';
+    return 'none';
+  }
+
+  async function ensureTimeDescSort(qa, doc = document, opts = {}) {
+    const interval      = opts.interval      ?? 200;
+    const headerTimeout = opts.headerTimeout ?? 15000;
+    const settleTimeout = opts.settleTimeout ?? 6000;
+    const maxTries      = opts.maxTries      ?? 4;
+
+    // ① 等“修改日期”表头出现
+    const th0 = await until(() => findTimeSortHeader(doc), interval, headerTimeout);
+    if (!th0) {
+      warn(`  排序：${headerTimeout}ms 内未找到“修改日期”表头，按无目标处理，跳过`);
+      return { ok: false, reason: 'no-th' };
+    }
+    if (getThSortState(th0) === 'desc') {
+      log('  排序：已是“修改日期”降序');
+      return { ok: true, method: 'already' };
+    }
+
+    // ② 点击 + until 轮询状态变化
+    for (let i = 0; i < maxTries; i++) {
+      const th = findTimeSortHeader(doc);
+      if (!th) {
+        warn('  排序：点击过程中表头消失，按无目标处理');
+        return { ok: false, reason: 'no-th-midway' };
+      }
+      if (getThSortState(th) === 'desc') {
+        log(`  排序：已切到降序（第 ${i} 次点击后）`);
+        return { ok: true, method: i === 0 ? 'already' : 'clicked', tries: i };
+      }
+
+      const before = getThSortState(th);
+      const target = th.querySelector('.table-order') || th;
+      log(`  排序：第 ${i + 1} 次点击（当前状态=${before}）`);
+      try {
+        if (qa && typeof qa.realClick === 'function') qa.realClick(target);
+        else target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
+      } catch {
+        try { target.click(); } catch {}
+      }
+
+      const got = await until(() => {
+        const cur = findTimeSortHeader(doc);
+        if (!cur) return null;
+        const st = getThSortState(cur);
+        if (st === 'desc') return { done: true,  st };
+        if (st !== before) return { done: false, st };
+        return null;
+      }, interval, settleTimeout);
+
+      if (got && got.done) {
+        log(`  排序：第 ${i + 1} 次点击后 → 降序 ✔`);
+        return { ok: true, method: 'clicked', tries: i + 1 };
+      }
+    }
+
+    warn(`  排序：${maxTries} 次点击后仍未切到降序，放弃（继续原流程）`);
+    return { ok: false, reason: 'cannot-desc' };
+  }
+
+  /* ============================================================
    *  checkbox 控制
    * ============================================================ */
   function getRowCheckbox(row) {
@@ -227,35 +320,37 @@
   }
 
   async function setRowCheckbox(qa, row, desired) {
+    const isDesired = () => {
+      const c = getRowCheckbox(row);
+      return c && !!c.checked === !!desired ? c : null;
+    };
+
     let cb = getRowCheckbox(row);
     if (!cb) return { ok: false, method: 'no-checkbox' };
     if (!!cb.checked === !!desired) return { ok: true, method: 'already' };
 
+    // ① 原生 click
     try { cb.click(); } catch {}
-    await sleep(200);
-    cb = getRowCheckbox(row);
-    if (cb && !!cb.checked === !!desired) return { ok: true, method: 'native-click' };
+    if (await until(isDesired, 100, 600)) return { ok: true, method: 'native-click' };
 
+    // ② React setter
     cb = getRowCheckbox(row);
     if (cb) {
       try {
         const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'checked').set;
         setter.call(cb, desired);
-        cb.dispatchEvent(new Event('input', { bubbles: true }));
+        cb.dispatchEvent(new Event('input',  { bubbles: true }));
         cb.dispatchEvent(new Event('change', { bubbles: true }));
       } catch {}
-      await sleep(200);
-      cb = getRowCheckbox(row);
-      if (cb && !!cb.checked === !!desired) return { ok: true, method: 'react-setter' };
+      if (await until(isDesired, 100, 600)) return { ok: true, method: 'react-setter' };
     }
 
+    // ③ 点 label
     cb = getRowCheckbox(row);
     if (cb) {
       const label = cb.closest('label') || row.querySelector('label.ant-checkbox-wrapper');
       if (label) qa.realClick(label);
-      await sleep(200);
-      cb = getRowCheckbox(row);
-      if (cb && !!cb.checked === !!desired) return { ok: true, method: 'label-click' };
+      if (await until(isDesired, 100, 600)) return { ok: true, method: 'label-click' };
     }
     return { ok: false, method: 'all-failed' };
   }
@@ -282,32 +377,33 @@
     const expected = getShareFileCount(doc);
     log(`  头部显示共 ${expected == null ? '?' : expected} 个；等待表格稳定...`);
 
-    while (Date.now() - t0 < maxMs) {
-      if (!doc.querySelector('.ant-spin-spinning')) break;
-      await sleep(200);
-    }
+    // ① 等 spin 消失
+    await until(() => !doc.querySelector('.ant-spin-spinning'), 200, maxMs);
     log(`  spin 已消失，等待行数稳定...`);
 
+    // ② 等行数连续稳定
     let lastCount = -1;
     let stableHits = 0;
-    let files = [];
-    while (Date.now() - t0 < maxMs) {
-      files = qa.scanFileRows(doc);
-      const cnt = files.length;
+    const remain = () => Math.max(0, maxMs - (Date.now() - t0));
+
+    const files = await until(() => {
+      const rows = qa.scanFileRows(doc);
+      const cnt = rows.length;
       if (expected && cnt >= expected && cnt === lastCount) {
-        stableHits++;
-        if (stableHits >= 2) { log(`  行数稳定：${cnt} 行（预期 ${expected}）`); return files; }
+        if (++stableHits >= 2) return rows;
       } else if (cnt > 0 && cnt === lastCount) {
-        stableHits++;
-        if (stableHits >= 4) { log(`  行数稳定：${cnt} 行`); return files; }
+        if (++stableHits >= 4) return rows;
       } else {
         stableHits = 0;
       }
       lastCount = cnt;
-      await sleep(400);
-    }
-    log(`  等待超时，当前扫描到 ${files.length} 行`);
-    return files;
+      return null;
+    }, 400, remain());
+
+    if (files) return files;
+    const cur = qa.scanFileRows(doc);
+    log(`  等待超时，当前扫描到 ${cur.length} 行`);
+    return cur;
   }
 
   async function applyTargetChecks(qa, doc, targets) {
@@ -339,7 +435,7 @@
    * ============================================================ */
   function runQuarkAutoTrigger(opts = {}) {
     const { force = false } = opts;
-    const folderId = getFolderId().trim();     // ★
+    const folderId = getFolderId().trim();
     if (!folderId) return { triggered: false, reason: 'no-folder' };
 
     const bd = loadBangumiData();
@@ -348,7 +444,7 @@
     const urls = collectShareUrls(bd);
     if (!urls.length) return { triggered: false, reason: 'no-urls' };
 
-    const state = gmGet(GM_CD, {}) || {};      // ★ 用 gmGet
+    const state = gmGet(GM_CD, {}) || {};
     const now = Date.now();
     const need = [];
     let skippedByCD = 0;
@@ -476,16 +572,16 @@
    *  夸克端
    * ============================================================ */
   async function waitForQA(timeout = 10000) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
+    return await until(() => {
       const qa = unsafeWindow.quarkAssistant;
-      if (qa && qa.isReady && qa.isReady()) return qa;
-      await sleep(150);
-    }
-    return null;
+      return qa && qa.isReady && qa.isReady() ? qa : null;
+    }, 150, timeout);
   }
 
   async function prepareShareSave(qa, doc = document) {
+    // ★ 先确保按“修改日期”降序
+    await ensureTimeDescSort(qa, doc);
+
     let files = await waitTableStable(qa, doc, 20000);
     if (!files.length) return { ok: false, kind: 'no-files', files: [] };
 
@@ -535,7 +631,7 @@
     const shareId = extractShareId(location.href);
     if (!shareId) return false;
 
-    const task = consumeTask(shareId);   // 消费即删，内部自动清过期
+    const task = consumeTask(shareId);
     if (!task) return false;
     log(`★ [子任务] ${shareId} 开始处理`);
 
@@ -614,8 +710,8 @@
     const shareId = extractShareId(url);
     if (!shareId) return { kind: 'fail', message: 'bad-url' };
 
-    clearResult(shareId);           // 清残留
-    setTask(shareId, url);          // 写任务
+    clearResult(shareId);
+    setTask(shareId, url);
 
     log(`  → 打开标签页：${url}`);
     try {
@@ -625,12 +721,8 @@
       return { kind: 'fail', message: 'open-tab-failed' };
     }
 
-    const t0 = Date.now();
-    while (Date.now() - t0 < TAB_RESULT_TIMEOUT) {
-      const r = consumeResult(shareId);
-      if (r) return r;
-      await sleep(1000);
-    }
+    const r = await until(() => consumeResult(shareId), 1000, TAB_RESULT_TIMEOUT);
+    if (r) return r;
     clearTask(shareId);
     return { kind: 'timeout', message: 'tab-timeout' };
   }
@@ -727,7 +819,6 @@
         log('无新转存文件，跳过刷新');
       }
     } finally {
-      // 兜底清除
       try { sessionStorage.removeItem(BUSY_KEY); } catch {}
     }
   }
@@ -736,6 +827,8 @@
    *  分享页：手动转存当前页
    * ============================================================ */
   async function runSaveCurrentPage(qa) {
+    await ensureTimeDescSort(qa, document);   // ★ 手动触发也先排序
+
     const url = normalizeShareKey(location.href);
     const allFiles = qa.scanFileRows(document);
     if (!allFiles.length) { alert('当前页无文件'); return; }
@@ -821,6 +914,8 @@
    *  分享页：标记 / 清除
    * ============================================================ */
   async function runMarkFlow(qa) {
+    await ensureTimeDescSort(qa, document);   // ★
+
     const url = normalizeShareKey(location.href);
     const allFiles = qa.scanFileRows(document);
     if (!allFiles.length) { alert('无文件'); return; }
@@ -856,6 +951,8 @@
   }
 
   async function runClearShareFlow(qa) {
+    await ensureTimeDescSort(qa, document);   // ★
+
     const url = normalizeShareKey(location.href);
     const allFiles = qa.scanFileRows(document);
     const checked = allFiles.filter(f => f.checked);
@@ -897,7 +994,7 @@
    *  夸克端入口
    * ============================================================ */
   async function initQuarkSide() {
-    cleanupBridgeComm();   // ★ 清残留
+    cleanupBridgeComm();
     const qa = await waitForQA();
     if (!qa) { warn('quarkAssistant 未就绪'); return; }
     log('quarkAssistant 就绪 v' + qa.version);
@@ -920,9 +1017,21 @@
       ]);
       qa.setProgressLabel('已转存');
       qa.setGrayPredicate(file => isFileSaved(file, collectSavedInfos(loadRecords())));
+      qa.setStatus('待机（分享页）');
+
+      // ★ 分享页一进来就保证降序（异步触发，不阻塞面板挂载）
+      ensureTimeDescSort(qa, document).then(r => {
+        log(`★ 分享页初始化排序结果：${JSON.stringify(r)}`);
+        if (r && r.ok && r.method !== 'already') {
+          setTimeout(() => {
+            const rr = qa.refreshGray(document);
+            log(`★ 排序后刷新灰置：扫描 ${rr.total}，已转存 ${rr.grayed}`);
+          }, 500);
+        }
+      });
+
       const r0 = qa.refreshGray(document);
       log(`★ 分享页初始化：扫描 ${r0.total}，已转存 ${r0.grayed}`);
-      qa.setStatus('待机（分享页）');
 
       if (r0.grayed > 0) {
         setTimeout(async () => {

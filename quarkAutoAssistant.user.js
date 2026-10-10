@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      5.2.2
+// @version      5.2.4
 // @description  夸克网盘平台层：UI + DOM 工具 + 下载流程 + 保存原语 + 对比清理失效记录
 // @match        https://pan.quark.cn/*
 // @grant        GM_setValue
@@ -16,7 +16,7 @@
 
   const PREFIX = '[夸克助手]';
   const GM_DL_RECORDS = 'quark_auto_dl_records';
-  const DL_TTL   = 24 * 60 * 60 * 1000;
+  const DL_TTL   = 24 * 60 * 60 * 1000;      // 记录保留时长（仅用于置灰判定）
   const THROTTLE = 5000;
   const BUSY_KEY = 'acgrip_bridge_busy';
 
@@ -242,7 +242,9 @@
       if (tds.length >= 3) sizeStr = (tds[2].textContent || '').trim();
       const fid = row.getAttribute('data-row-key') || '';
       const cb = row.querySelector('input.ant-checkbox-input, input[type="checkbox"]');
-      out.push({ name, sizeStr, fid, iconSig: getFileIconSig(row), row, checked: !!(cb && cb.checked) });
+      const checked =
+            !!(cb && cb.checked) || row.classList.contains('ant-table-row-selected');
+      out.push({ name, sizeStr, fid, iconSig: getFileIconSig(row), row, checked });
       seen.add(name);
     }
     return out;
@@ -388,33 +390,28 @@
   }
 
   async function waitForSaveDialog(doc = document, timeout = 8000) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
+    return await until(() => {
       const modal = findVisibleModal(doc);
-      if (modal) {
-        const cbs = modal.querySelectorAll('input[type="checkbox"], input.ant-checkbox-input');
-        if (cbs.length) return modal;
-      }
-      await sleep(200);
-    }
-    return null;
+      if (!modal) return null;
+      const cbs = modal.querySelectorAll('input[type="checkbox"], input.ant-checkbox-input');
+      return cbs.length ? modal : null;
+    }, 200, timeout);
   }
 
   async function clickConfirmInDialog(doc = document, timeout = 6000) {
     const modal = findVisibleModal(doc);
     const scope = modal || doc;
     const texts = ['保存到此处', '确定保存', '确认保存', '确定', '确认'];
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
+    const ok = await until(() => {
       for (const t of texts) {
         for (const el of scope.querySelectorAll('button')) {
           const txt = (el.textContent || '').trim();
           if (txt === t && isVisible(el)) { realClick(el); return true; }
         }
       }
-      await sleep(200);
-    }
-    return false;
+      return false;
+    }, 200, timeout);
+    return !!ok;
   }
 
   function closeDialog(doc = document) {
@@ -445,8 +442,7 @@
   }
 
   async function waitResult(doc = document, timeout = 8000) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
+    const k = await until(() => {
       let text = '';
       try {
         for (const sel of ['.swal2-popup', '.ant-message-notice', '.ant-notification-notice', '.ant-modal']) {
@@ -462,9 +458,9 @@
         log('waitResult 判定:', k, '| 命中：', text.slice(0, 200).replace(/\s+/g, ' '));
         return k;
       }
-      await sleep(300);
-    }
-    return 'unknown';
+      return null;
+    }, 300, timeout);
+    return k || 'unknown';
   }
 
   /* ============================================================
@@ -476,19 +472,36 @@
     const btnEl = document.querySelector('.quark-button.pl-button');
     if (!btnEl) throw new Error('找不到"下载助手"按钮');
     const win = btnEl.ownerDocument.defaultView || window;
+
     for (const t of ['mouseenter', 'mouseover']) {
       try { btnEl.dispatchEvent(new win.MouseEvent(t, { bubbles: true, view: win })); } catch {}
     }
-    const itemEl = document.querySelector('.pl-button-mode[data-mode="api"]');
+
+    // ★ 轮询等菜单项出现（hover 后才渲染）
+    const itemEl = await until(
+      () => document.querySelector('.pl-button-mode[data-mode="api"]'),
+      100, 3000
+    );
     if (!itemEl) throw new Error('找不到 API 下载菜单项');
+
     const $ = win.jQuery || win.$;
-    if ($) { try { $(itemEl).trigger('click'); } catch {} }
-    await sleep(200);
-    if (document.querySelector('.swal2-popup')) return;
-    realClick(itemEl);
-    await sleep(200);
-    if (document.querySelector('.swal2-popup')) return;
-    try { itemEl.click(); } catch {}
+    const popupShown = () => !!document.querySelector('.swal2-popup');
+
+    if ($) {
+      try { $(itemEl).trigger('click'); } catch {}
+      if (await until(popupShown, 100, 800)) return;
+    }
+    if (popupShown()) return;
+
+    if (itemEl.isConnected) {
+      realClick(itemEl);
+      if (await until(popupShown, 100, 800)) return;
+    }
+    if (popupShown()) return;
+
+    if (itemEl.isConnected) {
+      try { itemEl.click(); } catch {}
+    }
   }
 
   async function handleApiDialog() {
@@ -503,20 +516,33 @@
     }, 250, 8000);
     const dlink = link.dataset.link || '';
     const fname = link.dataset.filename || '';
+
     if (!dlink || /失败|提示|请先|异常/.test(dlink)) {
-      document.querySelector('.swal2-close')?.click();
-      await sleep(400);
+      const closeBtn = document.querySelector('.swal2-close');
+      if (closeBtn && isVisible(closeBtn)) realClick(closeBtn);
+      await until(() => !document.querySelector('.swal2-popup'), 100, 1500);
       throw new Error('链接无效: ' + dlink.slice(0, 80));
     }
+
     log(`  触发下载: ${fname}`);
     realClick(link);
-    await sleep(2000);
-    document.querySelector('.swal2-close')?.click();
-    await until(() => !document.querySelector('.swal2-popup'), 250, 3000).catch(() => {});
-    await sleep(300);
+
+    // ★ 轮询：弹窗存在且关闭按钮可点时点掉；超时则按"无关闭按钮"处理
+    await until(() => {
+      if (!document.querySelector('.swal2-popup')) return true;
+      const btn = document.querySelector('.swal2-close');
+      if (btn && isVisible(btn)) realClick(btn);
+      return false;
+    }, 100, 2000);
+
+    // 轮询等弹窗彻底消失
+    await until(() => !document.querySelector('.swal2-popup'), 150, 3000);
   }
 
   async function downloadOneRow(row) {
+    const fid = row.getAttribute('data-row-key') || '';
+
+    // 取消其它行勾选
     const allRows = document.querySelectorAll('tr.ant-table-row, [data-row-key]');
     for (const r of allRows) {
       if (r === row) continue;
@@ -525,13 +551,37 @@
         if (lbl) realClick(lbl);
       }
     }
-    await sleep(300);
-    const label = row.querySelector('label.ant-checkbox-wrapper');
-    if (!label) throw new Error('找不到 checkbox');
-    const input = label.querySelector('input.ant-checkbox-input');
-    if (!input || !input.checked) { realClick(label); await sleep(500); }
-    const newInput = row.querySelector('input.ant-checkbox-input');
-    if (!newInput || !newInput.checked) { realClick(label); await sleep(500); }
+
+    // ★ 轮询：等其它行全部取消选中（最多 2s，超时继续）
+    await until(() => {
+      for (const r of document.querySelectorAll('tr.ant-table-row-selected')) {
+        if (r !== row && (r.getAttribute('data-row-key') || '') !== fid) return false;
+      }
+      return true;
+    }, 100, 2000);
+
+    const isChecked = () => {
+      const input = row.querySelector('input.ant-checkbox-input');
+      if (input && input.checked) return true;
+      return row.classList.contains('ant-table-row-selected');
+    };
+
+    // ★ 轮询：第一次点击勾选
+    if (!isChecked()) {
+      const lbl = row.querySelector('label.ant-checkbox-wrapper');
+      if (!lbl) throw new Error('找不到 checkbox');
+      realClick(lbl);
+      await until(isChecked, 80, 1200);
+    }
+    // ★ 轮询：仍没勾上就再点一次（保留原有"重试一次"语义）
+    if (!isChecked()) {
+      const lbl = row.querySelector('label.ant-checkbox-wrapper');
+      if (lbl) {
+        realClick(lbl);
+        await until(isChecked, 80, 1200);
+      }
+    }
+
     await triggerApiDownload();
     await handleApiDialog();
   }
@@ -559,7 +609,9 @@
       setStatus('等待下载助手...', 'running');
       const ok = await waitForApiReady();
       if (!ok) { warn('下载助手未就绪'); return; }
-      await sleep(800);
+
+      // ★ 轮询等文件行渲染出来（最多 5s；无文件也继续，下面会 break）
+      await until(() => scanFileRows().length > 0, 200, 5000);
 
       for (let round = 1; round <= maxRounds; round++) {
         const files = scanFileRows();
@@ -577,13 +629,26 @@
             refreshGray();
           } catch (e) {
             warn(`  下载失败: ${e.message}`);
-            document.querySelector('.swal2-close')?.click();
-            await sleep(400);
+            const cb = document.querySelector('.swal2-close');
+            if (cb && isVisible(cb)) realClick(cb);
+            await until(() => !document.querySelector('.swal2-popup'), 100, 1000);
           }
           if (i < pending.length - 1) await sleep(throttle);
         }
         clickRefresh();
-        await sleep(5000);
+
+        // ★ 轮询等列表刷新稳定（行数连续 3 次相同，最多 5s）
+        let lastN = -1, hits = 0;
+        await until(() => {
+          const n = scanFileRows().length;
+          if (n > 0 && n === lastN) {
+            if (++hits >= 3) return true;
+          } else {
+            hits = 0;
+          }
+          lastN = n;
+          return false;
+        }, 200, 5000);
       }
       log('===== 下载完成 =====');
       setStatus('下载完成', 'done');
@@ -625,66 +690,65 @@
   async function clearAllSelection() {
     const rows = document.querySelectorAll('tr.ant-table-row, [data-row-key]');
     for (const row of rows) {
-      if (row.classList.contains('ant-table-row-selected')) {
-        const lbl = row.querySelector('label.ant-checkbox-wrapper');
-        if (lbl) { realClick(lbl); await sleep(60); }
-      }
+      if (!row.classList.contains('ant-table-row-selected')) continue;
+      const lbl = row.querySelector('label.ant-checkbox-wrapper');
+      if (!lbl) continue;
+      realClick(lbl);
+      // ★ 轮询等这一行取消选中（最多 800ms，超时继续下一行）
+      await until(() => {
+        const i = row.querySelector('input.ant-checkbox-input');
+        return !(i && i.checked) && !row.classList.contains('ant-table-row-selected');
+      }, 50, 800);
     }
   }
 
   /* 顶栏"删除"按钮（异步等待出现；勾选后才会被渲染） */
   async function clickDeleteButton(timeout = 6000) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
-      for (const btn of document.querySelectorAll('.btn-group button.btn-file, .btn-group button.ant-btn')) {
-        const txt = (btn.textContent || '').replace(/\s+/g, '');
-        if (txt === '删除' && isVisible(btn)) { realClick(btn); return true; }
+    const btn = await until(() => {
+      for (const el of document.querySelectorAll('.btn-group button.btn-file, .btn-group button.ant-btn')) {
+        const txt = (el.textContent || '').replace(/\s+/g, '');
+        if (txt === '删除' && isVisible(el)) return el;
       }
-      for (const btn of document.querySelectorAll('button.btn-file, button.ant-btn')) {
-        const txt = (btn.textContent || '').replace(/\s+/g, '');
-        if (txt === '删除' && isVisible(btn)) { realClick(btn); return true; }
+      for (const el of document.querySelectorAll('button.btn-file, button.ant-btn')) {
+        const txt = (el.textContent || '').replace(/\s+/g, '');
+        if (txt === '删除' && isVisible(el)) return el;
       }
-      await sleep(150);
-    }
-    return false;
+      return null;
+    }, 150, timeout);
+    if (!btn) return false;
+    realClick(btn);
+    return true;
   }
 
   /* 确认删除弹窗：优先 .ant-btn-primary（"确认删除"） */
   async function confirmDeleteDialog(timeout = 6000) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
+    const btn = await until(() => {
       const modal =
-        document.querySelector('.base-confirm-modal .ant-modal') ||
-        document.querySelector('.ant-modal-root .ant-modal-wrap[role="dialog"] .ant-modal') ||
-        findVisibleModal();
+            document.querySelector('.base-confirm-modal .ant-modal') ||
+            document.querySelector('.ant-modal-root .ant-modal-wrap[role="dialog"] .ant-modal') ||
+            findVisibleModal();
+      if (!modal || !isVisible(modal)) return null;
 
-      if (modal && isVisible(modal)) {
-        const primary = modal.querySelector('.ant-modal-footer .ant-btn-primary');
-        if (primary && isVisible(primary)) {
-          const txt = (primary.textContent || '').replace(/\s+/g, '');
-          if (/确认删除|确定删除|^删除$|^确定$|^确认$/.test(txt)) {
-            realClick(primary);
-            return true;
-          }
-        }
-        for (const btn of modal.querySelectorAll('.ant-modal-footer button')) {
-          if (!isVisible(btn)) continue;
-          const txt = (btn.textContent || '').replace(/\s+/g, '');
-          if (/确认删除|确定删除|^删除$|^确定$|^确认$/.test(txt)) {
-            realClick(btn);
-            return true;
-          }
-        }
+      const primary = modal.querySelector('.ant-modal-footer .ant-btn-primary');
+      if (primary && isVisible(primary)) {
+        const txt = (primary.textContent || '').replace(/\s+/g, '');
+        if (/确认删除|确定删除|^删除$|^确定$|^确认$/.test(txt)) return primary;
       }
-      await sleep(200);
-    }
-    return false;
+      for (const b of modal.querySelectorAll('.ant-modal-footer button')) {
+        if (!isVisible(b)) continue;
+        const txt = (b.textContent || '').replace(/\s+/g, '');
+        if (/确认删除|确定删除|^删除$|^确定$|^确认$/.test(txt)) return b;
+      }
+      return null;
+    }, 200, timeout);
+    if (!btn) return false;
+    realClick(btn);
+    return true;
   }
 
   /* 等删除结果 */
   async function waitDeleteResult(timeout = 8000) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
+    const r = await until(() => {
       let text = '';
       try {
         for (const sel of ['.ant-message-notice', '.ant-notification-notice', '.swal2-popup']) {
@@ -697,9 +761,9 @@
       if (/删除失败|操作失败|无法删除/.test(text)) return 'fail';
       const stillConfirm = document.querySelector('.base-confirm-modal');
       if (!stillConfirm || !isVisible(stillConfirm)) return 'success';
-      await sleep(300);
-    }
-    return 'unknown';
+      return null;
+    }, 300, timeout);
+    return r || 'unknown';
   }
 
   /* 用复选框删除指定 fid 集合（仅当前页能匹配到的） */
@@ -708,7 +772,6 @@
     const fidSet = new Set(fids);
 
     await clearAllSelection();
-    await sleep(300);
 
     const rows = document.querySelectorAll('tr.ant-table-row[data-row-key]');
     let picked = 0;
@@ -716,20 +779,28 @@
       const fid = row.getAttribute('data-row-key');
       if (!fid || !fidSet.has(fid)) continue;
       const lbl = row.querySelector('label.ant-checkbox-wrapper');
+      if (!lbl) continue;
       const input = row.querySelector('input.ant-checkbox-input');
-      if (!lbl || !input) continue;
-      if (!input.checked) { realClick(lbl); await sleep(120); }
+      if (!input || !input.checked) {
+        realClick(lbl);
+        // ★ 轮询等勾选生效
+        await until(() => {
+          const i = row.querySelector('input.ant-checkbox-input');
+          return i && i.checked;
+        }, 80, 800);
+      }
       const recheck = row.querySelector('input.ant-checkbox-input');
       if (recheck && recheck.checked) picked++;
     }
     if (!picked) { log('  目标 fid 在当前页未匹配到可勾选行'); return 0; }
 
-    await sleep(300);
     if (!await clickDeleteButton()) { warn('  未找到顶栏删除按钮'); return 0; }
     if (!await confirmDeleteDialog()) { warn('  未找到删除确认按钮'); return 0; }
     const r = await waitDeleteResult();
     log('  删除结果:', r);
-    await sleep(800);
+
+    // ★ 轮询等确认弹窗从 DOM 消失（最多 800ms）
+    await until(() => !document.querySelector('.base-confirm-modal'), 100, 800);
     return picked;
   }
 
@@ -750,7 +821,6 @@
 
     const ok = await until(() => document.querySelector('.quark-button.pl-button'), 500, 20000);
     if (!ok) { log('  下载助手未就绪，跳过'); return; }
-    await sleep(800);
 
     let files = [];
     const t0 = Date.now();
@@ -780,6 +850,34 @@
   }
 
   /* ============================================================
+   *  ★ 标记勾选的文件为已下载
+   * ============================================================ */
+  function markSelectedAsDownloaded() {
+    if (!isListPage()) { alert('当前不是列表页'); return 0; }
+
+    const files = scanFileRows();
+    const picked = files.filter(f => f.checked && f.fid);
+
+    if (!picked.length) {
+      alert('未勾选任何文件（或勾选的文件无有效 fid）');
+      return 0;
+    }
+
+    for (const f of picked) {
+      markFidDownloaded(f.fid, {
+        name: f.name,
+        sizeStr: f.sizeStr,
+        iconSig: f.iconSig,
+      });
+    }
+
+    log(`★ 标记选中为已下载：${picked.length} 个`);
+    refreshGray();
+    alert(`已标记 ${picked.length} 个文件为已下载`);
+    return picked.length;
+  }
+
+  /* ============================================================
    *  个人页按钮
    * ============================================================ */
   function clearDlRecordsFlow() {
@@ -787,6 +885,22 @@
     const files = scanFileRows();
     const dl = loadDlRecords();
 
+    // ① 有勾选 → 只清勾选文件的记录
+    const checked = files.filter(f => f.checked && f.fid);
+    if (checked.length) {
+      const hitIds = checked.filter(f => dl[f.fid]).map(f => f.fid);
+      if (!hitIds.length) {
+        alert(`勾选 ${checked.length} 个文件，但均无下载记录`);
+        return;
+      }
+      if (!confirm(`清除勾选的 ${hitIds.length} 条下载记录？`)) return;
+      clearDlRecordsFids(hitIds);
+      alert(`已清除 ${hitIds.length} 条（勾选）`);
+      refreshGray();
+      return;
+    }
+
+    // ② 无勾选、当前页无文件 → 清全部
     if (!files.length) {
       const n = Object.keys(dl).length;
       if (!n) { alert('无下载记录可清除'); return; }
@@ -797,12 +911,13 @@
       return;
     }
 
+    // ③ 无勾选、当前页有文件 → 清当前页全部
     const ids = files.map(f => f.fid).filter(Boolean);
     const hit = ids.filter(id => dl[id]).length;
     if (!hit) { alert('本页无下载记录'); return; }
-    if (!confirm(`清除本页 ${hit} 条下载记录？`)) return;
+    if (!confirm(`未勾选文件，清除本页 ${hit} 条下载记录？`)) return;
     clearDlRecordsFids(ids);
-    alert(`已清除 ${hit} 条`);
+    alert(`已清除 ${hit} 条（本页）`);
     refreshGray();
   }
 
@@ -811,6 +926,11 @@
       label: '⬇️ 下载', color: '#52c41a',
       title: '下载本页未下载过的文件',
       onclick: () => autoDownloadWorkflow(),
+    });
+    addBuiltinAction({
+      label: '✅ 标记已下载', color: '#1677ff',
+      title: '把当前勾选的文件标记为已下载（置灰，不再被自动下载）',
+      onclick: () => markSelectedAsDownloaded(),
     });
     addBuiltinAction({
       label: '🔍 清理失效记录', color: '#d46b08',
@@ -832,7 +952,7 @@
    *  对外 API
    * ============================================================ */
   unsafeWindow.quarkAssistant = {
-    version: '5.2.2',
+    version: '5.2.4',
     isReady: () => true,
     isListPage, isSharePage,
 
@@ -859,6 +979,9 @@
     // 对比清理（推荐入口）
     purgeMissingRecords,
 
+    // 标记勾选文件为已下载
+    markSelectedAsDownloaded,
+
     // 底层 UI 删除工具（自动流程不调用，可独立使用）
     clearAllSelection, clickDeleteButton,
     confirmDeleteDialog, waitDeleteResult,
@@ -876,14 +999,14 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus('待机（个人页）');
-      log('平台层就绪（个人页）v5.2.2');
+      log('平台层就绪（个人页）v5.2.4');
 
       // 启动后：先对比清理失效记录 → 再走自动下载
       setTimeout(() => { tryAutoDownloadOnBoot(); }, 3000);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v5.2.2');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v5.2.4');
     } else {
-      log('平台层就绪（其他页）v5.2.2');
+      log('平台层就绪（其他页）v5.2.4');
     }
 
     startGrayPolling();

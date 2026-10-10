@@ -281,6 +281,17 @@ function loadDatas() {
   if (repairBangumiRows(bd)) { migrated = true; setUpdated({ bangumi: 0 }); }
   if (bd.tracking) { delete bd.tracking; migrated = true; }
   if (bd.trackingDownloaded) { delete bd.trackingDownloaded; migrated = true; }
+  // ★ 新增：schedule 缓存回填到「资源」列（解决缓存命中后从未写回的问题）
+  for (const r of bd.rows) {
+    const rule = String(r.规则 || '').trim();
+    if (!rule) continue;
+    if (isDHHMM(r.资源)) continue;            // 资源已填，跳过
+    const cached = inferredTimesCache[rule];
+    if (isDHHMM(cached)) {                     // 兼容数字或字符串
+      r.资源 = cached;
+      migrated = true;
+    }
+  }
   if (migrated) setValue('bangumiData', bd);
   trackingItems = {}; downloaded = {};
   for (const r of bd.rows) {
@@ -682,7 +693,16 @@ async function autoReload() {
     return (((dd * _1d / _1h + h) * _1h / _1m + m) * _1m / _1s + s) * _1s;
   }
   function getRemain([i, t], current) {
-    const time = (Math.floor(t / digits / digits) - 1) * _1d + Math.floor((t / digits) % digits) * _1h + t % digits * _1m;
+    // 规范化：支持跨日编码（前一日 24:00~27:59 → 当日 00:00~03:59）
+    const rawDay  = Math.floor(t / digits / digits);     // 1~7
+    const rawHour = Math.floor((t / digits) % digits);   // 0~27
+    const rawMin  = t % digits;                          // 0~59
+    let day = rawDay, hour = rawHour;
+    if (hour >= 24) {
+      hour -= 24;
+      day = day === 7 ? 1 : day + 1;   // 周日24点 → 下周一0点（循环回周一）
+    }
+    const time = (day - 1) * _1d + hour * _1h + rawMin * _1m;
     const delta = time + waitDuration - current;
     return [i, t, delta <= 0 ? time + 7 * _1d + waitDuration - current : delta];
   }
@@ -816,6 +836,19 @@ function getBgmIdFromBGMID(text) {
   return m ? m[1] : '';
 }
 function isDHHMM(v) { const n = Number(v); return Number.isInteger(n) && n >= 10000 && n <= 79959; }
+/** DHHMM 跨日显示：0:00~3:59 一律显示为前一日 24:00~27:59（幂等） */
+function formatDHHMM(v) {
+  const n = Number(v);
+  if (!Number.isInteger(n) || !isDHHMM(n)) return String(v ?? '');
+  const d = Math.floor(n / 10000);
+  const hh = Math.floor(n / 100) % 100;
+  const mm = n % 100;
+  if (hh < 4) {
+    const newD = d === 1 ? 7 : d - 1;
+    return String(newD * 10000 + (hh + 24) * 100 + mm);
+  }
+  return String(n);
+}
 function isHttpUrl(v) { return /^https?:\/\//i.test(decodeHtmlEntities(String(v ?? '').trim())); }
 function extractDomainLastTwo(url) {
   try {
@@ -844,7 +877,7 @@ function getResourceDisplayInfo(row) {
   const rawRes = String(row.资源 ?? '').trim();
   const ruleStr = expandResourceUrl(rawRule, row);
   const resStr = expandResourceUrl(rawRes, row);
-  if (isDHHMM(row.资源)) return { text: String(row.资源), href: '' };
+  if (isDHHMM(row.资源)) return { text: formatDHHMM(row.资源), href: '' };
   if (isHttpUrl(ruleStr)) return { text: extractDomainLastTwo(ruleStr), href: ruleStr };
   if (isHttpUrl(resStr)) return { text: extractDomainLastTwo(resStr), href: resStr };
   if (ruleStr) return { text: '-', href: '' };
@@ -1000,8 +1033,17 @@ function evalDelayFormula(expr, row) {
 function timeToDHHMM(ms) {
   const d = new Date(ms);
   if (isNaN(d.getTime())) return 0;
-  return (d.getDay() || 7) * 10000 + d.getHours() * 100 + d.getMinutes();
+  let day = d.getDay() || 7;       // 1~7
+  let hh = d.getHours();
+  const mm = d.getMinutes();
+  // 0:00~3:59 视为前一日 24:00~27:59
+  if (hh < 4) {
+    hh += 24;
+    day = day === 1 ? 7 : day - 1;
+  }
+  return day * 10000 + hh * 100 + mm;
 }
+
 function loadInferredCache() {
   if (_inferredCacheLoaded) return;
   _inferredCacheLoaded = true;
@@ -3514,7 +3556,7 @@ function showEditDialog() {
       const resVal = String(row.资源 ?? '').trim();
       const ruleVal = String(row.规则 ?? '').trim();
       const tipParts = [];
-      if (isDHHMM(resVal)) tipParts.push(resVal);
+      if (isDHHMM(resVal)) tipParts.push(formatDHHMM(resVal));
       if (ruleVal) tipParts.push(ruleVal);
       else if (resVal && !isDHHMM(resVal)) tipParts.push(resVal);
       resDisplay.title = tipParts.join('\n');

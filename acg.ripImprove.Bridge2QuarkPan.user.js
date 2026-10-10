@@ -272,7 +272,13 @@
   function getTableBody(doc = document) {
     return doc.querySelector('.ant-table-body');
   }
-
+  /* ★ 分享页表格是否还在初始化加载（首屏 spin / 内容模糊） */
+  function isShareTableLoading(doc = document) {
+    if (doc.querySelector('.ant-table-wrapper .ant-table-spin-holder.ant-spin-spinning')) return true;
+    if (doc.querySelector('.ant-table-wrapper .table-loading-wrap')) return true;
+    if (doc.querySelector('.ant-table-wrapper .ant-spin-container.ant-spin-blur')) return true;
+    return false;
+  }
   function isVirtualScrolling(body) {
     if (!body) return false;
     const inner = body.firstElementChild;
@@ -309,8 +315,14 @@
       }
     }
 
-    const maxMs = opts.maxMs || 40000;
+    const maxMs    = opts.maxMs  || 40000;
     const expected = getShareFileCount(doc);
+
+    /* ★ 若还在初始化加载，先等 */
+    if (isShareTableLoading(doc)) {
+      log(`  ⏳ 检测到表格仍在初始化加载，等待...`);
+      await until(() => !isShareTableLoading(doc), 150, 15000);
+    }
 
     const body = getTableBody(doc);
     if (!body || !isVirtualScrolling(body)) {
@@ -538,6 +550,9 @@
 
   /* 一次 UI 刷新：置灰 + 进度（进度未设置时保持 '-'） */
   function refreshShareUI(qa, doc = document) {
+    /* ★ 加载中不刷：避免虚表空行被误判未转存 */
+    if (isShareTableLoading(doc)) return;
+
     applyShareGray(qa, doc);
     if (_shareFullCounts) {
       qa.showProgress(_shareFullCounts.num, _shareFullCounts.total, '已转存');
@@ -1244,16 +1259,20 @@
   async function waitTableStable(qa, doc = document, maxMs = 20000) {
     const t0 = Date.now();
     const expected = getShareFileCount(doc);
-    log(` 头部显示共 ${expected == null ? '?' : expected} 个；等待表格稳定...`);
+    log(`  头部显示共 ${expected == null ? '?' : expected} 个；等待表格稳定...`);
 
-    await until(() => !doc.querySelector('.ant-spin-spinning'), 200, maxMs);
-    log(` spin 已消失，等待行数稳定...`);
+    /* ★ 等"表格专用加载层"消失（不误判分页器/按钮的 spin） */
+    await until(() => !isShareTableLoading(doc), 150, maxMs);
+    log(`  表格加载层已消失，等待行数稳定...`);
 
     let lastCount = -1;
     let stableHits = 0;
     const remain = () => Math.max(0, maxMs - (Date.now() - t0));
 
     const files = await until(() => {
+      /* ★ 中途又出现加载层 → 重置稳定计数 */
+      if (isShareTableLoading(doc)) { lastCount = -1; stableHits = 0; return null; }
+
       const rows = qa.scanFileRows(doc);
       const cnt = rows.length;
       if (expected && cnt >= expected && cnt === lastCount) {
@@ -1265,11 +1284,11 @@
       }
       lastCount = cnt;
       return null;
-    }, 400, remain());
+    }, 300, remain());
 
     if (files) return files;
     const cur = qa.scanFileRows(doc);
-    log(` 等待超时，当前扫描到 ${cur.length} 行`);
+    log(`  等待超时，当前扫描到 ${cur.length} 行`);
     return cur;
   }
 
@@ -2087,9 +2106,23 @@
       /* 桥接自主的分享页轮询：只刷可见区置灰 + 进度 */
       startSharePolling(qa);
 
-      ensureTimeDescSort(qa, document).then(r => {
+      /* ★ 排序修复；排序会触发新的加载，所以排序完成后要再刷一次灰色 */
+      ensureTimeDescSort(qa, document).then(async (r) => {
         log(`★ 分享页初始化排序结果：${JSON.stringify(r)}`);
+        if (r && r.ok && r.method !== 'already') {
+          await until(() => !isShareTableLoading(document), 150, 15000);
+          refreshShareUI(qa);
+          log(`★ 排序后刷新灰置：可见区已刷新`);
+        }
       });
+
+      /* ★ 等首屏加载完，再刷一次可见区灰色（避免加载中查到空表格） */
+      (async () => {
+        await until(() => !isShareTableLoading(document), 150, 20000);
+        refreshShareUI(qa);
+        const r0 = { total: qa.scanFileRows(document).length };
+        log(`★ 分享页初始化（可见区）：扫描 ${r0.total}`);
+      })();
 
       log(`★ 分享页初始化（等待用户操作 / 子任务触发）`);
       /* ★ 不再主动 refreshShareFullCounts —— 未点击按钮前显示 '-'，不触发全表滚动 */

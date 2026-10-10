@@ -2118,10 +2118,11 @@
         const urls = (pack && Array.isArray(pack.urls)) ? pack.urls : null;
         if (urls && urls.length) {
           log(`★ 自动触发：从 pending_urls 读取 ${urls.length} 个 URL`);
-          runSaveAllFlow(qa, urls);
+          await runSaveAllFlow(qa, urls);
         } else {
           warn('自动触发但 pending_urls 为空');
         }
+        setTimeout(() => { try { window.close(); } catch {} }, 300);
       }
     } else {
       // 其他页

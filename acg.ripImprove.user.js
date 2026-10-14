@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.2
+// @version      1.3.1
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -65,7 +65,7 @@ new MutationObserver(muts => muts.forEach(onHandle)).observe(document.documentEl
     window.addEventListener('DOMContentLoaded', () => setTimeout(tryRestore, 400), { once: true });
   }
 })();
-/* ---- 非 acg.rip 页面：注入打开编辑面板的按钮（Esc 不触发打开，仅面板内 Esc 可关闭） ---- */
+/* ===== 非 acg.rip 页面：注入打开编辑面板的按钮 ===== */
 (function setupExternalPanelButton() {
   if (IS_ACGRIP_PAGE) return;
   const mount = () => {
@@ -126,12 +126,12 @@ window.addEventListener('resize', handleGlobalResize);
 /* 界面关闭时按 Esc：打开编辑界面（仅 acg.rip 页面） */
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
-  if (!IS_ACGRIP_PAGE) return;   // ★ 其他页面 Esc 不打开，只能靠按钮
-  // 界面已打开 → 由内部 handler 处理
+  if (!IS_ACGRIP_PAGE) return;
+  // 界面已打开时由内部 handler 处理
   if (_gmEditOverlay && _gmEditOverlay.style.display !== 'none') return;
-  // 导入子窗口已打开 → 由内部处理
+  // 导入子窗口已打开时由内部处理
   if (document.getElementById('importOverlay')) return;
-  // 页面上其它输入框正在编辑 → 不干扰
+  // 其它输入框正在编辑时不干扰
   const ae = document.activeElement;
   if (ae && ae !== document.body && ae !== document.documentElement) {
     const tag = ae.tagName;
@@ -141,7 +141,7 @@ document.addEventListener('keydown', (e) => {
   showEditDialog();
 }, true);
 
-/* ---- updated / last 存储 ---- */
+/* ===== updated / last 存储 ===== */
 function getUpdated() {
   const u = getValue(UPDATED_KEY);
   if (!u || typeof u !== 'object' || Array.isArray(u)) return { bangumi: 0, quarter: '', schedule: {} };
@@ -169,7 +169,7 @@ function idToHref(v) {
   return /^\d+$/.test(s) ? '/t/' + s : undefined;
 }
 
-/* ---- 已下载转换 ---- */
+/* ===== 已下载转换 ===== */
 function parseDownloadedToList(v) {
   const norm = s => { const n = String(s).replace(/^\/t\//, '').trim(); return /^\d+$/.test(n) ? Number(n) : null; };
   const items = Array.isArray(v) ? v.flatMap(x => String(x ?? '').split(/[;\n,]+/)) : String(v ?? '').split(/[;\n,]+/);
@@ -223,7 +223,7 @@ function isRuleInferable(key) {
   return true;
 }
 
-/* ---- 修复历史污染 & 数据加载 ---- */
+/* ===== 修复历史污染 & 数据加载 ===== */
 function repairBangumiRows(bd) {
   if (!Array.isArray(bd.rows)) return false;
   const slashRows = new Map();
@@ -282,7 +282,7 @@ function loadDatas() {
   if (repairBangumiRows(bd)) { migrated = true; setUpdated({ bangumi: 0 }); }
   if (bd.tracking) { delete bd.tracking; migrated = true; }
   if (bd.trackingDownloaded) { delete bd.trackingDownloaded; migrated = true; }
-  // ★ 新增：schedule 缓存回填到「资源」列（解决缓存命中后从未写回的问题）
+  // 用推断缓存回填空的「资源」列（缓存命中过但从未写回存储）
   for (const r of bd.rows) {
     const rule = String(r.规则 || '').trim();
     if (!rule) continue;
@@ -356,7 +356,7 @@ function saveBangumiData() {
     if (list) row.已下载 = parseDownloadedToList(list);
   }
   for (const row of bd.rows) cleanRowObject(row);
-  // ★ 新增：为每行预计算播出时间戳，供外部脚本复用
+  // 为每行预计算播出时间戳 _airDate，供外部脚本复用
   const delayData = (bd.delay && Array.isArray(bd.delay.rows)) ? bd.delay : { rows: [] };
   for (const row of bd.rows) {
     try {
@@ -371,13 +371,12 @@ function saveBangumiData() {
   setValue('bangumiData', bd);
 }
 
-/* ---- onHandle ---- */
+/* ===== onHandle ===== */
 function onHandle() {
   loadInferredCache();
   try { autoReload().catch(e => console.error('autoReload error:', e)); } catch (e) { console.error(e); }
   onHandleItems(setDisplayHighlight);
   setTimeHover();
-  // Bangumi 条目详情页：更新对应行
   if (/^https?:\/\/(bangumi\.tv|bgm\.tv)\/subject\/\d+/.test(window.location.href)) {
     updateFromBangumiSubjectPage().catch(e => console.error('[SubjectPage] error:', e));
     return;
@@ -407,7 +406,7 @@ function precomputeAirDatesGlobal() {
   } catch (e) { /* ignore */ }
 }
 
-/* ---- 悬浮显示 ---- */
+/* ===== 悬浮显示 ===== */
 function getDisplayHost() { return document.querySelector('header > .container') ?? document.body; }
 function getDisplay() {
   if (display?.isConnected) { positionDisplay(display); return display; }
@@ -456,7 +455,7 @@ function bindDisplayPositioning(disp) {
   setInterval(schedule, 1000);
 }
 
-/* ---- 未查看标记 ---- */
+/* ===== 未查看标记 ===== */
 function isViewed(href) {
   if (lastViewed == null) return true;
   const t = url2num(href), v = url2num(lastViewed);
@@ -490,7 +489,7 @@ function updateViewedButton(btn) {
   btn.textContent = '标记已查看';
 }
 
-/* ---- 时间悬浮 ---- */
+/* ===== 时间悬浮 ===== */
 function setTimeHover() {
   for (const timeObj of gE('time', 'all')) {
     if (gE('.local', timeObj)) continue;
@@ -507,7 +506,7 @@ function setTimeHover() {
   }
 }
 
-/* ---- 页面高亮 ---- */
+/* ===== 页面高亮 ===== */
 function setDisplayHighlight({ item, found, href }) {
   const color = getColor();
   for (const el of [item, ...gE('a', 'all', item)]) {
@@ -523,7 +522,7 @@ function setDisplayHighlight({ item, found, href }) {
   }
 }
 
-/* ---- 手动点击下载 ---- */
+/* ===== 手动点击下载 ===== */
 document.addEventListener('click', function (e) {
   const a = e.target.closest('a');
   if (e.altKey && a) {
@@ -567,7 +566,7 @@ document.addEventListener('click', function (e) {
   onHandleItems(setDisplayHighlight);
 });
 
-/* ---- 自动下载 ---- */
+/* ===== 自动下载 ===== */
 async function asyncDownloadTorrents() {
   downloadInProgress = true;
   try {
@@ -579,13 +578,13 @@ async function asyncDownloadTorrents() {
         if (done = (url2num(href) <= url2num(last))) return;
         if (!found || isDownloaded(found, href)) return;
 
-        // ★ 解耦：只要命中规则 + 未下载过就下载，不再因集数不匹配而拦截
+        // 命中规则且未下载过就下载，不校验集数
         const bd = getValue('bangumiData') ?? { rows: [] };
         const row = (bd.rows || []).find(r => String(r.规则 || '').trim() === key);
         if (row) {
           const parsed = parseBGMID(row.BGMID);
           const max = Number(parsed.最大) || 0, next = Number(row.下集) || 0;
-          // 仅保留「已完结」的兜底：下集已超过最大集 → 不再自动补下
+          // 已完结兜底：下集已超过最大集则不再补下
           if (max > 0 && next > max) return;
         }
 
@@ -673,7 +672,7 @@ async function downloadSince(sinceUrl, onlyRules = null) {
   onHandleItems(setDisplayHighlight);
 }
 
-/* ---- 倒计时 ---- */
+/* ===== 倒计时 ===== */
 async function autoReload() {
   const index = gE('.post-index');
   if (!index) return;
@@ -693,14 +692,14 @@ async function autoReload() {
     return (((dd * _1d / _1h + h) * _1h / _1m + m) * _1m / _1s + s) * _1s;
   }
   function getRemain([i, t], current) {
-    // 规范化：支持跨日编码（前一日 24:00~27:59 → 当日 00:00~03:59）
+    // 跨日编码规范化：前一日 24:00~27:59 折算为当日 00:00~03:59
     const rawDay  = Math.floor(t / digits / digits);     // 1~7
     const rawHour = Math.floor((t / digits) % digits);   // 0~27
     const rawMin  = t % digits;                          // 0~59
     let day = rawDay, hour = rawHour;
     if (hour >= 24) {
       hour -= 24;
-      day = day === 7 ? 1 : day + 1;   // 周日24点 → 下周一0点（循环回周一）
+      day = day === 7 ? 1 : day + 1;   // 周日 24 点归入下周一 0 点
     }
     const time = (day - 1) * _1d + hour * _1h + rawMin * _1m;
     const delta = time + waitDuration - current;
@@ -770,7 +769,7 @@ async function autoReload() {
   window.location = window.location.href;
 }
 
-/* ---- 存储读写 ---- */
+/* ===== 存储读写 ===== */
 function coerceObject(v) {
   if (v === undefined || v === null) return undefined;
   if (typeof v === 'string') { try { return JSON.parse(v); } catch { return undefined; } }
@@ -800,7 +799,7 @@ function showToast(msg) {
   setTimeout(() => { t.remove(); }, 1600);
 }
 
-/* ---- 辅助函数 ---- */
+/* ===== 辅助函数 ===== */
 function decodeHtmlEntities(s) {
   if (s == null) return s;
   return String(s).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, ' ');
@@ -900,7 +899,7 @@ function getTotalEpisodes(row) {
   return (next * prev) ? next + prev : 0;
 }
 
-/* ---- 延日公式求值器 ---- */
+/* ===== 延日公式求值器 ===== */
 function tokenizeDelay(s) {
   const tokens = []; let i = 0;
   while (i < s.length) {
@@ -1029,7 +1028,7 @@ function evalDelayFormula(expr, row) {
   catch (e) { console.error('evalDelayFormula error:', e); return NaN; }
 }
 
-/* ---- 时间推断 ---- */
+/* ===== 时间推断 ===== */
 function timeToDHHMM(ms) {
   const d = new Date(ms);
   if (isNaN(d.getTime())) return 0;
@@ -1217,7 +1216,7 @@ function syncNextEpisode(key, title) {
   }
 }
 
-/* ---- 更新节奏 / 播出时间 ---- */
+/* ===== 更新节奏 / 播出时间 ===== */
 function parseUpdateColumn(text) {
   const episodes = Array(7).fill(0);
   if (!text) return { episodes };
@@ -1377,7 +1376,7 @@ function collectTrackingFromRows(rows) {
   return t;
 }
 
-/* ---- 导入 / 富文本 ---- */
+/* ===== 导入 / 富文本 ===== */
 function importTableHtml(html) {
   const doc = document.implementation.createHTMLDocument('');
   doc.body.innerHTML = html;
@@ -1433,7 +1432,7 @@ function cleanBGMID(html) {
   return cleaned.trim();
 }
 
-/* ---- Bangumi 定时更新 ---- */
+/* ===== Bangumi 定时更新 ===== */
 function pad2(n) { return String(n).padStart(2, '0'); }
 function parseBangumiSubject(html, subjectId) {
   const doc = document.implementation.createHTMLDocument('');
@@ -1487,6 +1486,11 @@ function rowIsEmpty(r) {
     return String(v ?? '').trim() === '';
   });
 }
+/* 行签名比较用的列与数值列。
+ * 必须定义在模块作用域：rowCompareKey 会在面板构造期被调用，
+ * 若放在 showEditDialog 内部（其后的 const）会触发 TDZ。 */
+const CMP_ROW_FIELDS = ['下集','中文','名称','年','开播','放送','最大','初始','前季','更新','BGMID','资源','规则','延周','延日','已下载'];
+const CMP_NUMERIC_FIELDS = new Set(['下集', '初始', '最大', '前季']);
 async function fetchBangumiHomeIds() {
   const html = await $ajax.fetch('https://bangumi.tv/', null, 'GET');
   const doc = document.implementation.createHTMLDocument('');
@@ -2021,8 +2025,8 @@ function showEditDialog() {
       <button type="button" id="openBgmBtn">BGM</button>
       <button type="button" id="openBgmIdLinkBtn">链接</button>
       <button type="button" id="deleteSelectedBtn" style="color:#e88;">删除</button>
-      <button type="button" id="resetBangumiUpdate" title="重置从Bangumi更新的计时">重置更新</button>
-      <button type="button" id="resetInferredTimes" title="重置调度匹配计时">重置匹配</button>
+      <button type="button" id="resetBangumiUpdate" title="立即从 Bangumi 抓取更新，并把新条目刷新到表格">立即更新</button>
+      <button type="button" id="resetInferredTimes" title="立即重新匹配调度时间，并刷新表格显示">立即匹配</button>
       <button type="button" id="openAiredResourceBtn" title="打开所有播出时间已过、且有资源链接的条目">已播出</button>
     </div></h2>
 <div id="gmEditScroll" style="flex:1;min-height:0;min-width:0;overflow-y:auto;overflow-x:hidden;margin-top:6px;display:flex;flex-direction:column;">
@@ -2055,7 +2059,7 @@ function showEditDialog() {
   dialog.appendChild(form);
   overlay.appendChild(dialog);
   document.body.appendChild(overlay);
-  // ---- last 三个输入框的临时修改跟踪 ----
+  /* ===== last 三个输入框的临时修改跟踪 ===== */
   const inpLastViewed = dialog.querySelector('#inpLastViewed');
   const inpLast = dialog.querySelector('#inpLast');
   const inpLastDownload = dialog.querySelector('#inpLastDownload');
@@ -2098,11 +2102,26 @@ function showEditDialog() {
   const tbody = cE('tbody');
   const delayHost = dialog.querySelector('#delayTableHost');
   const delayTbody = cE('tbody');
-  // ---- 快照基准：以存储中的行为准，草稿里的行与之对比 ----
+  /* ===== 快照基准：以存储中的行为准，草稿里的行与之对比 ===== */
   const storedRowsForBaseline = (() => {
     const bd = getValue('bangumiData');
     return (bd && Array.isArray(bd.rows)) ? bd.rows : [];
   })();
+
+  /* 打开面板时存储里已有的行（身份键 + 内容签名）。
+   * 供"立即更新/立即匹配"补行时区分：基线里没有的才算新增行；基线里有而面板里没有的是用户删的，不补回。 */
+  const baselineRowKeys = (() => {
+    const ids = new Set(), content = new Set();
+    for (const r of storedRowsForBaseline) {
+      for (const k of rowIdentityKeysOf(r)) ids.add(k);
+      content.add(rowCompareKey(r));
+    }
+    return { ids, content };
+  })();
+
+  /* 本次面板会话中已经补进表格的存储行。
+   * 只按"存储侧"的稳定键记录，避免补进来的行被编辑后重复追加。 */
+  const appendedStoredRowKeys = new Set();
 
   const storedIndex = (() => {
     const map = new Map();
@@ -2125,18 +2144,15 @@ function showEditDialog() {
     更新: '', 初始: '', 前季: '', 已下载: '[]',
   };
 
-  /** 存储基准快照：按 BGMID → 规则 → 中文 → 名称 匹配；找不到返回空快照 */
+  /** 存储基准快照：按 BGMID、规则、中文、名称 的顺序匹配；找不到返回空快照 */
   function storedRowSnapshot(row) {
-    // 1) BGMID 的 id 最稳定，优先
+    // BGMID 的 id 最稳定，优先
     const id = getBgmIdFromBGMID(String(row.BGMID ?? ''));
     if (id && storedIndex.has('id:' + id)) return snapshotRowValues(storedIndex.get('id:' + id));
-    // 2) 规则
     const rule = String(row.规则 ?? '').trim();
     if (rule && storedIndex.has('rule:' + rule)) return snapshotRowValues(storedIndex.get('rule:' + rule));
-    // 3) 中文
     const cn = String(row.中文 ?? '').trim();
     if (cn && storedIndex.has('cn:' + cn)) return snapshotRowValues(storedIndex.get('cn:' + cn));
-    // 4) 名称
     const nm = String(row.名称 ?? '').trim();
     if (nm && storedIndex.has('nm:' + nm)) return snapshotRowValues(storedIndex.get('nm:' + nm));
     return { ...EMPTY_SNAPSHOT };
@@ -2219,17 +2235,51 @@ function showEditDialog() {
     return out;
   }
 
-  /** 与"格子/ last 输入框标记 + delay 与存储比对"一致的变化判定 */
+  /* 行内容签名：判断"删除行 / 新增行 / 数据被临时更改"。
+   * 面板与已保存的 bangumiData 用同一套规范化规则，且只比较已知列，避免派生字段误判。
+   * 依赖的 CMP_ROW_FIELDS / CMP_NUMERIC_FIELDS 在模块作用域（本函数会在面板构造期被调用）。 */
+  function rowCompareKey(r) {
+    const src = r || {};
+    const bgm = cleanBGMID(src.BGMID ?? '');
+    const parsed = parseBGMID(bgm);
+    const parts = [];
+    for (const k of CMP_ROW_FIELDS) {
+      let v;
+      if (k === 'BGMID') v = bgm;
+      else if (k === '已下载') v = parseDownloadedToList(src[k]).join(',');
+      else {
+        v = String(src[k] ?? '').trim();
+        /* 与保存逻辑一致：等于 BGMID 派生默认值的字段按空处理 */
+        const def = String(parsed[k] ?? '').trim();
+        if (def && v === def) v = '';
+        if (v !== '' && CMP_NUMERIC_FIELDS.has(k)) {
+          const n = Number(v);
+          if (Number.isFinite(n)) v = String(n);   // '01' 与 '1' 视为同一值
+        }
+      }
+      parts.push(k + '=' + v);
+    }
+    return parts.join('\u0001');
+  }
+  /* 顺序无关（面板会 sortMainRows，顺序差异不算数据改动） */
+  function rowsCompareSignature(rows) {
+    return (Array.isArray(rows) ? rows : [])
+    .filter(r => !rowIsEmpty(r))
+    .map(rowCompareKey)
+    .sort()
+    .join('\u0002');
+  }
+
   function hasAnyChange(panelRows, panelDelay, panelLast) {
     try {
-      // 1. 任何格子有 cell-temp-edited → 有变化
+      // 1. 任何格子有 cell-temp-edited 即有变化
       for (const tr of tbody.children) {
         if (!tr._row) continue;
         for (const td of tr.children) {
           if (td.classList && td.classList.contains('cell-temp-edited')) return true;
         }
       }
-      // 2. last 三个输入框有 last-temp-edited → 有变化
+      // 2. last 三个输入框有 last-temp-edited 即有变化
       for (const sel of ['#inpLast', '#inpLastDownload', '#inpLastViewed']) {
         const inp = dialog.querySelector(sel);
         if (inp && inp.classList && inp.classList.contains('last-temp-edited')) return true;
@@ -2246,6 +2296,10 @@ function showEditDialog() {
         })),
       });
       if (delayNorm(panelDelay) !== delayNorm(storedDelay)) return true;
+      // 4. 行集合与存储比对：删除行 / 新增行 / 导入 / 任意数据改动
+      const storedRows = Array.isArray(bd.rows) ? bd.rows : [];
+      const curRows = (Array.isArray(panelRows) && panelRows.length) ? panelRows : collectUnifiedRows();
+      if (rowsCompareSignature(curRows) !== rowsCompareSignature(storedRows)) return true;
       return false;
     } catch (e) {
       console.error('hasAnyChange error', e);
@@ -2271,7 +2325,7 @@ function showEditDialog() {
         viewed: dialog.querySelector('#inpLastViewed').value,
       };
 
-      // 与存储对比：无变化 → 清草稿 + 灰按钮
+      // 与存储对比：无变化则清草稿并置灰按钮
       if (!hasAnyChange(rows, delay, last)) {
         try { localStorage.removeItem(DRAFT_KEY); } catch {}
         setDiscardBtnEnabled(false);
@@ -2285,7 +2339,7 @@ function showEditDialog() {
     }
   }
 
-  /* ---- 延周表 ---- */
+  /* ===== 延周表 ===== */
   function computeDelayCols() {
     let max = 0;
     for (const dr of delayData.rows) {
@@ -2418,15 +2472,116 @@ function showEditDialog() {
     delayData.rows.push({ 名称: '', 排除: '', episodes: [], weeks: [] });
     buildDelayTable(); renderDelayTable(); scheduleRefresh();
   });
-  dialog.querySelector('#resetBangumiUpdate').addEventListener('click', () => {
-    setUpdated({ bangumi: 0 });
-    showToast('已重置 Bangumi 抓取计时');
+  /* 立即更新 / 立即匹配：把存储里的最新数据刷新到面板表格。
+   * 不整体重建面板（重建会丢掉未保存的编辑），只补进新增行并重算显示。 */
+  function rowIdentityKeysOf(row) {
+    const keys = [];
+    const id = getBgmIdFromBGMID(String((row && row.BGMID) ?? ''));
+    if (id) keys.push('id:' + id);
+    const rule = String((row && row.规则) ?? '').trim();
+    if (rule) keys.push('rule:' + rule);
+    const cn = String((row && row.中文) ?? '').trim();
+    if (cn) keys.push('cn:' + cn);
+    const nm = String((row && row.名称) ?? '').trim();
+    if (nm) keys.push('nm:' + nm);
+    return keys;
+  }
+  /** 把 bangumiData 中"面板打开后新增"的行补进表格，返回新增条数。
+   * 只补新行，不动已有行（避免覆盖未保存的编辑 / 把用户删掉的行复活）。 */
+  function appendMissingRowsFromStorage() {
+    const bd = getValue('bangumiData');
+    const rows = (bd && Array.isArray(bd.rows)) ? bd.rows : [];
+    if (!rows.length) return 0;
+
+    const presentIds = new Set();       // 面板已有行的身份键
+    const presentContent = new Set();   // 面板已有行的内容签名
+    for (const tr of tbody.children) {
+      if (!tr._row) continue;
+      for (const k of rowIdentityKeysOf(tr._row)) presentIds.add(k);
+      presentContent.add(rowCompareKey(tr._row));
+    }
+
+    let added = 0;
+    for (const r of rows) {
+      if (rowIsEmpty(r)) continue;
+      const keys = rowIdentityKeysOf(r);
+      const contentKey = rowCompareKey(r);
+      /* 存储侧的稳定键：行身份键，没有身份键时用内容签名 */
+      const storedKey = keys.length ? keys.join('\u0004') : contentKey;
+      /* ③ 本次会话已经补过这一行，跳过（防止补进来后被编辑导致重复） */
+      if (appendedStoredRowKeys.has(storedKey)) continue;
+      /* ① 基线里就有：面板里没有只能是用户删的，不补回 */
+      const inBaseline = keys.length
+        ? keys.some(k => baselineRowKeys.ids.has(k))
+        : baselineRowKeys.content.has(contentKey);
+      if (inBaseline) continue;
+      /* ② 面板里已经在显示，跳过（没有身份键的行按内容比对，避免重复追加） */
+      const already = keys.length
+        ? keys.some(k => presentIds.has(k))
+        : presentContent.has(contentKey);
+      if (already) continue;
+
+      buildRow({ ...r });
+      appendedStoredRowKeys.add(storedKey);
+      for (const k of keys) presentIds.add(k);
+      presentContent.add(contentKey);
+      added++;
+    }
+    if (added) sortMainRows();
+    return added;
+  }
+  /** 立即更新 / 立即匹配 之后刷新表格显示 */
+  function refreshDialogTableDisplay() {
+    try {
+      appendMissingRowsFromStorage();
+      for (const tr of tbody.querySelectorAll('tr')) if (tr._row) updateDerived(tr);
+      scheduleRefresh();   // 内部还会做 ensureTrailingEmpty / 列宽 / 高亮 / 草稿同步
+    } catch (e) { console.error('刷新表格显示失败', e); }
+  }
+
+  let _updatingFromBangumi = false;
+  dialog.querySelector('#resetBangumiUpdate').addEventListener('click', async () => {
+    if (_updatingFromBangumi) { showToast('正在更新中…'); return; }
+    _updatingFromBangumi = true;
+    const btn = dialog.querySelector('#resetBangumiUpdate');
+    if (btn) btn.disabled = true;
+    showToast('正在从 Bangumi 更新…');
+    try {
+      setUpdated({ bangumi: 0 });            // 清掉 24h 计时，使本次立即执行
+      await autoUpdateFromBangumi();
+      refreshDialogTableDisplay();
+      showToast('更新完成');
+    } catch (e) {
+      console.error('立即更新失败', e);
+      showToast('更新失败：' + (e && e.message || e));
+    } finally {
+      _updatingFromBangumi = false;
+      if (btn) btn.disabled = false;
+    }
   });
-  dialog.querySelector('#resetInferredTimes').addEventListener('click', () => {
-    inferredTimesCache = {}; _inferredCacheLoaded = true; _inferScannedThisSession = false;
-    saveInferredCache();
-    inferenceStatus = { phase: 'idle', pending: 0, found: 0, page: 0, message: '已清空调度时间匹配', scanning: false };
-    showToast('已清空调度时间匹配');
+
+  let _matchingInferred = false;
+  dialog.querySelector('#resetInferredTimes').addEventListener('click', async () => {
+    if (_matchingInferred) { showToast('正在匹配中…'); return; }
+    _matchingInferred = true;
+    const btn = dialog.querySelector('#resetInferredTimes');
+    if (btn) btn.disabled = true;
+    showToast('正在重新匹配调度时间…');
+    try {
+      inferredTimesCache = {}; _inferredCacheLoaded = true; _inferScannedThisSession = false;
+      saveInferredCache();
+      inferenceStatus = { phase: 'idle', pending: 0, found: 0, page: 0, message: '正在重新匹配…', scanning: false };
+      const more = await buildInferredTimes();
+      for (const k in more) inferredTimes[k] = more[k];
+      refreshDialogTableDisplay();
+      showToast(`匹配完成：命中 ${Object.keys(more || {}).length} 条`);
+    } catch (e) {
+      console.error('立即匹配失败', e);
+      showToast('匹配失败：' + (e && e.message || e));
+    } finally {
+      _matchingInferred = false;
+      if (btn) btn.disabled = false;
+    }
   });
   function collectDelayData() {
     const rows = [];
@@ -2504,7 +2659,7 @@ function showEditDialog() {
     if (!last || !last._row || !isEmptyRow(last)) buildRow({});
   }
 
-  /* ---- 选中与轮廓 ---- */
+  /* ===== 选中与轮廓 ===== */
   function clearRowSelection() {
     for (const tr of tbody.children) if (tr._row) tr.classList.remove('row-selected');
     updateSelectionBorders();
@@ -2589,7 +2744,7 @@ function showEditDialog() {
     updateSelectionBorders();
   }
 
-  /* ---- 单元格模块 ---- */
+  /* ===== 单元格模块 ===== */
   function setReadOnly(el, ro) {
     if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') el.readOnly = ro;
     else el.contentEditable = ro ? 'false' : 'true';
@@ -2646,14 +2801,13 @@ function showEditDialog() {
       if (s) saved = JSON.parse(s);
     } catch {}
 
-    // 兼容旧格式
     if (saved && !Array.isArray(saved.rowNames)) {
       saved.rowNames = saved.rowName ? [saved.rowName] : [];
     }
     const wantedNames = (saved && Array.isArray(saved.rowNames)) ? saved.rowNames : [];
     const colIndex = (saved && typeof saved.colIndex === 'number') ? saved.colIndex : 0;
 
-    // 显示名 → tr
+    // 显示名到 tr 的映射
     const nameToTr = new Map();
     for (const tr of tbody.children) {
       if (!tr._row) continue;
@@ -2713,8 +2867,8 @@ function showEditDialog() {
 
   /**
    * Ctrl+方向键跳格：
-   * - 下一格为空（或当前为空）→ 跳过多空，落到方向第一个非空；找不到则到方向尽头
-   * - 当前非空且下一格非空 → 连续非空块末尾
+   * - 下一格为空（或当前为空）：跳过多空，落到方向第一个非空；找不到则到方向尽头
+   * - 当前非空且下一格非空：连续非空块末尾
    */
   function ctrlArrowTarget(cell, key) {
     const allTrs = [...tbody.children].filter(t => t._row);
@@ -2839,7 +2993,7 @@ function showEditDialog() {
         } else {
           try { input.focus({ preventScroll: true }); } catch {}
           if (input.isContentEditable) {
-            // contenteditable 从 false → true 后需要等一次布局再设置光标
+            // contenteditable 由 false 变为 true 后需要等一次布局再设置光标
             requestAnimationFrame(() => {
               if (!this._editing) return;
               if (document.activeElement !== input) {
@@ -2978,7 +3132,7 @@ function showEditDialog() {
     if (editor !== host) editor.addEventListener('input', onInputResize);
     const onFocus = () => {
       const tr = cell.tr;
-      // 选中状态由 mousedown / 键盘导航逻辑管理，onFocus 不再重置
+      // 选中状态由 mousedown / 键盘导航逻辑管理，onFocus 不重置
       updateSelectionBorders();
 
       if (editor.classList && (editor.classList.contains('u-name') || editor.classList.contains('u-cn') || editor.classList.contains('u-update'))) {
@@ -3160,7 +3314,7 @@ function showEditDialog() {
       }
       return;
     }
-    // Ctrl+Shift+方向键：按内容跳格到目标行，区间选中（anchor → 目标）
+    // Ctrl+Shift+方向键：按内容跳格到目标行，区间选中（anchor 到目标）
     if (e.ctrlKey && e.shiftKey && !e.altKey && !editing && ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(key)) {
       e.preventDefault(); e.stopPropagation();
       const target = ctrlArrowTarget(cell, key);
@@ -3508,7 +3662,7 @@ function showEditDialog() {
     }
   }
 
-  /* ---- updateDerived ---- */
+  /* ===== updateDerived ===== */
   function updateDerived(tr) {
     const row = tr._row, parsed = parseBGMID(row.BGMID);
     const ph = (cls, v) => { const el = tr.querySelector('.' + cls); if (el) el.placeholder = v || ''; };
@@ -3669,7 +3823,7 @@ function showEditDialog() {
         el.style.setProperty('unicode-bidi', 'plaintext', 'important');
       }
     });
-    // 当前聚焦的非编辑 name/cn/update → 光标归零
+    // 当前聚焦的非编辑 name/cn/update 光标归零
     if (document.activeElement && document.activeElement.tagName === 'INPUT') {
       const ae = document.activeElement;
       if (ae.classList.contains('u-name') || ae.classList.contains('u-cn') || ae.classList.contains('u-update')) {
@@ -4103,8 +4257,7 @@ function showEditDialog() {
       下集: String(row.下集 ?? ''),
       延周: String(row.延周 ?? ''),
       延日: String(row.延日 ?? ''),
-      // 面板里的 row.BGMID 已由 buildRow 做过 cleanBGMID；快照基准也必须统一清洗，
-      // 否则存储里的 <span> 包装会导致 BGMID 列永远被判为"已修改"
+      // 快照基准也要做 cleanBGMID（与 buildRow 一致），否则 <span> 包装会让 BGMID 列永远算"已修改"
       BGMID: cleanBGMID(String(row.BGMID ?? '')),
       名称: String(row.名称 ?? ''),
       中文: String(row.中文 ?? ''),
@@ -4137,7 +4290,7 @@ function showEditDialog() {
     }
   }
 
-  /* ---- 表格骨架 ---- */
+  /* ===== 表格骨架 ===== */
   const header = cE('thead'); const hr = cE('tr');
   const headerCols = [
     ['名称', '220px'], ['资源', '73px'],
@@ -4162,7 +4315,7 @@ function showEditDialog() {
   adjustAdaptiveColumns();
   updateDelayNameHighlight();
 
-  /* ---- 排序 / 分隔 / 高亮 ---- */
+  /* ===== 排序 / 分隔 / 高亮 ===== */
   function sortMainRows() {
     const mainRows = [...tbody.children].filter(tr => tr._row);
     mainRows.sort((a, b) => {
@@ -4172,8 +4325,7 @@ function showEditDialog() {
       const maxA = Number(effective(ra, '最大', pa)) || 0;
       const maxB = Number(effective(rb, '最大', pb)) || 0;
       const nextA = Number(ra.下集) || 0, nextB = Number(rb.下集) || 0;
-      // 与 applyRowHighlight 同一条件：下一集已超过最大集 → 视为 END
-      // 排序：严格大于最大集才算已完结
+      // END 判定与 applyRowHighlight 同一条件：下一集严格超过最大集即已完结
       const endA = maxA > 1 && nextA > maxA;
       const endB = maxB > 1 && nextB > maxB;
       if (endA !== endB) return endA ? 1 : -1;    // END 行排末尾
@@ -4374,7 +4526,7 @@ function showEditDialog() {
     if (max !== 1 && next === initVal && !isEnd && els.next) els.next.classList.add('hl-warn');
   }
 
-  /* ---- 自适应 / 辅助 ---- */
+  /* ===== 自适应 / 辅助 ===== */
   function scheduleRefresh() {
     if (refreshTimer) return;
     refreshTimer = setTimeout(() => {
@@ -4429,7 +4581,7 @@ function showEditDialog() {
         if (w > maxW) maxW = w;
       }
 
-      // ★ 列宽上限：不超过滚动容器可见宽度
+      // 列宽上限：不超过滚动容器可见宽度
       const scroll = host.closest('#gmEditScroll');
       if (scroll) {
         maxW = Math.min(maxW, Math.max(60, scroll.clientWidth - 40));
@@ -4442,7 +4594,7 @@ function showEditDialog() {
       th.style.setProperty('max-width', maxW + 'px', 'important');
     }
 
-    // 列宽变化可能影响 dialog 需要的宽度 → 重新布局
+    // 列宽变化可能影响 dialog 需要的宽度，需重新布局
     if (_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none') {
       // 防止频繁调用
       if (!adjustAdaptiveColumns._layoutTimer) {
@@ -4473,7 +4625,7 @@ function showEditDialog() {
       const left = Math.max(0, Math.min(rect.left, vw - 60));
       return Math.max(60, vw - left - 40);
     }
-    // ★ 优先以滚动容器的可见宽度为上限，避免展开的输入框撑出横向滚动
+    // 优先以滚动容器可见宽度为上限，避免展开的输入框撑出横向滚动
     const scroll = el.closest('#gmEditScroll');
     if (scroll) {
       return Math.max(60, scroll.clientWidth - 24);
@@ -4579,7 +4731,7 @@ function showEditDialog() {
     ta.style.setProperty('width', w + 'px', 'important');
     ta.style.setProperty('max-width', avail + 'px', 'important');
   }
-  /* ---- 行选择事件 ---- */
+  /* ===== 行选择事件 ===== */
   tbody.addEventListener('mousedown', (e) => {
     const tr = e.target.closest('tr'); if (!tr || !tr._row) return;
     const isControl = e.ctrlKey || e.metaKey;
@@ -4645,7 +4797,7 @@ function showEditDialog() {
     updateSelectionBorders();
   });
 
-  /* ---- 按钮 ---- */
+  /* ===== 按钮 ===== */
   dialog.querySelector('#openResourceBtn').addEventListener('click', () => {
     const rows = getSelectedRows(); if (!rows.length) { showToast('请先选择行'); return; }
     let opened = 0;
@@ -4717,7 +4869,7 @@ function showEditDialog() {
     ensureTrailingEmpty(); scheduleRefresh();
   });
 
-  /* ---- 导入 ---- */
+  /* ===== 导入 ===== */
   dialog.querySelector('#importTableBtn').addEventListener('click', () => {
     const ov = cE('div'); ov.id = 'importOverlay';
     ov.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:10000;display:flex;justify-content:center;align-items:center;color-scheme:dark;';
@@ -4808,8 +4960,7 @@ function showEditDialog() {
         }
       }
 
-      // 3. 重建 UI（编辑缓存，不写 bangumiData）
-      // buildRow 内部会用 storedRowSnapshot(row) 作为基准 → 已有行对比存储，新增行对比空
+      // 3. 只重建 UI（不写 bangumiData）；buildRow 用 storedRowSnapshot 作基准，已有行对比存储、新增行对比空
       tbody.innerHTML = '';
       for (const meta of metas) buildRow(meta.row);
       for (const row of newRows) buildRow(row);
@@ -4898,8 +5049,7 @@ function showEditDialog() {
       for (const tr of emptyTrs) tr.remove();
       ensureTrailingEmpty();
 
-      // 关键：保存后先把快照重置为已保存值，再 sortMainRows
-      // 这样 rebuildDividerRows 的 END 判定使用新值，已完结→未完结的行能正确回到原位
+      // 关键：先重置快照再 sortMainRows，让 END 判定用新值，已完结变未完结的行能回到原位
       for (const tr of tbody.querySelectorAll('tr')) {
         if (!tr._row) continue;
         tr._originalValues = snapshotRowValues(tr._row);
@@ -4935,7 +5085,7 @@ function showEditDialog() {
     try { localStorage.setItem(PANEL_OPEN_KEY, '1'); } catch {}  // 重建后保持打开
     showEditDialog();
   });
-  /* ---- 全局 Esc / Ctrl+S ---- */
+  /* ===== 全局 Esc / Ctrl+S ===== */
   const escKeyHandler = (e) => {
     if (overlay.style.display === 'none') return;
     if (e.key !== 'Escape') return;
@@ -5003,20 +5153,19 @@ function showEditDialog() {
       overlay.style.left = '0';
       overlay.style.right = '0';
       overlay.style.justifyContent = 'center';
-      overlay.style.alignItems = 'flex-start';   // 改为顶部对齐，便于设置 margin-top
+      overlay.style.alignItems = 'flex-start';   // 顶部对齐，便于设置 margin-top
       overlay.style.background = 'transparent';
       overlay.style.pointerEvents = 'auto';
       overlay.style.padding = '';
       dialog.style.pointerEvents = 'auto';
       dialog.style.maxWidth = `${Math.min(naturalW, vw - 40)}px`;
-      // 非并排模式：编辑框距离窗口顶部至少 500px，底部保持在窗口内
+      // 非并排模式：给对话框留顶部间距，底部保持在窗口内
       const topMargin = Math.min(50, vh - 20);  // 窗口过矮时降级，保证底部可见
       dialog.style.marginTop = topMargin + 'px';
       dialog.style.maxHeight = `calc(${vh}px - ${topMargin}px - 20px)`;
     }
 
-    // 先让浏览器完成布局（acgrip-split 生效后 session-bar 移到新位置）
-    // 再计算浮标位置，确保拿到最新的 session-bar.getBoundingClientRect()
+    // 先让布局生效（split 后 session-bar 会移位），再计算浮标位置以拿到最新 rect
     void document.body.offsetWidth;
     requestAnimationFrame(() => positionDisplay());
   }
@@ -5255,7 +5404,7 @@ function initAjax() {
  * ===================================================================== */
 if (/^acg\.rip$/i.test(location.hostname)) {
   unsafeWindow.acgripApi = {
-    version: '1.2',
+    version: '1.3.1',
 
     /** 读取 bangumiData（含原脚本已写入的 _airDate 字段） */
     getBangumiData: () => getValue('bangumiData'),
@@ -5270,21 +5419,14 @@ if (/^acg\.rip$/i.test(location.hostname)) {
     getValue,
     setValue,
   };
-  console.log('[acgripApi] 已暴露 v1.2');
+  console.log('[acgripApi] 已暴露 v1.3.1');
 }
 
 /* =====================================================================
- *  Bangumi 首页自动「看到」标记
- *  适用：https://bgm.tv/ 、https://bangumi.tv/ 等含 #cloumnSubjectInfo 的页面
- *
- *  数据表格约定（编辑面板）：
- *    下集：本季相对集数（下一集要下载的本季第 N 集）
- *    前季：前季集数（用于把本季相对集数换算成绝对集数）
- *    总集（编辑面板显示列）= 下集 + 前季
- *
- *  因此：
- *    目标相对集数 = 下集 - 1（在 prgText 里提交 watchedeps）
- *    目标绝对集数 = 下集 - 1 + 前季 = 总集 - 1（在 prg_list 里匹配 li 文本）
+ *  Bangumi 首页自动「看到」标记（bgm.tv / bangumi.tv 含 #cloumnSubjectInfo 的页面）
+ *  面板约定：下集 = 本季相对集数，前季 = 前季集数，总集 = 下集 + 前季
+ *  由此：目标相对集数 = 下集 - 1（prgText 提交 watchedeps）
+ *        目标绝对集数 = 下集 - 1 + 前季 = 总集 - 1（prg_list 匹配 li 文本）
  * ===================================================================== */
 const BG_LOG_TAG = '[acgrip·bgHome]';
 function bgLog(...args) { console.log(BG_LOG_TAG, ...args); }
@@ -5318,10 +5460,8 @@ function bgHomeFindRow(subjectId) {
 }
 
 /**
- * 计算目标集数：
- *   rel = 下集 - 1        （本季相对，prgText 用）
- *   abs = rel + 前季       （绝对，prg_list 用；= 总集 - 1）
- * 若 前季 缺省，则 abs === rel
+ * 计算目标集数：rel = 下集 - 1（本季相对，prgText 用）；abs = rel + 前季（绝对，prg_list 用，即 总集 - 1）
+ * 前季缺省时 abs === rel。
  */
 function bgHomeWatchedCandidates(row) {
   const next = Number(row && row.下集) || 0;
@@ -5377,10 +5517,8 @@ function bgHomeHideClueTip() {
 }
 
 /**
- * 在 ul.prg_list 里按集数文本匹配对应的 <a>。
- * targets 是数值数组，比如 [2, 15]。
- * 匹配用 Number()，兼容 "02" 这类补零写法。
- * 遇到 <li class="subtitle">（SP/OP/ED 分隔）即 break，不处理其后内容。
+ * 在 ul.prg_list 里按集数文本匹配对应 <a>；targets 为数值数组，如 [2, 15]。
+ * 用 Number() 匹配以兼容 "02" 这类补零写法；遇到 <li class="subtitle"> 即截断。
  */
 function bgHomeFindEpisodeLink(listEl, targets) {
   if (!listEl || !targets || !targets.length) return null;
@@ -5400,11 +5538,7 @@ function bgHomeFindEpisodeLink(listEl, targets) {
 
 /**
  * 并发等待 prg_list 与 prgText（都可能是其他脚本异步添加的）。
- * - listGetter 返回 ul.prg_list（或 null）
- * - prgGetter  返回 input[name=watchedeps]（或 null）
- * - 任一已出现，则再等 graceMs 毫秒让"稍慢的那个"也有机会跟上；
- * - 任一方已出现且已等待超过 graceMs，则提前返回，不空等到 timeout；
- * - 两者都出现则立即返回。
+ * 任一已出现则再等 graceMs，给"稍慢的那个"机会；已等待超过 graceMs 就提前返回，不空等到 timeout。
  */
 async function bgHomeWaitListAndPrgText(listGetter, prgGetter, timeout = 5000, interval = 150, graceMs = 800) {
   const start = Date.now();
@@ -5427,7 +5561,7 @@ async function bgHomeWaitListAndPrgText(listGetter, prgGetter, timeout = 5000, i
   return { listEl, prgInput };
 }
 /**
- * hover 指定 a → 等 cluetip → 点「看到」
+ * hover 指定 a，等 cluetip 出现后点「看到」
  * 若 cluetip 未出现，则从 #subject_prg_content 的隐藏 prginfo_<epId> 兜底
  */
 async function bgHomeHoverAndClickWatchedTill(a, subjectId = '', subjName = '') {
@@ -5456,7 +5590,7 @@ async function bgHomeHoverAndClickWatchedTill(a, subjectId = '', subjName = '') 
     return box;
   }, 4000, 100);
 
-  // 兜底：cluetip 没出现 → 从 #subject_prg_content 中拿 WatchedTill
+  // 兜底：cluetip 没出现时，从 #subject_prg_content 中取 WatchedTill
   if (!inner) {
     bgWarn(`hover: id=${subjectId} 集数=${(a.textContent || '').trim()} epid=${epId} → cluetip 未出现，尝试从隐藏 prginfo 中取 WatchedTill`);
     const hidden = document.getElementById('prginfo_' + epId);
@@ -5501,7 +5635,7 @@ async function bgHomeHoverAndClickWatchedTill(a, subjectId = '', subjName = '') 
 async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
   const tag = `[grid ${idx + 1}/${total}]`;
 
-  // ---- 1. 找 subject 链接 ----
+  /* ===== 1. 找 subject 链接 ===== */
   const subjLink =
         grid.querySelector('a[data-subject-id][href^="/subject/"]') ||
         grid.querySelector('.tinyHeader a[href^="/subject/"]') ||
@@ -5517,7 +5651,7 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
         (subjLink.dataset && (subjLink.dataset.subjectNameCn || subjLink.dataset.subjectName)) ||
         (subjLink.textContent || '').trim() || '';
 
-  // ---- 2. 查表 ----
+  /* ===== 2. 查表 ===== */
   const row = bgHomeFindRow(subjectId);
   if (!row) { bgLog(tag, `id=${subjectId} 名称="${subjName}" → 表格中无匹配，跳过`); return { status: 'skip', reason: 'not-in-table', subjectId, subjName }; }
 
@@ -5530,7 +5664,7 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
   }
   const baseInfo = `id=${subjectId} 名称="${subjName}" 下集=${nextEp} 前季=${prevEp} 目标(相对)=${rel.join('/') || '-'} 目标(绝对)=${abs.join('/') || '-'}`;
 
-  // ---- 3. 已同步到 / 超过目标进度则跳过 ----
+  /* ===== 3. 已同步到 / 超过目标进度则跳过 ===== */
   const wrapper = grid.closest('.infoWrapper') || grid.parentElement;
   const progressInput = wrapper
     ? (wrapper.querySelector('#watched_eps_' + subjectId) || wrapper.querySelector('.progressBar input[name="watchedeps"]'))
@@ -5544,7 +5678,7 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
     }
   }
 
-  // ---- 4. 并发等待 prg_list / prgText ----
+  /* ===== 4. 并发等待 prg_list / prgText ===== */
   bgLog(tag, baseInfo, `→ 并发等待 prg_list / prgText…`);
   const { listEl, prgInput: prgInputInitial } = await bgHomeWaitListAndPrgText(
     () => grid.querySelector('ul.prg_list'),
@@ -5556,7 +5690,7 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
   bgLog(tag, baseInfo,
         `→ 等待完成：prg_list=${listEl ? `有（${listEl.querySelectorAll('li > a').length} 项）` : '无'}，prgText=${prgInput ? '有' : '无'}`);
 
-  // ---- 5. prg_list 命中 → hover → 点「看到」 ----
+  /* ===== 5. prg_list 命中则 hover 并点「看到」 ===== */
   if (listEl && abs.length) {
     const hit = bgHomeFindEpisodeLink(listEl, abs);
     if (hit) {
@@ -5576,7 +5710,7 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
     bgLog(tag, baseInfo, `→ prg_list 不存在，直接使用 prgText 兜底`);
   }
 
-  // ---- 6. 兜底：prgText 输入框（用相对集数）----
+  /* ===== 6. 兜底：prgText 输入框（用相对集数） ===== */
   if (!rel.length) { bgWarn(tag, baseInfo, `→ ❌ 兜底失败：无可用的相对集数`); return { status: 'fail', reason: 'no-relative-target', subjectId }; }
 
   if (!prgInput) {
@@ -5602,11 +5736,8 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
 }
 /**
  * 处理 subject 页面（/subject/NNN）。
- * 结构：
- *   - h1.nameSingle a[href="/subject/NNN"] → subjectId / 名称
- *   - .subject_prg ul.prg_list            → 集数列表（subtitle 之后截断）
- *   - .panelProgress form[name=merge]     → prgText（提交 watchedeps）
- *   - #subject_prg_content 里的 prginfo_<epid> → hover 不出现时的兜底
+ * 关键节点：h1.nameSingle a 取 subjectId 与名称；.subject_prg ul.prg_list 是集数列表（subtitle 之后截断）；
+ * .panelProgress form[name=merge] 提供 prgText（提交 watchedeps）；prginfo_<epid> 是 hover 不出现时的兜底。
  */
 async function bgSubjectProcess() {
   const m = location.pathname.match(/^\/subject\/(\d+)/);
@@ -5661,7 +5792,7 @@ async function bgSubjectProcess() {
   bgLog(baseInfo,
         `→ 等待完成：prg_list=${listEl ? `有（${listEl.querySelectorAll('li > a').length} 项）` : '无'}，prgText=${prgInput ? '有' : '无'}`);
 
-  // prg_list 命中 → hover → 点「看到」
+  // prg_list 命中则 hover 并点「看到」
   if (listEl && abs.length) {
     const hit = bgHomeFindEpisodeLink(listEl, abs);
     if (hit) {

@@ -1,9 +1,11 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      5.3.4
+// @version      5.3.8
 // @description  夸克网盘平台层：UI + DOM 工具 + 批量下载 + 下载记录 + 暂停控制 + 底层删除工具（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
+// @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
+// @updateURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        unsafeWindow
@@ -34,7 +36,7 @@
     return null;
   }
 
-  /* ★ 直接存原生类型，GM 会自己序列化；读时兼容旧的 JSON 字符串 */
+  /* 直接存原生类型，GM 自己序列化；读取时兼容旧的 JSON 字符串 */
   function gmGet(key, def) {
     try {
       const v = GM_getValue(key);
@@ -47,9 +49,7 @@
   }
   function gmSet(key, val) { try { GM_setValue(key, val); } catch {} }
 
-  /* ============================================================
-   *  暂停控制
-   * ============================================================ */
+  /* ===== 暂停控制 ===== */
   function isPaused() {
     try { return GM_getValue(PAUSE_KEY) === '1'; } catch { return false; }
   }
@@ -66,15 +66,11 @@
     log('▶ 已恢复');
   }
 
-  /* ============================================================
-   *  页面识别
-   * ============================================================ */
+  /* ===== 页面识别 ===== */
   function isListPage()  { return location.pathname.startsWith('/list'); }
   function isSharePage() { return /^\/s\/[a-zA-Z0-9]+/.test(location.pathname); }
 
-  /* ============================================================
-   *  面板
-   * ============================================================ */
+  /* ===== 面板 ===== */
   let uiRefs = null;
   let _builtinActions = [];
   let _externalActions = [];
@@ -163,9 +159,7 @@
   function addBuiltinAction(a) { _builtinActions.push(a); renderActions(); }
   function clearBuiltinActions() { _builtinActions = []; renderActions(); }
 
-  /* ============================================================
-   *  悬浮进度条
-   * ============================================================ */
+  /* ===== 悬浮进度条 ===== */
   let progressEl = null;
   function ensureProgressEl() {
     if (progressEl && progressEl.isConnected) return progressEl;
@@ -186,9 +180,7 @@
     el.style.display = 'none';
   }
 
-  /* ============================================================
-   *  DOM 工具
-   * ============================================================ */
+  /* ===== DOM 工具 ===== */
   function isVisible(el) {
     if (!el) return false;
     try {
@@ -275,19 +267,34 @@
     return out;
   }
 
-  /* ============================================================
-   *  下载记录（GM）
-   * ============================================================ */
+  /* ===== 下载记录（GM） =====
+     记录带 scope（所属目录），清理只作用于同目录，避免误删其它目录或尚未渲染的记录。 */
+  function currentListScope() {
+    try {
+      const h = String(location.hash || '');
+      /* /list#/list/all/<folderId>/ */
+      const m = h.match(/#\/list\/[^/]+\/([^/?#]+)/);
+      if (m && m[1]) { try { return decodeURIComponent(m[1]); } catch { return m[1]; } }
+      const m2 = h.match(/#\/list\/([^/?#]+)/);
+      if (m2 && m2[1]) { try { return decodeURIComponent(m2[1]); } catch { return m2[1]; } }
+    } catch {}
+    return '';
+  }
+
   function loadDlRecords() { return gmGet(GM_DL_RECORDS, {}) || {}; }
   function saveDlRecords(recs) { gmSet(GM_DL_RECORDS, recs); }
+
+  function recordTs(r) { return typeof r === 'number' ? r : (r && r.ts || 0); }
+
   function isFidDownloaded(fid) {
     if (!fid) return false;
     const recs = loadDlRecords();
     const r = recs[fid];
     if (!r) return false;
-    const ts = typeof r === 'number' ? r : (r.ts || 0);
+    const ts = recordTs(r);
     return ts > 0 && Date.now() - ts <= DL_TTL;
   }
+
   function markFidDownloaded(fid, info = {}) {
     if (!fid) return;
     const recs = loadDlRecords();
@@ -296,30 +303,36 @@
       name: info.name || '',
       sizeStr: info.sizeStr || '',
       iconSig: info.iconSig || '',
+      scope: info.scope || currentListScope(),
     };
     saveDlRecords(recs);
   }
+
   function clearDlRecordsFids(fids) {
+    if (!fids || !fids.length) return 0;
     const recs = loadDlRecords();
-    for (const fid of fids) delete recs[fid];
+    let n = 0;
+    for (const fid of fids) { if (recs[fid]) { delete recs[fid]; n++; } }
     saveDlRecords(recs);
+    return n;
   }
-  function clearAllDlRecords() { saveDlRecords({}); }
+
+  function clearAllDlRecords() {
+    saveDlRecords({});
+  }
+
   function pickExpiredFids() {
     const recs = loadDlRecords();
     const now = Date.now();
     const out = [];
     for (const k of Object.keys(recs)) {
-      const r = recs[k];
-      const ts = typeof r === 'number' ? r : (r && r.ts || 0);
-      if (!ts || now - ts > DL_TTL) out.push(k);
+      const ts = recordTs(recs[k]);
+      if (ts > 0 && now - ts > DL_TTL) out.push(k);
     }
     return out;
   }
 
-  /* ============================================================
-   *  个人页置灰 + 进度
-   * ============================================================ */
+  /* ===== 个人页置灰 + 进度 ===== */
   let _progressLabel = '已处理';
 
   function setProgressLabel(label) { _progressLabel = label || '已处理'; }
@@ -352,9 +365,7 @@
     tick();
   }
 
-  /* ============================================================
-   *  通用模态框查找（供内部 confirmDeleteDialog 使用）
-   * ============================================================ */
+  /* ===== 通用模态框查找（供内部 confirmDeleteDialog 使用） ===== */
   function findVisibleModal(doc = document) {
     const sels = [
       '.ant-modal:not(.ant-modal-hidden)',
@@ -373,9 +384,7 @@
     return null;
   }
 
-  /* ============================================================
-   *  下载流程
-   * ============================================================ */
+  /* ===== 下载流程 ===== */
   let downloadRunning = false;
 
   async function triggerApiDownload() {
@@ -554,9 +563,7 @@
     return isChecked();
   }
 
-  /* ============================================================
-   *  批量下载流程
-   * ============================================================ */
+  /* ===== 批量下载流程 ===== */
   async function autoDownloadWorkflow(opts = {}) {
     const { throttle = THROTTLE } = opts;
 
@@ -675,32 +682,130 @@
     }
   }
 
-  /* ============================================================
-   *  对比清理失效记录
-   * ============================================================ */
-  function purgeMissingRecords() {
-    if (!isListPage()) return 0;
-    const files = scanFileRows();
-    if (!files.length) { log('对比清理：当前页无文件，跳过'); return 0; }
+  /* ===== 对比清理失效记录 =====
+     只清理当前目录(scope)内的记录，且要求列表已加载完；看不到某行 ≠ 该记录失效（虚拟滚动/未渲染完/别的目录）。 */
+  /* 加载中判定（依据夸克实际 DOM）：.ant-table-wrapper > .ant-spin-nested-loading 下的
+     .table-loading-wrap / .ant-table-spin-holder.ant-spin-spinning / .ant-spin-container.ant-spin-blur */
+  function isLoadingAnimPresent() {
+    /* 全文档匹配：页面可能有多个 .ant-table-wrapper（隐藏表格/弹窗），只看第一个会漏掉真正的加载动画，
+       把"加载中"当成"加载完"。 */
+    return !!(
+      document.querySelector('.table-loading-wrap') ||
+      document.querySelector('.ant-table-spin-holder.ant-spin-spinning') ||
+      document.querySelector('.ant-spin-nested-loading .ant-spin-spinning') ||
+      document.querySelector('.ant-spin-container.ant-spin-blur')
+    );
+  }
 
+  /* "确实没有文件"的空态：.table-empty-wrap 在加载期间同样存在但 opacity:0，必须靠 opacity 区分。
+     本函数不参与"是否加载完"的判断，只在删除时作为匹配依据（列表为空即该目录没有任何文件，其记录全部不匹配）；判定不出来时一律"不算空"（fail closed）。 */
+  function isEmptyUiVisible() {
+    if (isLoadingAnimPresent()) return false;
+
+    const wrap = document.querySelector('.ant-table-placeholder .table-empty-wrap')
+      || document.querySelector('.table-empty-wrap');
+    if (!wrap) return false;
+
+    let op = '';
+    try { op = getComputedStyle(wrap).opacity; } catch {}
+    if (op === '' || op == null) op = (wrap.style && wrap.style.opacity) || '';
+    if (op === '') return false;              /* 拿不到 opacity 就不认为是空目录 */
+    const n = Number(op);
+    if (!Number.isFinite(n)) return false;
+    return n > 0.01;
+  }
+
+  /* 列表是否已加载完：只看还有没有加载动画（空列表判定不参与，见 isEmptyUiVisible）。 */
+  function isListLoaded() {
+    return !isLoadingAnimPresent();
+  }
+
+  /* 列表是否为虚拟滚动（DOM 里只有可见行）：这种快照天然不完整，自动清理会把未渲染的记录当"失效"删掉。 */
+  function isTableVirtual() {
+    const body = document.querySelector('.ant-table-wrapper .ant-table-body');
+    if (!body) return false;
+    const inner = body.firstElementChild;
+    if (!inner) return false;
+    const innerH = inner.getBoundingClientRect().height
+      || parseFloat(getComputedStyle(inner).height) || 0;
+    /* 取不到高度（如加载态 vt 容器 height:0）时按"虚拟"从宽处理 */
+    if (!innerH) return true;
+    return innerH > body.clientHeight + 50;
+  }
+
+  /* 该目录的行是否"全部在 DOM 里"（自动清理的硬前提）：还能滚动就可能有视窗外的未渲染行，此时自动清理必然误删。 */
+  function isWholeListRendered() {
+    const body = document.querySelector('.ant-table-wrapper .ant-table-body');
+    if (!body) return true;
+    if (body.scrollHeight > body.clientHeight + 50) return false;
+    return !isTableVirtual();
+  }
+
+  function purgeMissingRecords(opts = {}) {
+    const manual = opts.manual === true;
+    if (!isListPage()) return 0;
+
+    /* 确认列表已加载完：只看加载动画是否还在 */
+    if (!isListLoaded()) { log('对比清理：列表尚未加载完（仍有加载动画），跳过（避免误删）'); return 0; }
+
+    const files = scanFileRows();
     const pageFids = new Set(files.map(f => f.fid).filter(Boolean));
-    if (!pageFids.size) { log('对比清理：当前页无 fid，跳过'); return 0; }
+    /* 空列表只在这里作为"匹配依据"：没有文件行、且空态 UI 确实显示，才认为该目录没有文件，
+       其记录全部不匹配；否则跳过。 */
+    const emptyUi = !pageFids.size && isEmptyUiVisible();
+
+    /* 有文件行就用 fid 对比；确认的空目录则其记录全部视为失效 */
+    if (!pageFids.size && !emptyUi) {
+      log('对比清理：本页无可用 fid，且不是"没有文件"空态，跳过');
+      return 0;
+    }
+
+    const scope = currentListScope();
+    /* 识别不出当前目录就无法判断记录归属，一律不动（避免跨目录误删） */
+    if (!scope) { log('对比清理：无法识别当前目录，跳过'); return 0; }
 
     const recs = loadDlRecords();
     const stale = [];
     for (const fid of Object.keys(recs)) {
+      const r = recs[fid];
+      const s = (r && typeof r === 'object') ? String(r.scope || '') : '';
+      /* scope 为空的记录归属未知，一律不动 */
+      if (!s) continue;
+      /* 其它目录的记录一律不动 */
+      if (s !== scope) continue;
       if (!pageFids.has(fid)) stale.push(fid);
     }
     if (!stale.length) { log('对比清理：无失效记录'); return 0; }
 
-    clearDlRecordsFids(stale);
-    log(`★ 对比清理：移除 ${stale.length} 条失效记录（本页 ${pageFids.size} 个文件）`);
-    return stale.length;
+    if (manual) {
+      const notWhole = !emptyUi && !isWholeListRendered();
+      const ok = confirm(
+        `将清理目录「${scope}」中 ${stale.length} 条“文件已不存在”的下载记录` +
+        (emptyUi ? '（当前目录为空）' : '') + `。\n` +
+        (notWhole
+          ? '⚠️ 当前列表可滚动 / 为虚拟滚动，DOM 里只有部分行；未被渲染的行也会被算作“不存在”。\n'
+          : '') +
+        `（其它目录的记录不受影响）\n\n继续？`
+      );
+      if (!ok) return 0;
+    } else if (!emptyUi && !isWholeListRendered()) {
+      /* 列表还能滚动或为虚拟滚动，DOM 里只有部分行，自动清理必然误删 */
+      log(`对比清理：列表仍可滚动或为虚拟滚动（DOM 仅 ${files.length} 行，非全量），`
+        + '自动清理会误删未渲染记录，跳过（如需清理请手动点击，会先确认再执行）');
+      return 0;
+    } else if (!emptyUi && stale.length > Math.max(20, files.length)) {
+      /* 自动路径：待删数量远超本页可见行，极可能是快照不完整，放弃 */
+      log(`对比清理：自动清理疑似误删（待删 ${stale.length} > 本页 ${files.length}），跳过`);
+      return 0;
+    }
+
+    const n = clearDlRecordsFids(stale);
+    log(`★ 对比清理：移除 ${n} 条失效记录（目录 ${scope}，`
+      + (emptyUi ? '空目录' : `本页 ${pageFids.size} 个文件`) + '）');
+    return n;
   }
 
-  /* ============================================================
-   *  底层 UI 删除工具
-   * ============================================================ */
+  /* ===== 底层 UI 删除工具 ===== */
   async function clearAllSelection() {
     const rows = document.querySelectorAll('tr.ant-table-row, [data-row-key]');
     for (const row of rows) {
@@ -811,9 +916,7 @@
     return picked;
   }
 
-  /* ============================================================
-   *  启动自动流程
-   * ============================================================ */
+  /* ===== 启动自动流程 ===== */
   async function tryAutoDownloadOnBoot() {
     if (downloadRunning) { log('★ 自动流程：已有任务，跳过'); return; }
     if (isPaused()) { log('★ 自动流程：当前处于暂停状态，跳过'); return; }
@@ -822,7 +925,14 @@
       return;
     }
 
-    purgeMissingRecords();
+    /* 自动对比清理前先确认列表已加载完（只看加载动画）：仍有加载动画说明只是部分渲染，
+       超时则本次跳过，绝不拿半截快照去删记录；空列表不参与"是否加载完"，只在实际删除时作匹配依据。 */
+    const listLoaded = await until(() => isListLoaded(), 300, 20000);
+    if (!listLoaded) {
+      log('★ 对比清理：等待列表加载完成超时，本次跳过（避免误删）');
+    } else {
+      purgeMissingRecords();
+    }
 
     log('★ 自动下载检查启动...');
 
@@ -856,9 +966,7 @@
     }
   }
 
-  /* ============================================================
-   *  标记勾选的文件为已下载
-   * ============================================================ */
+  /* ===== 标记勾选的文件为已下载 ===== */
   function markSelectedAsDownloaded() {
     if (!isListPage()) { alert('当前不是列表页'); return 0; }
 
@@ -884,9 +992,7 @@
     return picked.length;
   }
 
-  /* ============================================================
-   *  清除下载记录
-   * ============================================================ */
+  /* ===== 清除下载记录 ===== */
   function clearDlRecordsFlow() {
     if (!isListPage()) { alert('当前不是列表页'); return; }
     const files = scanFileRows();
@@ -925,9 +1031,7 @@
     refreshGray();
   }
 
-  /* ============================================================
-   *  个人页按钮
-   * ============================================================ */
+  /* ===== 个人页按钮 ===== */
   function installListPageActions() {
     addBuiltinAction({
       label: '⬇️ 下载',
@@ -956,11 +1060,13 @@
     addBuiltinAction({
       label: '🔍 清理失效记录',
       color: '#d46b08',
-      title: '对比本页实际文件，清掉"记录存在但文件已不存在"的下载记录',
+      title: '只清理「当前目录」中"记录存在但文件已不存在"的记录（需列表加载完；其它目录不受影响）',
       onclick: () => {
-        const n = purgeMissingRecords();
+        const n = purgeMissingRecords({ manual: true });
         refreshGray();
-        alert(`已清理 ${n} 条失效记录`);
+        alert(n > 0
+          ? `已清理 ${n} 条失效记录`
+          : '没有可清理的记录（若列表仍在加载，本次已跳过以避免误删）');
       },
     });
     addBuiltinAction({
@@ -971,11 +1077,9 @@
     });
   }
 
-  /* ============================================================
-   *  对外 API
-   * ============================================================ */
+  /* ===== 对外 API ===== */
   unsafeWindow.quarkAssistant = {
-    version: '5.3.4',
+    version: '5.3.8',
     isReady: () => true,
     isListPage, isSharePage,
 
@@ -993,6 +1097,8 @@
     loadDlRecords, saveDlRecords, isFidDownloaded,
     markFidDownloaded, clearDlRecordsFids, clearAllDlRecords,
     pickExpiredFids,
+    currentListScope,
+    isLoadingAnimPresent, isEmptyUiVisible, isListLoaded, isTableVirtual, isWholeListRendered,
 
     isPaused, setPaused, waitWhilePaused,
 
@@ -1010,9 +1116,7 @@
     deleteRowsByFids,
   };
 
-  /* ============================================================
-   *  启动
-   * ============================================================ */
+  /* ===== 启动 ===== */
   (async function boot() {
     if (!document.body) await new Promise(r => window.addEventListener('DOMContentLoaded', r, { once: true }));
 
@@ -1022,17 +1126,17 @@
       installListPageActions();
       if (isPaused()) {
         setStatus('已暂停', 'running');
-        log('平台层就绪（个人页，暂停中）v5.3.4');
+        log('平台层就绪（个人页，暂停中）v5.3.8');
       } else {
         setStatus('待机（个人页）');
-        log('平台层就绪（个人页）v5.3.4');
+        log('平台层就绪（个人页）v5.3.8');
       }
 
       setTimeout(() => { tryAutoDownloadOnBoot(); }, 3000);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v5.3.4');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v5.3.8');
     } else {
-      log('平台层就绪（其他页）v5.3.4');
+      log('平台层就绪（其他页）v5.3.8');
     }
 
     startGrayPolling();

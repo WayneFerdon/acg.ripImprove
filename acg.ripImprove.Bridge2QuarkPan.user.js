@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.0.7
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回）
+// @version 3.0.10
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
+// @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
+// @updateURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
 // @grant GM_setValue
 // @grant GM_getValue
 // @grant GM_openInTab
@@ -35,7 +37,7 @@
   const TASK_TTL = 3 * 60 * 1000;
   const TAB_RESULT_TIMEOUT = 90 * 1000;
 
-  const SAVE_TTL = 24 * 60 * 60 * 1000;
+  /* 转存记录不按时间过期，是否过期只依据 acg.ripImprove 清单（sweepObsoleteRecords）。 */
   const BASE_CD = 30 * 60 * 1000;
   const MAX_CD = 7 * 24 * 60 * 60 * 1000;
   const AUTO_TTL = 5 * 60 * 1000;
@@ -55,7 +57,7 @@
     return null;
   }
 
-  /* ★ 直接存原生类型；读时兼容旧的 JSON 字符串 */
+  /* 直接存原生类型；读取时兼容旧的 JSON 字符串 */
   function gmGet(key, def) {
     try {
       const v = GM_getValue(key);
@@ -69,9 +71,7 @@
 
   function gmSet(key, val) { try { GM_setValue(key, val); } catch {} }
 
-  /* ============================================================
- * 跨标签页通信
- * ============================================================ */
+  /* ===== 跨标签页通信 ===== */
   function _pruneByTTL(m, ttl) {
     const now = Date.now();
     let dirty = false;
@@ -143,17 +143,17 @@
     return String(v);
   }
 
-  /* ★ 规范化文件大小：去空白、统一单位大小写、把占位符视为未知 */
+  /* 规范化文件大小：去空白、统一单位大小写，占位符视为未知 */
   function normalizeSizeStr(s) {
     const t = String(s ?? '').trim();
     if (!t) return '';
     // 表格未加载完的占位符
     if (t === '--' || t === '-' || t === '—' || /^未知|loading/i.test(t)) return '';
-    // 去掉内部所有空白，"1.5 GB" → "1.5GB"
+    // 去掉内部空白："1.5 GB" 变 "1.5GB"
     return t.replace(/\s+/g, '').toUpperCase();
   }
 
-  /* ★ 规范化文件名：去零宽字符 + trim */
+  /* 规范化文件名：去零宽字符 + trim */
   function normalizeFileName(s) {
     return String(s ?? '')
     .replace(/[\u200B-\u200D\uFEFF]/g, '')
@@ -167,13 +167,12 @@
     const sa = normalizeSizeStr(a.sizeStr);
     const sb = normalizeSizeStr(b.sizeStr);
 
-    // 任一方大小未知（未加载 / 占位符）→ 仅凭文件名视为相同
+    // 任一方大小未知（未加载 / 占位符）：仅凭文件名视为相同
     if (!sa || !sb) return true;
 
-    // 大小归一化后一致 → 相同
     if (sa === sb) return true;
 
-    // ★ 兜底：iconSig 一致且都存在时也算相同（防止个别大小格式仍不同）
+    // 兜底：iconSig 一致且都存在时也算相同（个别大小格式可能不同）
     const ia = String(a.iconSig ?? '').trim();
     const ib = String(b.iconSig ?? '').trim();
     if (ia && ib && ia === ib) return true;
@@ -193,9 +192,7 @@
     return extractShareId(location.href) || 'default';
   }
 
-  /* ============================================================
- * bangumiData
- * ============================================================ */
+  /* ===== bangumiData ===== */
   function loadBangumiData() {
     if (IS_ACGRIP) {
       try {
@@ -242,10 +239,9 @@
     return [...urls];
   }
 
-  /* ============================================================
- * 转存记录
- * ============================================================ */
+  /* ===== 转存记录：读取路径永不删数据，删除只发生在显式 sweep / 用户清空 ===== */
   function loadRecords() {
+    /* 用户显式清空请求（acg.rip 菜单命令） */
     const clearTs = Number(GM_getValue(GM_CLEAR_FLAG, 0) || 0);
     if (clearTs > 0) {
       gmSet(GM_RECORDS, {});
@@ -253,17 +249,54 @@
       log(`★ 响应清空请求，转存记录已清空（ts=${clearTs}）`);
       return {};
     }
-    const recs = gmGet(GM_RECORDS, {});
-    const now = Date.now();
-    for (const k of Object.keys(recs)) {
-      if (now - (recs[k].ts || 0) > SAVE_TTL) delete recs[k];
-    }
-    return recs;
+    return gmGet(GM_RECORDS, {}) || {};
   }
   function saveRecords(recs) { gmSet(GM_RECORDS, recs); }
 
+  /* 未被显式清空的记录一律算"已转存"；是否过期只依据 acg.ripImprove 清单。 */
   function collectSavedInfos(records) {
-    return Object.values(records).flatMap(r => Array.isArray(r.fileInfos) ? r.fileInfos : []);
+    return Object.values(records || {})
+    .flatMap(r => Array.isArray(r.fileInfos) ? r.fileInfos : []);
+  }
+
+  /* 从 bangumiData 收集"清单里仍存在"的分享 key。
+   * 故意不做播出日期过滤，否则未播出条目的记录会被误判为已从清单移除。 */
+  function collectAllShareKeys(bd) {
+    const keys = new Set();
+    if (!bd || !Array.isArray(bd.rows)) return keys;
+    for (const row of bd.rows) {
+      for (const f of ['资源', '规则']) {
+        const m = String((row && row[f]) || '').match(/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)/);
+        if (m && m[1]) keys.add(`https://pan.quark.cn/s/${m[1]}`);
+      }
+    }
+    return keys;
+  }
+
+  /* 清理过期记录：只依据 acg.ripImprove 清单，清单里已不存在的分享即过期。
+   * 清单不可用或解析不到链接时一律不动（宁可不清，也不误删）。 */
+  function sweepObsoleteRecords() {
+    const bd = loadBangumiData();
+    if (!bd || !Array.isArray(bd.rows) || !bd.rows.length) {
+      log('★ 过期清理：acg.ripImprove 数据不可用，跳过（不删除任何记录）');
+      return 0;
+    }
+    const live = collectAllShareKeys(bd);
+    if (!live.size) {
+      log('★ 过期清理：清单中未解析到任何夸克链接，跳过（不删除任何记录）');
+      return 0;
+    }
+    const recs = gmGet(GM_RECORDS, {}) || {};
+    const dead = Object.keys(recs).filter(k => !live.has(normalizeShareKey(k)));
+    if (!dead.length) {
+      log(`★ 过期清理：${Object.keys(recs).length} 条记录均在清单中，无需清理`);
+      return 0;
+    }
+    for (const k of dead) delete recs[k];
+    gmSet(GM_RECORDS, recs);
+    log(`★ 过期清理：移除 ${dead.length} 条已不在 acg.ripImprove 清单中的转存记录`
+      + `（保留 ${Object.keys(recs).length} 条）`);
+    return dead.length;
   }
   function isFileSaved(file, savedInfos) {
     if (!Array.isArray(savedInfos)) return false;
@@ -284,9 +317,7 @@
     );
   }
 
-  /* ============================================================
- * ★ 全表缓存（避免反复滚动）
- * ============================================================ */
+  /* ===== 全表缓存（避免反复滚动） ===== */
   let _allFilesCache = null;
   const ALL_FILES_CACHE_TTL = 60 * 1000;
 
@@ -301,13 +332,11 @@
   }
   function clearAllFilesCache() { _allFilesCache = null; }
 
-  /* ============================================================
- * 虚拟滚动支持
- * ============================================================ */
+  /* ===== 虚拟滚动支持 ===== */
   function getTableBody(doc = document) {
     return doc.querySelector('.ant-table-body');
   }
-  /* ★ 分享页表格是否还在初始化加载（首屏 spin / 内容模糊） */
+  /* 分享页表格是否仍在初始化加载（首屏 spin / 内容模糊） */
   function isShareTableLoading(doc = document) {
     if (doc.querySelector('.ant-table-wrapper .ant-table-spin-holder.ant-spin-spinning')) return true;
     if (doc.querySelector('.ant-table-wrapper .table-loading-wrap')) return true;
@@ -337,7 +366,7 @@
     return null;
   }
 
-  /* ★ 滚动遍历：检测 loading tr，不做无谓等待；harvest 总是覆盖最新状态 */
+  /* 滚动遍历：有 loading tr 才多等，否则不空耗；harvest 总是覆盖最新状态 */
   async function scanAllRowsByScroll(qa, doc = document, opts = {}) {
     const useCache = opts.useCache === true;
     const key = opts.key || null;
@@ -353,7 +382,6 @@
     const maxMs = opts.maxMs || 40000;
     const expected = getShareFileCount(doc);
 
-    /* ★ 若还在初始化加载，先等 */
     if (isShareTableLoading(doc)) {
       log(` ⏳ 检测到表格仍在初始化加载，等待...`);
       await until(() => !isShareTableLoading(doc), 150, 15000);
@@ -366,7 +394,6 @@
       return rows;
     }
 
-    /* ★ 检测"加载更多"指示器 */
     const hasLoadingMore = () => !!doc.querySelector(
       '.recent-loading-tr .ant-spin-spinning, ' +
       'tr[data-row-config-type="more"] .ant-spin-spinning'
@@ -387,7 +414,7 @@
       return added;
     };
 
-    /* ① 滚到顶部 */
+    /* 滚到顶部 */
     body.scrollTop = 0;
     await qa.sleep(150);
     harvest();
@@ -407,12 +434,12 @@
       const atBottom = curTop + bodyH >= scrollH - 8;
 
       if (atBottom) {
-        /* ★ 到底：根据 loading 状态决定等待时长 */
+        /* 到底：按 loading 状态决定等待时长 */
         if (hasLoadingMore()) {
-          // 有加载中 → 等它消失（最多 1500ms）
+          // 有加载中：等它消失（最多 1500ms）
           await qa.until(() => !hasLoadingMore(), 60, 1500);
         } else {
-          // 无加载中 → 只等 100ms，没有新内容就认到底
+          // 无加载中：只等 100ms，没有新内容就认到底
           await qa.sleep(100);
         }
 
@@ -436,7 +463,7 @@
         continue;
       }
 
-      /* ③ 未到底：向下滚一屏（0.8 倍视口，保证 ~20% 重叠） */
+      /* 未到底：向下滚一屏（0.8 倍视口，保证约 20% 重叠） */
       const step = Math.max(200, Math.floor(bodyH * 0.8));
       body.scrollTop = Math.min(curTop + step, scrollH);
       await qa.sleep(100);
@@ -465,7 +492,7 @@
     return result;
   }
 
-  /* ★ 滚动收集"所有被勾选的行"（partial 场景用） */
+  /* 滚动收集所有被勾选的行（partial 场景用） */
   async function scanCheckedRowsByScroll(qa, doc = document, opts = {}) {
     const cacheKey = opts.cacheKey || null;
     const body = getTableBody(doc);
@@ -476,12 +503,7 @@
     return all.filter(f => f.checked);
   }
 
-  /* ★ 滚动定位单行
- * ① 可见区优先
- * ② 用缓存 index 估计滚动位置
- * ③ 附近小范围扫
- * ④ 回退：从当前分别向上/向下顺序扫
- */
+  /* 滚动定位单行：可见区优先，其次按缓存 index 估计位置就近扫，最后上下顺序扫 */
   async function scrollToRowByName(qa, doc, name, opts = {}) {
     const body = getTableBody(doc);
     if (!body) return null;
@@ -548,12 +570,7 @@
     return null;
   }
 
-  /* ============================================================
- * 全量进度刷新
- * ============================================================ */
-  /* ============================================================
- * ★ 分享页置灰 + 进度（由桥接自主维护）
- * ============================================================ */
+  /* ===== 分享页置灰 + 进度（由桥接自主维护） ===== */
   const SHARE_GRAY_CLASS = 'qap-grayed';
   let _shareFullCounts = null; // { num, total } | null
 
@@ -585,7 +602,7 @@
 
   /* 一次 UI 刷新：置灰 + 进度（进度未设置时保持 '-'） */
   function refreshShareUI(qa, doc = document) {
-    /* ★ 加载中不刷：避免虚表空行被误判未转存 */
+    /* 加载中不刷：避免虚表空行被误判未转存 */
     if (isShareTableLoading(doc)) return;
 
     applyShareGray(qa, doc);
@@ -636,9 +653,7 @@
     } catch (e) { warn('全量进度统计失败', e); }
   }
 
-  /* ============================================================
- * 排序
- * ============================================================ */
+  /* ===== 排序 ===== */
   function findTimeSortHeader(doc = document) {
     const ths = doc.querySelectorAll('th.td-file-sort');
     for (const th of ths) {
@@ -712,9 +727,7 @@
     return { ok: false, reason: 'cannot-desc' };
   }
 
-  /* ============================================================
- * 转存原语
- * ============================================================ */
+  /* ===== 转存原语 ===== */
   function _isVisible(el) {
     if (!el) return false;
     try {
@@ -1034,9 +1047,7 @@
     return result;
   }
 
-  /* ============================================================
- * 行 checkbox
- * ============================================================ */
+  /* ===== 行 checkbox ===== */
   function getRowCheckbox(row) {
     return row.querySelector('input.ant-checkbox-input, input[type="checkbox"]');
   }
@@ -1074,9 +1085,7 @@
     return { ok: false, method: 'all-failed' };
   }
 
-  /* ============================================================
- * 表头全选
- * ============================================================ */
+  /* ===== 表头全选 ===== */
   function getHeaderCheckbox(doc = document) {
     return doc.querySelector('th.ant-table-selection-column input.ant-checkbox-input')
     || doc.querySelector('.ant-table-selection-column input.ant-checkbox-input');
@@ -1140,9 +1149,7 @@
     return { ok: getHeaderCheckState(doc) === 'none', reason: 'not-cleared' };
   }
 
-  /* ============================================================
- * 逐行勾选（虚拟滚动兼容）
- * ============================================================ */
+  /* ===== 逐行勾选（虚拟滚动兼容） ===== */
   async function applyTargetChecks(qa, doc, targets, opts = {}) {
     if (!targets || !targets.size) return { ok: true, applied: 0, failed: 0 };
 
@@ -1181,12 +1188,9 @@
     };
   }
 
-  /* ============================================================
- * 表头全选方案
- * - 少量勾选：表头清空 → 单独滚到目标勾选
- * - 大量勾选：表头全选 → 逐个滚到排除项取消
- * - 快速返回：目标全 true 且表头已 all / 目标全 false 且表头已 none
- * ============================================================ */
+  /* ===== 表头全选方案 =====
+   * 少量勾选：表头清空后逐个滚动勾选；大量勾选：表头全选后逐个滚动取消。
+   * 目标全 true 且表头已 all / 全 false 且表头已 none 时直接快速返回。 */
   async function applyTargetChecksViaSelectAll(qa, doc, targets, opts = {}) {
     if (!targets || !targets.size) return { ok: true, applied: 0, failed: 0 };
 
@@ -1202,19 +1206,17 @@
     const headerState = getHeaderCheckState(doc);
     log(` 表头状态：${headerState}；目标：${trueCount} 勾选 / ${falseCount} 取消`);
 
-    /* ★ 快速返回 1：目标全 true 且表头已 all */
     if (trueCount === totalCount && headerState === 'all') {
       log(` ✓ 表头已全选，无需操作`);
       return { ok: true, applied: 0, failed: 0, method: 'header-all-satisfied' };
     }
 
-    /* ★ 快速返回 2：目标全 false 且表头已 none */
     if (falseCount === totalCount && headerState === 'none') {
       log(` ✓ 表头已全不选，无需操作`);
       return { ok: true, applied: 0, failed: 0, method: 'header-none-satisfied' };
     }
 
-    /* 少量勾选：表头清空 → 逐个滚动勾选目标 */
+    /* 少量勾选：表头清空后逐个滚动勾选目标 */
     if (trueCount > 0 && trueCount < totalCount / 2) {
       log(` ★ 少量勾选（${trueCount}/${totalCount}），走「表头全不选 → 单独勾」快速路径`);
 
@@ -1249,7 +1251,7 @@
       };
     }
 
-    /* 大量勾选：表头全选 → 逐个滚动取消排除项 */
+    /* 大量勾选：表头全选后逐个滚动取消排除项 */
     const anyTrue = trueCount > 0;
     const targetHeaderState = anyTrue ? 'all' : 'none';
 
@@ -1288,15 +1290,13 @@
     };
   }
 
-  /* ============================================================
- * 表格稳定等待
- * ============================================================ */
+  /* ===== 表格稳定等待 ===== */
   async function waitTableStable(qa, doc = document, maxMs = 20000) {
     const t0 = Date.now();
     const expected = getShareFileCount(doc);
     log(` 头部显示共 ${expected == null ? '?' : expected} 个；等待表格稳定...`);
 
-    /* ★ 等"表格专用加载层"消失（不误判分页器/按钮的 spin） */
+    /* 等"表格专用加载层"消失（不误判分页器/按钮的 spin） */
     await until(() => !isShareTableLoading(doc), 150, maxMs);
     log(` 表格加载层已消失，等待行数稳定...`);
 
@@ -1305,7 +1305,7 @@
     const remain = () => Math.max(0, maxMs - (Date.now() - t0));
 
     const files = await until(() => {
-      /* ★ 中途又出现加载层 → 重置稳定计数 */
+      /* 中途又出现加载层：重置稳定计数 */
       if (isShareTableLoading(doc)) { lastCount = -1; stableHits = 0; return null; }
 
       const rows = qa.scanFileRows(doc);
@@ -1327,9 +1327,7 @@
     return cur;
   }
 
-  /* ============================================================
- * 批次执行器
- * ============================================================ */
+  /* ===== 批次执行器 ===== */
   async function executeBatches(qa, doc, prep, opts = {}) {
     const useSelectAll = opts.useSelectAll === true;
     const batches = (Array.isArray(prep.batches) && prep.batches.length) ? prep.batches : [prep.needSave || []];
@@ -1409,30 +1407,28 @@
     if (saved > 0) return { kind: 'partial', saved, total, failed: failedNames.length, failedReasons };
     return { kind: 'fail', saved: 0, total, failed: failedNames.length, failedReasons };
   }
-  /* ★ 格式化文件名列表，超长截断 */
+  /* 文件名列表拼接，超过 maxShow 个则截断 */
   function fmtNames(arr, maxShow = 20) {
     const names = (arr || []).map(x => (typeof x === 'string' ? x : x.name)).filter(Boolean);
     if (!names.length) return '（无）';
     if (names.length <= maxShow) return names.join('、');
     return names.slice(0, maxShow).join('、') + ` 等 ${names.length} 个`;
   }
-  /* ============================================================
- * 分享页准备
- * ============================================================ */
+  /* ===== 分享页准备 ===== */
   async function prepareShareSave(qa, doc = document, opts = {}) {
     const splitOldest = opts.splitOldest !== false;
     const cacheKey = currentCacheKey();
 
     await ensureTimeDescSort(qa, doc);
 
-    /* 等表格稳定（可见区） */
+    /* 先等可见区表格稳定 */
     let files = await waitTableStable(qa, doc, 20000);
     files = (files || []).filter(f => !isFolderFile(f));
     if (!files.length) return { ok: false, kind: 'no-files', files: [] };
 
     await sleep(300);
 
-    /* ★ 一次滚动收集全表；后续命中缓存不再滚动 */
+    /* 一次滚动收集全表；后续命中缓存不再滚动 */
     files = await scanAllRowsByScroll(qa, doc, { key: cacheKey, useCache: true });
     files = (files || []).filter(f => !isFolderFile(f));
     if (!files.length) return { ok: false, kind: 'no-files', files: [] };
@@ -1473,9 +1469,7 @@
     };
   }
 
-  /* ============================================================
- * 子任务
- * ============================================================ */
+  /* ===== 子任务 ===== */
   async function tryHandleChildTask(qa) {
     const shareId = extractShareId(location.href);
     if (!shareId) return false;
@@ -1495,7 +1489,7 @@
     qa.mountPanel();
     qa.setStatus('子任务处理中...', 'running');
     qa.setProgress('-');
-    startSharePolling(qa); // ★ 让子任务页可见区也置灰
+    startSharePolling(qa); // 让子任务页可见区也置灰
 
     const finish = (kind, extra = {}) => {
       setResult(shareId, { kind, ...extra });
@@ -1591,9 +1585,7 @@
     clearTask(shareId);
     return { kind: 'timeout', message: 'tab-timeout' };
   }
-  /* ============================================================
- * 个人页：点击页面内"刷新"按钮（替代整页 reload）
- * ============================================================ */
+  /* ===== 个人页：点击页面内"刷新"按钮（替代整页 reload） ===== */
   function findListRefreshButton(doc = document) {
     const el = doc.querySelector('.fl-refresh');
     if (el && _isVisible(el)) return el;
@@ -1616,7 +1608,7 @@
     }
   }
 
-  /* 点击刷新后，等待表格 loading 出现→消失（列表重拉一次） */
+  /* 点击刷新后，等表格 loading 出现再消失（列表重拉一次） */
   async function clickListRefreshAndWait(qa, doc = document, opts = {}) {
     const appearedTimeout = opts.appearedTimeout ?? 3000;
     const settleTimeout  = opts.settleTimeout  ?? 12000;
@@ -1633,7 +1625,6 @@
       100, appearedTimeout
     );
 
-    // 再等 spin 消失
     if (appeared) {
       await until(() => !tableWrap.querySelector('.ant-spin-spinning'), 150, settleTimeout);
     } else {
@@ -1642,9 +1633,7 @@
     }
     return true;
   }
-  /* ============================================================
- * 批量转存
- * ============================================================ */
+  /* ===== 批量转存 ===== */
   async function runSaveAllFlow(qa, pendingUrlsOverride) {
     let pending;
 
@@ -1767,9 +1756,7 @@
     }
   }
 
-  /* ============================================================
- * 分享页：手动转存当前页
- * ============================================================ */
+  /* ===== 分享页：手动转存当前页 ===== */
   async function runSaveCurrentPage(qa) {
     await ensureTimeDescSort(qa, document);
 
@@ -1904,9 +1891,7 @@
     refreshFullCounts(qa);
   }
 
-  /* ============================================================
- * 分享页：标记 / 清除
- * ============================================================ */
+  /* ===== 分享页：标记 / 清除 ===== */
   async function runMarkFlow(qa) {
     await ensureTimeDescSort(qa, document);
 
@@ -2026,9 +2011,7 @@
     await refreshShareFullCounts(qa);
   }
 
-  /* ============================================================
- * acg.rip 端
- * ============================================================ */
+  /* ===== acg.rip 端 ===== */
   function runQuarkAutoTrigger(opts = {}) {
     const { force = false } = opts;
     const folderId = getFolderId().trim();
@@ -2153,7 +2136,7 @@
         const pend = gmGet(GM_PENDING_URLS, {}) || {};
         const auto = Number(GM_getValue(GM_AUTO_TRIGGER, 0) || 0);
         alert(
-          `转存记录：${Object.keys(recs).length} 条\n` +
+          `转存记录：${Object.keys(recs).length} 条（不按时间过期；过期只依据 acg.rip 清单）\n` +
           `CD：${Object.keys(state).length} 个 URL\n` +
           `待处理清单：${Array.isArray(pend.urls) ? pend.urls.length : 0} 项\n` +
           `自动触发标记：${auto ? new Date(auto).toLocaleTimeString() : '无'}`
@@ -2161,12 +2144,13 @@
       });
     } catch {}
 
+    /* 过期只依据 acg.ripImprove 清单；清单不可用时 sweepObsoleteRecords 会自行跳过，绝不误删。 */
+    setTimeout(() => { try { sweepObsoleteRecords(); } catch (e) { warn('过期清理失败', e); } }, 2000);
+
     log('已启动（acg.rip 端）');
   }
 
-  /* ============================================================
- * 夸克端入口
- * ============================================================ */
+  /* ===== 夸克端入口 ===== */
   async function waitForQA(timeout = 10000) {
     return await until(() => {
       const qa = unsafeWindow.quarkAssistant;
@@ -2203,7 +2187,7 @@
       /* 桥接自主的分享页轮询：只刷可见区置灰 + 进度 */
       startSharePolling(qa);
 
-      /* ★ 排序修复；排序会触发新的加载，所以排序完成后要再刷一次灰色 */
+      /* 排序会触发新的加载，完成后需再刷一次灰置 */
       ensureTimeDescSort(qa, document).then(async (r) => {
         log(`★ 分享页初始化排序结果：${JSON.stringify(r)}`);
         if (r && r.ok && r.method !== 'already') {
@@ -2213,7 +2197,7 @@
         }
       });
 
-      /* ★ 等首屏加载完，再刷一次可见区灰色（避免加载中查到空表格） */
+      /* 等首屏加载完再刷灰色，避免加载中查到空表格 */
       (async () => {
         await until(() => !isShareTableLoading(document), 150, 20000);
         refreshShareUI(qa);
@@ -2222,7 +2206,7 @@
       })();
 
       log(`★ 分享页初始化（等待用户操作 / 子任务触发）`);
-      /* ★ 不再主动 refreshShareFullCounts —— 未点击按钮前显示 '-'，不触发全表滚动 */
+      /* 不主动 refreshShareFullCounts：未点击按钮前显示 '-'，不触发全表滚动 */
     } else if (isList) {
       qa.setActions([
         {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      5.6.0
+// @version      5.6.1
 // @description  夸克网盘平台层：UI + DOM 工具 + 批量下载 + 下载记录 + 暂停控制 + 底层删除工具（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -232,20 +232,57 @@
     return true;
   }
 
+  /* 读取元素的 background-image 真实 URL（优先 computedStyle，退回 style 属性）。
+   * 夸克的文件图标是 `<div class="file-icon"><div style="background-image:url(…)"></div></div>`，
+   * 没有 <img>，所以必须走 background-image。*/
+  function readBgImageUrl(el) {
+    if (!el) return '';
+    try {
+      const win = (el.ownerDocument && el.ownerDocument.defaultView) || window;
+      const bg = win.getComputedStyle(el).backgroundImage;
+      if (bg && bg !== 'none') {
+        const m = bg.match(/url\(["']?(.*?)["']?\)/);
+        if (m && m[1]) return m[1];
+      }
+    } catch {}
+    const inline = el.getAttribute && el.getAttribute('style');
+    if (inline) {
+      const m = String(inline).match(/background(?:-image)?\s*:\s*[^;]*url\(["']?(.*?)["']?\)/i);
+      if (m && m[1]) return m[1];
+    }
+    return '';
+  }
+
+  /* 文件图标签名。**保留完整 URL（含 ?fid=…）**：fid 是该文件的身份，改名/转存都不会变。
+   * svg/cls 只有类型信息（同类型文件完全相同），不能当身份用。*/
   function getFileIconSig(row) {
-    const iconEl = row.querySelector('.file-icon');
+    /* 图标容器：只在图标元素内部找 —— 回退到整行会把操作列/角标等无关背景图当成缩略图。*/
+    const iconEl = row.querySelector('.file-icon, [class*="file-icon"], [class*="FileIcon"], [class*="thumb"]');
     if (!iconEl) return '';
-    const useEl = iconEl.querySelector('use');
+    const scope = iconEl;
+
+    /* ① 真实缩略图/图片：img → 完整 src（含 query） */
+    const img = scope.querySelector('img');
+    if (img) {
+      const u = img.currentSrc || img.src || img.getAttribute('src') || '';
+      if (u && /^(https?:)?\/\//.test(u)) return 'img:' + u;
+    }
+
+    /* ② background-image（夸克个人页/分享页的视频缩略图就走这里） */
+    const bgSelf = readBgImageUrl(scope);
+    if (bgSelf && /^(https?:)?\/\//.test(bgSelf)) return 'bg:' + bgSelf;
+    for (const child of scope.querySelectorAll('div,span,i')) {
+      const u = readBgImageUrl(child);
+      if (u && /^(https?:)?\/\//.test(u)) return 'bg:' + u;
+    }
+
+    /* ③ 退回类型签名（不可辨识，只用于日志） */
+    const useEl = scope.querySelector('use');
     if (useEl) {
       const href = useEl.getAttribute('xlink:href') || useEl.getAttribute('href') || '';
       if (href) return 'svg:' + href;
     }
-    const img = iconEl.querySelector('img');
-    if (img && img.src) return 'img:' + String(img.src).split('?')[0];
-    const html = iconEl.innerHTML || '';
-    const m = html.match(/url\(["']?([^"')]+)["']?\)/);
-    if (m) return 'url:' + m[1].split('?')[0].slice(0, 80);
-    const cls = (iconEl.className || '').trim();
+    const cls = (scope.className || '').trim();
     return cls ? 'cls:' + cls : '';
   }
 
@@ -1139,7 +1176,7 @@
 
   /* ===== 对外 API ===== */
   unsafeWindow.quarkAssistant = {
-    version: '5.6.0',
+    version: '5.6.1',
     isReady: () => true,
     isListPage, isSharePage,
 

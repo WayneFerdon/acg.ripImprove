@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.5.1
+// @version 3.5.2
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 [bgm]名称[bgm]原始文件名）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -2717,8 +2717,8 @@
       && savedBefore.some(si => isSameFile(si, { name: savedName, sizeStr: (saved && saved.sizeStr) || '', iconSig: (saved && saved.iconSig) || '' }));
 
     /* ① 图标签名一致（**主判据**）。用户确认：图标本身不会变，URL 里的 fid 就是文件身份。
-     * ①-a 带 fid 的签名：全库唯一命中即为同一份文件（不需要名字、不需要记录、不需要大小）。
-     * ①-b 只认路径的签名（无 fid）：必须名字收敛 + 唯一 + 大小可辨，避免同目录同类型误配。*/
+     * ①-a 带 fid 的签名：**唯一**命中即为同一份文件（不依赖名字/记录/后缀；不唯一就绝不猜）；
+     * ①-b 只认路径的签名（无 fid）：必须名字收敛 + 排除纯名旧行 + 唯一 + 大小可辨。*/
     if (isIdentifiableIconSig(savedIcon)) {
       const sameIcon = rows.filter(r => sameIconSig(r.iconSig, savedIcon));
       if (sameIcon.length) {
@@ -2727,9 +2727,9 @@
             log(` ★ 改名：${savedName} 按 icon（fid=${iconFid(savedIcon)}）唯一命中「${sameIcon[0].name}」`);
             return mk(sameIcon[0], 'icon-fid');
           }
-          log(` ★ 改名：${savedName} 的 icon(fid=${iconFid(savedIcon)}) 命中 ${sameIcon.length} 行，用大小收敛`);
-          const sized = savedSize ? sameIcon.filter(r => normSizeKey(r.sizeStr) === savedSize) : [];
-          if (sized.length === 1) return mk(sized[0], 'icon-fid');
+          /* fid 命中多行（fid 不是逐文件唯一）→ icon 不能当身份用，改走快照/名字路径 */
+          log(` ★ 改名：${savedName} 的 icon(fid=${iconFid(savedIcon)}) 命中 ${sameIcon.length} 行（fid 非唯一），`
+            + `icon 不作身份用 → 改走快照/名字匹配`);
         } else {
           const nameOk = r => {
             const cur = String(r.name || '');

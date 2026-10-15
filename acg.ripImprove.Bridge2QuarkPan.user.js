@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.3.1
+// @version 3.5.1
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 [bgm]名称[bgm]原始文件名）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -276,10 +276,8 @@
 
     if (sa === sb) return true;
 
-    // 兜底：iconSig 一致且都存在时也算相同（个别大小格式可能不同）
-    const ia = String(a.iconSig ?? '').trim();
-    const ib = String(b.iconSig ?? '').trim();
-    if (ia && ib && ia === ib) return true;
+    // 兜底：iconSig 一致（fid 相同 = 同一份文件）时也算相同
+    if (sameIconSig(a.iconSig, b.iconSig)) return true;
 
     return false;
   }
@@ -1628,25 +1626,10 @@
   /* ===== 行内改名（夸克真实实现）=====
    * 文件名单元格：`<div class="filename-text editable-cell editable-cell-allow" title="原名">原名</div>`
    * 点它 → 原地变成 `<input class="ant-input input-edit" maxlength="250" value="原名">`（无弹窗）。
-   * 写入新名 → Enter（不行再失焦 / 点确认 / Ctrl+Enter）提交 → **等列表确认新名落地** 才算成功。
-   * fid：目标行的 data-row-key（改名不换 fid，用它绑定复核，比按名比对可靠）。
-   * 返回 'ok' | 'fail' | 'unverified'。*/
+   * 写入新名 → Enter（不行再失焦 / 点确认 / Ctrl+Enter）提交 → **等列表按完整新名确认到** 才算成功。
+   * fid：目标行的 data-row-key（改名不换 fid，用它绑定复核）。*/
 
-  /* 提交后绑定复核：同一 fid 行现在叫什么？
-   * 不能用 findListRowByName 做判据 —— 它的比较键会把 [bgm]…[bgm] 剥掉，
-   * "新名"与"旧名"键相同 → 恒真，会把没改成的判成功。*/
-  function readRowLiveName(fid, doc = document) {
-    if (!fid) return null;
-    const row = findRowByFid(fid, doc);
-    if (!row) return null;
-    const cell = row.querySelector('.filename-text, [class*="filename-text"], .file-name, [class*="file-name"]');
-    const el = cell || row;
-    const t = (el.getAttribute && el.getAttribute('title')) || '';
-    return `${t} ${el.textContent || ''}`.replace(/\s+/g, ' ').trim();
-  }
-
-  /* 读取某一行"当前显示的单个文件名"（title 优先，退回 textContent）。
-   * 注意：readRowLiveName 返回的是 "title 空格 textContent" 的拼接串，**不能**当文件名用。*/
+  /* 读取某一行"当前显示的单个文件名"（title 优先，退回 textContent）。*/
   function readRowRealName(fid, doc = document) {
     if (!fid) return '';
     const row = findRowByFid(fid, doc);
@@ -1656,90 +1639,94 @@
     .replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
   }
 
-  function rowNameMatches(live, raw, mode) {
-    if (!live || !raw) return false;
-    if (mode === 'new') return live.includes(raw) || live.replace(/\s+/g, '') === raw.replace(/\s+/g, '');
-    return live.includes(raw);
+  /* 在列表里按**完整文件名（含 [bgm] 标签）**精确查找：可见区找不到就全表滚动扫描。
+   * 这是改名确认的唯一依据 —— 必须能按新名（含标签）重新找到那一行。*/
+  function normExactName(s) {
+    return String(s ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+  }
+  async function findExactNameAnywhere(qa, name, doc = document, maxMs = 4000) {
+    const want = normExactName(name);
+    if (!want) return null;
+    const visible = (qa.scanFileRows(doc) || []).find(f => normExactName(f.name) === want);
+    if (visible) return visible;
+    try {
+      const all = await scanAllRowsByScroll(qa, doc, { key: currentCacheKey(), useCache: false, maxMs }) || [];
+      return all.find(f => normExactName(f.name) === want) || null;
+    } catch { return null; }
   }
 
   /* ===== 改名落地确认（唯一判据，行内与弹窗两条路径共用）=====
-   * 必须确认"这一行（fid 绑定）的原样名确实变成了新名"，或者"旧名精确消失 + 新名出现"。
-   * 绝不用 getComparableFileName / findListRowByName 做成功判据：它会剥掉 [bgm]…[bgm]，
-   * 新旧名比较键相同 → 恒真，会把没改成的判成功。
-   * 返回 true(已确认) / false(确认没有改) / null(确认不了)。*/
+   * 用户要求：**必须按完整新名（含 [bgm] 标签）在列表里重新匹配到那一行**，才算改名成功。
+   * 只认"完整名精确相等"（可见区每 300ms 查一次、全表每 3s 查一次），
+   * 不用 includes / 不用会剥 [bgm] 的比较键（那等于把没改成判成功）。
+   * 返回 true(已确认) / false(确认没改成) / null(确认不了)。*/
   async function confirmRenamedInList(qa, opts = {}) {
     const doc = opts.doc || document;
     const fid = opts.fid || '';
-    const oldName = String(opts.oldName ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-    const newName = String(opts.newName ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    const oldName = normExactName(opts.oldName);
+    const newName = normExactName(opts.newName);
     const budgetMs = Number(opts.budgetMs) > 0 ? Number(opts.budgetMs) : 45000;
     const stableMs = 2000;
-    const preRaw = fid ? readRowLiveName(fid, doc) : null;
 
     const deadline = Date.now() + budgetMs;
-    let scrolled = false;
-    let lastLog = 0;
-    let lastFallback = 0;
-    let lastFallbackHit = false;
     let stableSince = 0;
+    let lastFull = 0;
+    let lastFullHit = false;
+    let lastLog = 0;
+    let scrolled = false;
+
+    /* 可见区按"完整名"精确匹配（并校验 fid） */
+    const visibleExact = () => {
+      const hit = (qa.scanFileRows(doc) || []).find(f => normExactName(f.name) === newName);
+      if (!hit) return false;
+      if (fid && hit.fid && hit.fid !== fid) return false;   /* 同名但不是目标行 */
+      return true;
+    };
 
     while (Date.now() < deadline) {
-      /* 确认"新名已落地"：连续 stableMs 都成立才算，避免乐观更新/瞬时值假成功。
-       * 兜底查询被节流时沿用上次结果（否则每 300ms 一次的循环会把连续计时清零，
-       * 兜底永远攒不满 stableMs）。*/
-      let fallbackHit = false;
-      if (Date.now() - lastFallback > 1000) {
-        lastFallback = Date.now();
-        const hit = findRowByExactName(qa, newName, doc);
-        fallbackHit = !!(hit && (!fid || hit.fid === fid));
-        lastFallbackHit = fallbackHit;
-      } else {
-        fallbackHit = lastFallbackHit;
+      let seen = visibleExact();
+      /* 可见区没命中时才做全表兜底（虚拟滚动）：每 3 秒一次、单次最多 4 秒，
+       * 结果在两次之间沿用，保证"连续 2 秒看到新名"能攒满。*/
+      if (!seen && Date.now() - lastFull > 3000) {
+        lastFull = Date.now();
+        const hit = await findExactNameAnywhere(qa, newName, doc, 4000);
+        lastFullHit = !!(hit && (!fid || !hit.fid || hit.fid === fid));
       }
-      const seenNow = () => {
-        if (fid) {
-          const live = readRowLiveName(fid, doc);
-          if (live != null && rowNameMatches(live, newName, 'new')) return true;
-        }
-        return fallbackHit;
-      };
+      if (!seen) seen = lastFullHit;
 
-      if (seenNow()) {
+      if (seen) {
         if (!stableSince) stableSince = Date.now();
-        if (Date.now() - stableSince >= stableMs) return true;
+        if (Date.now() - stableSince >= stableMs) {
+          log(` ✓ 改名：按完整名（含标签）在列表里确认到「${newName}」`);
+          return true;
+        }
       } else {
         stableSince = 0;
       }
 
       if (!scrolled && Date.now() > deadline - (budgetMs - 5000)) {
         scrolled = true;
-        if (fid) { try { await scrollToRowByName(qa, doc, newName, { cacheKey: currentCacheKey(), maxMs: 4000 }); } catch {} }
+        try { await scrollToRowByName(qa, doc, newName, { cacheKey: currentCacheKey(), maxMs: 4000 }); } catch {}
       }
       if (Date.now() - lastLog > 8000) {
         lastLog = Date.now();
-        const live = fid ? readRowLiveName(fid, doc) : null;
-        log(`   …仍在等待改名生效（当前行名：${live ? live.slice(0, 60) : '不在可见区'}）`);
+        const live = fid ? readRowRealName(fid, doc) : '';
+        log(`   …仍在等待改名生效（该行当前名：${live ? live.slice(0, 60) : '不在可见区'}）`);
       }
       await sleep(300);
     }
 
-    /* 超时：只用**原样名**判定（绝不用会剥 [bgm] 的比较键 —— 那等于把未改名判成成功） */
-    if (fid && preRaw) {
-      const live = readRowLiveName(fid, doc);
-      if (live != null) {
-        if (live === preRaw) {
-          /* 同一 fid 行原样名一个字都没变 → 确实没改成 */
-          return false;
-        }
-        if (live === newName) return true;
-        const exactNew = findRowByExactName(qa, newName, doc);
-        if (exactNew && (!fid || exactNew.fid === fid)) return true;
-        return null;
-      }
+    /* 超时：再各查一次完整名（可见区 + 全表） */
+    const finalHit = await findExactNameAnywhere(qa, newName, doc);
+    if (finalHit && (!fid || !finalHit.fid || finalHit.fid === fid)) {
+      log(` ✓ 改名：超时前一刻按完整名确认到「${newName}」`);
+      return true;
     }
-    if (oldName && findRowByExactName(qa, oldName, doc)) return false;
-    const hitNew = findRowByExactName(qa, newName, doc);
-    if (hitNew && (!fid || hitNew.fid === fid)) return true;
+    /* 旧名还在（完整名精确）→ 确认没改成 */
+    if (oldName) {
+      const oldHit = await findExactNameAnywhere(qa, oldName, doc);
+      if (oldHit) return false;
+    }
     return null;
   }
 
@@ -2124,6 +2111,18 @@
     const msg = lines.join('\n');
     log('=== 改名诊断 ===\n' + msg);
     alert(msg + '\n\n（本诊断不改动任何文件；详细内容见控制台 [桥接] 日志）');
+  }
+
+  /* 手动放行：改名没确认时 BUSY_KEY 会一直保持（阻止自动下载）。用户确认要用原名下载时点这里。*/
+  async function runAllowDownloadAfterRename(qa) {
+    let busy = false;
+    try { busy = sessionStorage.getItem(BUSY_KEY) === '1'; } catch {}
+    if (busy && !confirm('改名未全部确认，当前已阻止下载。\n\n确定要按当前文件名（可能还是旧名）继续下载吗？')) return;
+    releaseBusy();
+    log('★ 用户确认允许下载：已解除忙碌标志，触发下载');
+    if (qa.isPaused && qa.isPaused()) { alert('已允许下载，但夸克助手处于暂停状态（点「▶️ 继续下载」后再下载）。'); return; }
+    if (typeof qa.autoDownloadWorkflow !== 'function') { alert('已解除限制；请点夸克面板「⬇️ 下载」。'); return; }
+    await qa.autoDownloadWorkflow();
   }
 
   /* ===== 逐行勾选（虚拟滚动兼容） ===== */
@@ -2615,12 +2614,48 @@
    * 所以**不能按名字找行**。优先用图标签名（thumbnail URL 去掉 fid 查询参数后是文件自身的标识）。
    * 退路：名字去 (n) 后缀相等（按后缀号最大者优先 = 夸克给新文件分配的号最大）。*/
 
-  /* 图标签名归一化：去掉 ?query（fid 不同页不同），只留资源路径 */
+  /* 图标签名归一化：**保留 fid**（fid 就是文件身份，改名/转存都不变），其余 query 参数去掉。
+   * 输入形如 `bg:https://drive-pc.quark.cn/1/clouddrive/file/video/thumbnail?fid=…&pr=ucpro&fr=pc`。*/
   function normalizeIconSig(sig) {
-    const s = String(sig ?? '').trim();
+    let s = String(sig ?? '').trim();
     if (!s) return '';
-    const cut = s.split('?')[0];
-    return cut.replace(/\/+$/, '');
+    s = s.replace(/&amp;/g, '&').replace(/^([A-Za-z]+):/, (m, p) => p.toLowerCase() + ':');
+    /* 去掉可能包裹的引号/实体 */
+    s = s.replace(/^([a-z]+:)\s*["']?/, '$1').replace(/["']\s*$/, '').trim();
+    const q = s.indexOf('?');
+    if (q < 0) return s.replace(/\/+$/, '');
+    const base = s.slice(0, q).replace(/\/+$/, '');
+    const params = s.slice(q + 1).split('&').filter(Boolean);
+    const fidKv = params.find(p => /^fid=/i.test(p));
+    if (fidKv) return base + '?' + fidKv;          /* 身份 = 路径 + fid */
+    return base + '?' + params.slice().sort().join('&');
+  }
+
+  /* 取签名里的 fid（没有则为空） */
+  function iconFid(sig) {
+    const m = normalizeIconSig(sig).match(/[?&]fid=([^&]+)/i);
+    return m ? m[1] : '';
+  }
+
+  /* 签名是否"可按文件区分"：只有真实图片/缩略图 URL 才算。
+   * `svg:`/`cls:` 是**按类型**生成的（同类型文件完全相同），不能当身份用。*/
+  function isIdentifiableIconSig(sig) {
+    const s = String(sig ?? '').trim();
+    if (!s || /^(svg|cls):/i.test(s)) return false;
+    if (!/^(img|bg|url):/i.test(s)) return /^https?:\/\//i.test(s);
+    return /thumbnail|\.(png|jpe?g|webp|gif|avif)/i.test(s) || /[?&]fid=/i.test(s);
+  }
+
+  /* 两个图标签名是否同一份文件：
+   * - **带 fid 的签名：只比 fid**（fid 就是身份；跨页前缀 img:/bg:、host、其它参数不同也算同一份）；
+   * - 都无 fid 的真实图片：路径全等即同一份；
+   * - 任一方是 svg/cls 类型签名 → 一律不算（避免同类型误配）。*/
+  function sameIconSig(a, b) {
+    if (!isIdentifiableIconSig(a) || !isIdentifiableIconSig(b)) return false;
+    const fa = iconFid(a), fb = iconFid(b);
+    if (fa || fb) return !!fa && !!fb && fa.toLowerCase() === fb.toLowerCase();
+    const na = normalizeIconSig(a), nb = normalizeIconSig(b);
+    return !!na && na === nb;
   }
 
   /* 判定"目录里已存在的文件" vs "刚转存进来的新文件" */
@@ -2642,26 +2677,17 @@
     try { return normalizeSizeStr(s); } catch { return String(s ?? '').trim().toUpperCase(); }
   }
 
-  /* 图标签名是否"可以按文件区分"：只有真实缩略图/图片 URL 才当身份用。
-   * `svg:`/`cls:`/`url:` 这类是**按文件类型**生成的（同类型文件签名相同），不能用来认文件。*/
-  function isIdentifiableIconSig(sig) {
-    const s = normalizeIconSig(sig);
-    return /^img:https?:\/\//i.test(s) && /thumbnail|\.(png|jpe?g|webp|gif|avif)/i.test(s);
-  }
-
-  /* 图标签名是否同一份文件（去掉 ?query 后全等）。匹配不上就走名字后缀那条路。*/
-  function sameIconSig(a, b) {
-    if (!isIdentifiableIconSig(a) || !isIdentifiableIconSig(b)) return false;
-    const na = normalizeIconSig(a), nb = normalizeIconSig(b);
-    return !!na && na === nb;
-  }
+  /* 上一次 matchSavedToListRow 的判定备注：'' = 正常/找不到，'ambiguous' = 有多行但无法判定谁是新的 */
+  let lastMatchReason = '';
 
   /* saved：转存结果记录（share 页拿到的原始文件名，可能没有大小）
    * rows：个人页当前列表行（qa.scanFileRows）
    * savedBefore：本次转存前的已转存名单（用于区分"已存在的旧同名文件"与"刚转存进来的新文件"）
    * 返回 { row, currentName, base, how }；base 一律取**列表真实当前名**（不剥 (n)），
    * 避免目标名与目录里已存在的文件撞名。*/
-  function matchSavedToListRow(saved, rows, savedBefore) {
+  function matchSavedToListRow(saved, rows, savedBefore, opts = {}) {
+    const beforeFids = (opts && opts.beforeFids) || null;
+    lastMatchReason = '';
     if (!Array.isArray(rows) || !rows.length) return null;
     const savedName = String((saved && saved.name) || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
     if (!savedName) return null;
@@ -2690,50 +2716,98 @@
     const exactAlreadySaved = Array.isArray(savedBefore)
       && savedBefore.some(si => isSameFile(si, { name: savedName, sizeStr: (saved && saved.sizeStr) || '', iconSig: (saved && saved.iconSig) || '' }));
 
-    /* ① 图标签名一致（首选）。
-     * 但必须先按名字收敛，且必须**唯一**：
-     * - 同目录同类型视频的缩略图签名可能相同（query 里才带 fid），不过滤名字会命中一整片；
-     * - 命中多行或大小列未加载时不能猜（猜错就是改错文件）；
-     * - 若"纯名旧行"本来就在转存记录里（exactAlreadySaved），那么 icon 命中它就一定是错的
-     *   （正确的新行可能是懒加载/无缩略图）→ 直接弃用 icon 路径，交给名字路径挑带后缀的新行。*/
+    /* ① 图标签名一致（**主判据**）。用户确认：图标本身不会变，URL 里的 fid 就是文件身份。
+     * ①-a 带 fid 的签名：全库唯一命中即为同一份文件（不需要名字、不需要记录、不需要大小）。
+     * ①-b 只认路径的签名（无 fid）：必须名字收敛 + 唯一 + 大小可辨，避免同目录同类型误配。*/
     if (isIdentifiableIconSig(savedIcon)) {
-      const nameOk = r => {
-        const cur = String(r.name || '');
-        const curKey = getComparableFileName(cur);
-        if (curKey === wantName) return true;
-        const rs = stripDedupSuffix(cur);
-        return rs.suffix > 0 && getComparableFileName(rs.base) === wantName;
-      };
-      const oldRows = exactAlreadySaved ? new Set(exactCand.map(c => c.r)) : new Set();
-      const byIcon = rows.filter(r => nameOk(r) && !oldRows.has(r) && sameIconSig(r.iconSig, savedIcon));
-      if (byIcon.length) {
-        const sized = savedSize ? byIcon.filter(r => normSizeKey(r.sizeStr) === savedSize) : [];
-        const allSized = byIcon.every(r => !!normSizeKey(r.sizeStr));
-        if (savedSize && allSized && sized.length === 1) return mk(sized[0], 'icon');
-        if (!savedSize && byIcon.length === 1 && normSizeKey(byIcon[0].sizeStr)) return mk(byIcon[0], 'icon');
-        log(` ★ 改名：${savedName} 的缩略图命中 ${byIcon.length} 行（大小可辨=${allSized}），无法唯一确定，改走名字匹配`);
+      const sameIcon = rows.filter(r => sameIconSig(r.iconSig, savedIcon));
+      if (sameIcon.length) {
+        if (iconFid(savedIcon)) {
+          if (sameIcon.length === 1) {
+            log(` ★ 改名：${savedName} 按 icon（fid=${iconFid(savedIcon)}）唯一命中「${sameIcon[0].name}」`);
+            return mk(sameIcon[0], 'icon-fid');
+          }
+          log(` ★ 改名：${savedName} 的 icon(fid=${iconFid(savedIcon)}) 命中 ${sameIcon.length} 行，用大小收敛`);
+          const sized = savedSize ? sameIcon.filter(r => normSizeKey(r.sizeStr) === savedSize) : [];
+          if (sized.length === 1) return mk(sized[0], 'icon-fid');
+        } else {
+          const nameOk = r => {
+            const cur = String(r.name || '');
+            const curKey = getComparableFileName(cur);
+            if (curKey === wantName) return true;
+            const rs = stripDedupSuffix(cur);
+            return rs.suffix > 0 && getComparableFileName(rs.base) === wantName;
+          };
+          const oldRows = new Set(exactCand.map(c => c.r));   /* 无条件排除纯名旧行 */
+          const byIcon = sameIcon.filter(r => nameOk(r) && !oldRows.has(r));
+          if (byIcon.length) {
+            const sized = savedSize ? byIcon.filter(r => normSizeKey(r.sizeStr) === savedSize) : [];
+            const allSized = byIcon.every(r => !!normSizeKey(r.sizeStr));
+            if (savedSize && allSized && sized.length === 1) return mk(sized[0], 'icon');
+            if (!savedSize && byIcon.length === 1 && normSizeKey(byIcon[0].sizeStr)) return mk(byIcon[0], 'icon');
+          }
+        }
+      } else {
+        log(` ★ 改名：${savedName} 的 icon 在列表里没有匹配行（icon=${String(savedIcon).slice(0, 80)}）`);
       }
     }
 
     /* ② 名字一致或只差 (n) 后缀。
-     * 关键判定：如果"与转存名完全相同"的那一行**本来就在转存记录里**（=旧文件），
-     * 那这次新转存进来的是带后缀的那个 → 取后缀号最大的候选。
-     * （"最大后缀号 = 新文件"依赖夸克的分配规则，日志会打出来，真机可核对。）*/
+     * 判定顺序（越来越弱）：
+     * ②-a **转存前快照**：候选行里 fid 在转存前不存在的那个 = 刚转存进来的新文件（最可靠，
+     *      夸克重名转存会新建一个 fid）。不需要知道"最大后缀号"是什么规则。
+     * ②-b 只剩唯一候选 → 就是它。
+     * ②-c 转存记录里已有纯名行（旧文件）→ 新的是带后缀的那个，取后缀号最大者。
+     * ②-d 纯名行 + 带后缀行并存、又没有快照/记录佐证 → 不猜（宁可不改，不可改错）。*/
+    const allCand = exactCand.concat(baseCand);
     const suffixed = exactCand.filter(c => c.suffix > 0).concat(baseCand);
-    if (!exactAlreadySaved && exactCand.length && baseCand.length) {
-      /* 纯名旧行 + 带后缀行同时存在，但我们不知道哪个是刚转存的 → 不猜（宁可不改，不可改错） */
-      warn(` ⚠️ 改名：${savedName} 同时存在 ${exactCand.length} 个同名行与 ${baseCand.length} 个带后缀行，无法判定哪个是刚转存的，跳过`);
+    const pickBySize = list => {
+      if (savedSize) {
+        const sized = list.filter(c => normSizeKey(c.r.sizeStr) === savedSize);
+        if (sized.length) return sized;
+      }
+      return list;
+    };
+    const pickMaxSuffix = list => {
+      const p = pickBySize(list).slice();
+      p.sort((a, b) => b.suffix - a.suffix);
+      return p[0];
+    };
+
+    /* ②-a 快照判定：哪一行的 fid 是转存后新出现的 */
+    if (beforeFids && beforeFids.size && allCand.length) {
+      const fresh = allCand.filter(c => c.r && c.r.fid && !beforeFids.has(c.r.fid));
+      if (fresh.length) {
+        const pick = fresh.length === 1 ? fresh[0] : pickMaxSuffix(fresh);
+        log(` ★ 改名：${savedName} 按"转存前快照"定位到新行 ${pick.cur}（fid=${pick.r.fid}）`);
+        return mk(pick.r, 'new-fid');
+      }
+      if (allCand.every(c => c.r && c.r.fid && beforeFids.has(c.r.fid))) {
+        log(` ★ 改名：${savedName} 的候选行在转存前就都存在（没有新行），改用记录/后缀判定`);
+      }
+    }
+
+    /* ②-b 唯一候选 */
+    if (allCand.length === 1) return mk(allCand[0].r, 'name-only');
+
+    /* ②-c 记录里已有纯名行 → 取带后缀的最新那个 */
+    if (exactAlreadySaved && suffixed.length) {
+      const pick = pickMaxSuffix(suffixed);
+      return mk(pick.r, 'name');
+    }
+
+    /* ②-d 无法判定 */
+    if (exactCand.length && baseCand.length) {
+      warn(` ⚠️ 改名：${savedName} 同时存在 ${exactCand.length} 个同名行与 ${baseCand.length} 个带后缀行，`
+        + `且没有"转存前快照/记录"能说明哪一行是新转存的 → 跳过（宁可不改，不可改错）`);
+      lastMatchReason = 'ambiguous';
       return null;
     }
-    const cand = (exactAlreadySaved && suffixed.length) ? suffixed : (exactCand.length ? exactCand : baseCand);
+
+    const cand = exactCand.length ? exactCand : baseCand;
     if (cand.length) {
-      let pool = cand;
-      if (savedSize) {
-        const sized = cand.filter(c => normSizeKey(c.r.sizeStr) === savedSize);
-        if (sized.length) pool = sized;
-      }
-      pool.sort((a, b) => b.suffix - a.suffix);
-      return mk(pool[0].r, 'name');
+      const pick = pickMaxSuffix(cand);
+      return mk(pick.r, 'name');
     }
 
     /* ③ 兜底：仅按可比较名匹配 */
@@ -2746,18 +2820,27 @@
    * listRows：个人页当前列表行（用于把"刚转存的文件"对上真实行，含 (n) 后缀场景）。
    * old 一律保留"列表页当前名"原样（applyListRenames 靠它定位行）。
    * 同一个原始文件名出现在多个分享、但 acg 最终名称不一致 → 无法判定，跳过不改名。*/
-  function buildRenamePlan(savedByUrl, bd, listRows = [], alreadySaved = []) {
+  function buildRenamePlan(savedByUrl, bd, listRows = [], alreadySaved = [], beforeFids = null) {
     const { map: nameByShare, conflict } = collectShareNameMap(bd);
     /* 先给每个"转存结果"配上列表里真实的行与未被转存前就存在的同名文件 */
     const items = [];
     const usedFids = new Set();
     const usedRows = new Set();
+    /* 需要改名但没能对上列表行的文件（含"被同批占用"）—— 调用方据此**禁止下载**：
+     * 一旦有文件没改名成功，就绝不能按旧名开始下载。*/
+    const unmatched = [];
+    let ambiguous = [];    /* 有多行但无法判定哪个是刚转存的（要用户/真机确认） */
+    const noName = [];       /* 所在分享在 acg 清单里找不到最终名称 → 没有名字可改 */
     for (const entry of (Array.isArray(savedByUrl) ? savedByUrl : [])) {
       if (!entry || !Array.isArray(entry.files) || !entry.files.length) continue;
       const acgName = nameByShare.get(entry.url);
       if (!acgName) {
         const why = conflict.has(entry.url) ? `名称冲突（${conflict.get(entry.url)}）` : '清单里没有该分享的最终名称';
         log(` ★ 改名：跳过 ${entry.url} —— ${why}`);
+        for (const f of entry.files) {
+          const savedName = String((f && f.name) || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+          if (savedName) noName.push(savedName);
+        }
         continue;
       }
       for (const f of entry.files) {
@@ -2767,19 +2850,31 @@
          * （否则 seenOld 会静默丢掉一个，等于漏改）。
          * 无 fid 的行用行对象本身当占用键，避免 fid 为空时过滤失效。*/
         const freeRows = listRows.filter(r => !usedRows.has(r) && !(r.fid && usedFids.has(r.fid)));
-        const m = matchSavedToListRow(f, freeRows, alreadySaved);
+        const m = matchSavedToListRow(f, freeRows, alreadySaved, { beforeFids });
         if (!m) {
-          const exists = !!matchSavedToListRow(f, listRows, alreadySaved);
-          log(exists
-            ? ` ★ 改名：${savedName} 对应的行已被另一个同批文件占用，跳过（宁可不改，不可改错）`
-            : ` ★ 改名：列表里找不到 ${savedName} 对应的行（转存后可能尚未显示），跳过`);
+          if (lastMatchReason === 'ambiguous') {
+            ambiguous.push(savedName);
+            log(` ★ 改名：${savedName} 有多行同名/带后缀且无法判定哪一行是新转存的，跳过（宁可不改）`);
+          } else {
+            const exists = !!matchSavedToListRow(f, listRows, alreadySaved, { beforeFids });
+            unmatched.push(savedName);
+            log(exists
+              ? ` ★ 改名：${savedName} 对应的行已被另一个同批文件占用，跳过（宁可不改，不可改错）`
+              : ` ★ 改名：列表里找不到 ${savedName} 对应的行（转存后可能尚未显示），跳过`);
+          }
           continue;
         }
         if (m.row) { usedRows.add(m.row); if (m.row.fid) usedFids.add(m.row.fid); }
         items.push({ savedName, acgName, currentName: m.currentName, base: m.base, row: m.row, how: m.how });
       }
     }
-    if (!items.length) return [];
+    if (!items.length) {
+      const empty = [];
+      empty.unmatched = unmatched;
+      empty.ambiguous = ambiguous;
+      empty.noName = noName;
+      return empty;
+    }
 
     /* 原始文件名（去标识符后）→ acg 名称；同一原始名对应不同 acg 名 → 冲突跳过 */
     const targetByBase = new Map();
@@ -2799,27 +2894,33 @@
 
     const out = [];
     const seenOld = new Set();
+    ambiguous = [];
+    const notRenamed = unmatched.slice();      /* 没对上行的：也要算"没改名成功" */
     for (const it of items) {
       const oldName = it.currentName;                /* 列表里的真实当前名（可能带 (2)） */
-      if (!oldName || seenOld.has(oldName)) continue;
+      if (!oldName || seenOld.has(oldName)) { if (oldName) ambiguous.push(oldName); continue; }
       seenOld.add(oldName);
 
       if (conflictNames.has(it.base)) {
         log(` ★ 改名：跳过 ${oldName} —— 同名文件对应了不同的 acg 名称`);
+        ambiguous.push(oldName);        /* 刻意未改名 → 也要计入闸门，不放行下载 */
         continue;
       }
       const name = targetByBase.get(it.base);
-      if (!name) continue;
+      if (!name) { notRenamed.push(oldName); continue; }
       /* 目标名用"列表真实当前名的原始名部分"重建（保留 (2) 后缀，已有 [bgm] 前缀则替换为新 acg 名）。
        * acg 名称超长时 buildRenamedFileName 会自动截短 acg 名称部分，原始文件名一字不动。*/
       const baseForTarget = stripMarkerBlock(String(it.currentName ?? '')).trim();
-      if (!baseForTarget) continue;
+      if (!baseForTarget) { notRenamed.push(oldName); continue; }
       const next = buildRenamedFileName(name, baseForTarget);
-      if (!next) continue;                             /* 即使截短也放不下 → 不改 */
-      if (!needRename(it.currentName, name)) continue; /* 已经是目标名 → 不改 */
+      if (!next) { notRenamed.push(oldName); continue; }        /* 即使截短也放不下 → 没改成 */
+      if (!needRename(it.currentName, name)) continue;          /* 已经是目标名 → 不改 */
       out.push({ old: oldName, next, acgName: name, truncated: fitAcgName(name, baseForTarget).truncated, matchedBy: it.how, fid: (it.row && it.row.fid) || '' });
       if (it.how !== 'icon') log(`   ↳ ${oldName} 非 icon 命中（matchedBy=${it.how}），目标名 ${next}`);
     }
+    out.unmatched = notRenamed;
+    out.ambiguous = ambiguous;
+    out.noName = noName;
     return out;
   }
 
@@ -2890,6 +2991,22 @@
      * （夸克重名转存会给新文件加 (2)，不能靠名字判断哪个是新的）。*/
     const savedNamesBefore = collectSavedInfos(loadRecords())
     .map(si => ({ name: si.name, sizeStr: si.sizeStr, iconSig: si.iconSig }));
+
+    /* 本次改名是否全部确认成功（false 时不允许下载、也不允许关页）。
+     * 必须声明在 try 之外 —— catch/finally 要用它。*/
+    let renameAllConfirmedOut = true;
+    let hadRenamePlan = false;
+
+    /* 转存**前**给列表拍快照：转存后哪个 fid 是新出现的，那一行就是刚转存的文件。
+     * 这是除 icon 之外最可靠的判据（不依赖"最大后缀号"这类猜测）。*/
+    let preRows = [];
+    try {
+      preRows = await scanAllRowsByScroll(qa, document, { key: currentCacheKey(), useCache: false, maxMs: 12000 }) || [];
+    } catch (e) {
+      warn('⚠️ 改名：转存前快照失败（不影响 icon 主判据）', e);
+      preRows = qa.scanFileRows(document) || [];
+    }
+    log(` ★ 改名：转存前列表快照 ${preRows.length} 行`);
 
     try {
       qa.setStatus('转存中...', 'running');
@@ -2967,9 +3084,6 @@
       qa.setStatus('转存完成', 'done');
       qa.setProgress('-');
 
-      /* 本次改名是否全部确认成功（false 时不允许下载、也不允许关页） */
-      let renameAllConfirmedOut = true;
-      let hadRenamePlan = false;
       if (successCount + partialCount > 0) {
         log('★ 有新转存，点击页面内刷新按钮触发列表更新...');
         /* 注意：此处不放开 BUSY_KEY —— 刷新和改名期间放开会让夸克助手的 boot 自动下载抢跑 */
@@ -2985,21 +3099,52 @@
         /* ===== 刷新完成 → ★ 按 acg 最终名称改名 → 触发下载 ===== */
         let plan = [];
         let planBuildOk = true;
+        let planUnmatched = [];      /* 有 acg 名称但没对上列表行的文件（=没改名成功） */
+        let planAmbiguous = [];      /* 无法判定/被同批占用的 */
+        let planNoName = [];         /* acg 清单里找不到最终名称 → 没有名字可改（按原名下载） */
         try {
           /* 把"转存结果"对上列表真实行：夸克重名会加 (2) 后缀，所以要拿当前列表行来比对。
-           * 用**全表滚动扫描**而不是只看渲染行 —— 虚拟滚动下新文件可能不在视野内，
-           * 只比对可见区会误配到旧的同名行。
-           * savedNamesBefore：本轮转存前的已转存名单（区分旧同名文件与刚转存的新文件）。*/
+           * 用**全表滚动扫描**而不是只看渲染行 —— 虚拟滚动下新文件可能不在视野内。
+           * beforeFids：转存前的 fid 快照（区分"旧同名文件"与"刚转存的新文件"）；
+           * savedNamesBefore：本轮转存前的已转存名单。*/
           let listRows = [];
           try {
             listRows = await scanAllRowsByScroll(qa, document, { key: currentCacheKey(), useCache: false }) || [];
           } catch (e) { warn('⚠️ 改名：全表扫描失败，退回可见区', e); listRows = qa.scanFileRows(document) || []; }
           log(` ★ 改名：列表共扫到 ${listRows.length} 行用于匹配`);
-          plan = buildRenamePlan(savedByUrl, loadBangumiData(), listRows, savedNamesBefore);
+          /* 快照完整性：转存后应比转存前多 0..本轮转存成功数 行。
+           * （成功转存必然新增行，所以不能用"行数相等"；用"新增行数不超过本轮转存数"排除漏扫。）*/
+          const savedTotalForSnap = savedByUrl.reduce((n, en) => n + ((en && en.files) || []).length, 0);
+          const addedRows = listRows.length - preRows.length;
+          let beforeFids = null;
+          if (preRows.length && addedRows >= 0 && addedRows <= savedTotalForSnap) {
+            beforeFids = new Map(preRows.map(r => [r.fid, String(r.name || '')]));
+            log(` ★ 改名：使用转存前快照判定新行（${beforeFids.size} 个 fid，新增 ${addedRows} 行）`);
+          } else if (preRows.length) {
+            warn(` ⚠️ 改名：转存前 ${preRows.length} 行 / 转存后 ${listRows.length} 行（新增 ${addedRows}，本轮转存 ${savedTotalForSnap}）`
+              + `，快照看起来不完整 → 不按快照判定新行`);
+          }
+          plan = buildRenamePlan(savedByUrl, loadBangumiData(), listRows, savedNamesBefore, beforeFids);
+          planUnmatched = plan.unmatched || [];
+          planAmbiguous = plan.ambiguous || [];
+          planNoName = plan.noName || [];
         } catch (e) { warn('⚠️ 改名计划构建失败', e); planBuildOk = false; }
         if (!planBuildOk) {
           qa.setStatus('改名计划构建失败，已暂停下载', 'error');
           warn('⛔ 改名计划构建失败：本轮不下载（避免按旧名落盘）');
+        }
+
+        /* 本次真正转存成功的文件数（仅用于日志） */
+        const savedTotal = savedByUrl.reduce((n, en) => n + ((en && en.files) || []).length, 0);
+        if (savedTotal && planUnmatched.length) {
+          warn(` ⛔ 改名：${planUnmatched.length} 个已转存文件在列表里没找到对应行（未改名成功）：${planUnmatched.join('、')}`);
+        }
+        if (planAmbiguous.length) {
+          warn(` ⚠️ 改名：${planAmbiguous.length} 个文件无法唯一判定是哪一行，未改名：${planAmbiguous.join('、')}`);
+        }
+        if (planNoName.length) {
+          warn(` ⚠️ 改名：${planNoName.length} 个文件所在分享在 acg 清单里找不到最终名称（没有名字可改），将按原文件名下载：`
+            + planNoName.join('、'));
         }
 
         if (plan.length && ok) {
@@ -3027,25 +3172,34 @@
               if (n) log(` ★ 改名：同步 ${n} 条下载记录到新名`);
             } catch (e) { warn('⚠️ 同步下载记录失败（不影响下载）', e); }
           }
+        } else if (!planUnmatched.length && !planAmbiguous.length) {
+          log('★ 改名：本次无需改名（清单里没有对应最终名称）');
         } else {
-          log('★ 改名：本次无需改名（无计划或清单里没有对应最终名称）');
+          log('★ 改名：没有可执行的改名计划（见上方未匹配/无法判定的告警）');
         }
 
         /* 下载前先把"改名结果"讲清楚，并决定这一轮还能不能下载 */
         const confirmedCount = (renameReport.confirmed || []).length;
         const notConfirmed = (renameReport.failed || 0) + (renameReport.skipped || 0);
-        if (plan.length) {
-          log(`★ 改名结果：确认成功 ${confirmedCount} / 计划 ${plan.length}`
-            + (notConfirmed ? `，未确认 ${notConfirmed}` : ''));
+        if (plan.length || planUnmatched.length || planAmbiguous.length || planNoName.length) {
+          log(`★ 改名结果：按完整名确认 ${confirmedCount} / 应改名 ${plan.length + planUnmatched.length + planAmbiguous.length}`
+            + `（计划 ${plan.length}，未匹配 ${planUnmatched.length}，无法判定 ${planAmbiguous.length}）`
+            + (planNoName.length ? `，清单无名称 ${planNoName.length}（按原名）` : '')
+            + (notConfirmed ? `，本次未确认 ${notConfirmed}` : ''));
         }
-        /* 用户要求：必须等名称确认改完，才允许下载 / 关页。
-         * 计划构建失败 / 改名步骤异常 / 有文件没确认 → 一律视为"未全确认"：
-         * 不下载、不重载、不关页（改名确认通过后才由本脚本触发夸克下载）。*/
+        if (planNoName.length) {
+          qa.setStatus('注意：有文件清单里没有名称，按原名下载', 'running');
+        }
+        /* 用户要求：**必须按完整新名（含标签）在列表里重新匹配到**才算改名成功；
+         * 只要还有"本次转存成功但没改名成功"的文件（未确认 / 没匹配到行 / 无法判定 / 计划构建失败），
+         * 就一律不下载、不重载、不关页。*/
         const renameAllConfirmed = planBuildOk && renameStepOk
+          && planUnmatched.length === 0
+          && planAmbiguous.length === 0
           && (renameReport.failedEntries || []).length === 0
-          && (!plan.length || confirmedCount >= plan.length);
+          && confirmedCount >= plan.length;
         renameAllConfirmedOut = renameAllConfirmed;
-        hadRenamePlan = plan.length > 0;
+        hadRenamePlan = plan.length > 0 || planUnmatched.length > 0 || planAmbiguous.length > 0;
 
         await sleep(600);
 
@@ -3062,16 +3216,22 @@
             warn('⚠️ quarkAssistant.autoDownloadWorkflow 不可用，无法触发下载');
           }
         } else {
-          const names = (renameReport.failedEntries || []).map(e => e.old).join('、');
-          warn(`⛔ 改名未全部确认（${confirmedCount}/${plan.length}${planBuildOk ? '' : '，改名计划构建失败'}），`
-            + `已跳过下载、保持本页：${names || '（见上方日志）'}`);
+          const failedNames = (renameReport.failedEntries || []).map(e => e.old);
+          const allBad = [...new Set([...failedNames, ...planUnmatched, ...planAmbiguous])];
+          warn(`⛔ 改名未全部确认（已确认 ${confirmedCount} / 计划 ${plan.length}，未匹配 ${planUnmatched.length}`
+            + `${planBuildOk ? '' : '，改名计划构建失败'}），已跳过下载、保持本页：${allBad.join('、') || '（见上方日志）'}`);
           qa.setStatus('改名未确认，已暂停下载', 'error');
-          alert(`⚠️ 改名未全部确认（${confirmedCount}/${plan.length}），已跳过下载并保持本页。\n\n`
-            + `${names ? '未确认：' + names + '\n\n' : ''}`
+          alert(`⚠️ 改名未全部确认，已跳过下载并保持本页。\n\n`
+            + `已按完整名（含标签）确认：${confirmedCount} / 计划 ${plan.length}\n`
+            + (planUnmatched.length ? `列表里没找到对应行（未改名）：${planUnmatched.join('、')}\n` : '')
+            + (planAmbiguous.length ? `无法唯一判定是哪一行：${planAmbiguous.join('、')}\n` : '')
+            + (planNoName.length ? `清单里没有最终名称（将按原名下载）：${planNoName.join('、')}\n` : '')
+            + (allBad.length ? '\n' : '')
             + `处理建议：\n`
             + `1) 先点「🔍 改名诊断」看入口，再点「🏷️ 测试改名」验证该文件能否改成功；\n`
-            + `2) 想手动改：直接在文件名上点一下，改完按 Enter；\n`
-            + `3) 改好后重新点「▶️ 转存」再跑一轮。`);
+            + `2) 也可以直接在文件名上点一下手动改名，改完按 Enter；\n`
+            + `3) 改好后点「🔓 允许下载」继续下载（下载已被阻止，不会按旧名先下）；\n`
+            + `4) 若重新点「▶️ 转存」提示"均已处理完毕"，说明本轮没有新转存，用第 3 步即可。`);
         }
 
         if (renameAllConfirmed) {
@@ -3088,12 +3248,21 @@
       }
       return { hadPlan: hadRenamePlan, allConfirmed: renameAllConfirmedOut };
     } catch (e) {
-      /* 流程异常：绝不"出错后还按旧名下载" */
-      warn('⛔ 转存流程异常，本轮不下载', e);
+      /* 流程异常：绝不"出错后还按旧名下载" —— 忙碌标志保持，挡住夸克助手自动下载 */
+      warn('⛔ 转存流程异常，本轮不下载（保持忙碌标志，阻挡自动下载）', e);
       qa.setStatus('流程异常，已暂停下载', 'error');
+      hadRenamePlan = true;
+      renameAllConfirmedOut = false;
       throw e;
     } finally {
-      releaseBusy();
+      /* 只有"改名全部确认"或"本轮根本不需要改名"才放开忙碌标志。
+       * 未确认时保持 BUSY_KEY —— 否则夸克助手的 boot/手动下载会立刻按旧名下载。*/
+      if (renameAllConfirmedOut || !hadRenamePlan) {
+        releaseBusy();
+      } else {
+        warn('⛔ 改名未全部确认：保持忙碌标志（夸克助手在此期间不会自动下载）；'
+          + '点面板「🔓 允许下载」可解除并继续下载。');
+      }
     }
   }
 
@@ -3564,6 +3733,11 @@
           label: '🔍 改名诊断', color: '#8c8c8c',
           title: '只报告改名入口的 DOM/按钮/勾选状态，不改动任何文件',
           onclick: () => runRenameDiagnose(qa),
+        },
+        {
+          label: '🔓 允许下载', color: '#52c41a',
+          title: '改名未确认时默认阻止下载；点这里确认后用当前文件名下载',
+          onclick: () => runAllowDownloadAfterRename(qa),
         },
       ]);
       qa.setStatus('待机（个人页）');

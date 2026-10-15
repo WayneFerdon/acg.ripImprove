@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.3.0
+// @version 3.3.1
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 [bgm]名称[bgm]原始文件名）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -1723,7 +1723,7 @@
       await sleep(300);
     }
 
-    /* 超时：原样名精确判定 */
+    /* 超时：只用**原样名**判定（绝不用会剥 [bgm] 的比较键 —— 那等于把未改名判成成功） */
     if (fid && preRaw) {
       const live = readRowLiveName(fid, doc);
       if (live != null) {
@@ -1731,15 +1731,15 @@
           /* 同一 fid 行原样名一个字都没变 → 确实没改成 */
           return false;
         }
-        /* 名字变了：按"排除标识符后同名"确认，或精确等于新名 */
         if (live === newName) return true;
-        if (findRowByExactName(qa, newName, doc)) return true;
-        if (findListRowByName(qa, newName, doc)) return true;
+        const exactNew = findRowByExactName(qa, newName, doc);
+        if (exactNew && (!fid || exactNew.fid === fid)) return true;
         return null;
       }
     }
     if (oldName && findRowByExactName(qa, oldName, doc)) return false;
-    if (findRowByExactName(qa, newName, doc)) return true;
+    const hitNew = findRowByExactName(qa, newName, doc);
+    if (hitNew && (!fid || hitNew.fid === fid)) return true;
     return null;
   }
 
@@ -2671,27 +2671,14 @@
 
     const mk = (r, how) => ({ row: r, currentName: r.name, base: stripMarkerBlock(r.name).trim(), how });
 
-    /* ① 图标签名一致（首选）。
-     * 但必须唯一：命中多个且大小无法唯一确定时，不能猜（猜错就是改错文件）。*/
-    if (isIdentifiableIconSig(savedIcon)) {
-      const byIcon = rows.filter(r => sameIconSig(r.iconSig, savedIcon));
-      if (byIcon.length) {
-        const sized = savedSize ? byIcon.filter(r => normSizeKey(r.sizeStr) === savedSize) : [];
-        if (sized.length) return mk(sized[0], 'icon');
-        if (byIcon.length === 1) return mk(byIcon[0], 'icon');
-        log(` ★ 改名：${savedName} 的缩略图匹配到 ${byIcon.length} 行且大小无法区分，改走名字匹配`);
-      }
-    }
-
-    /* ② 名字一致或只差 (n) 后缀。
-     * 关键判定：如果"与转存名完全相同"的那一行**本来就在转存记录里**（=旧文件），
-     * 那这次新转存进来的是带后缀的那个 → 取后缀号最大的候选。
-     * （"最大后缀号 = 新文件"依赖夸克的分配规则，日志会打出来，真机可核对。）*/
+    /* 先算出"与转存名完全相同"的候选行（纯计算，无副作用）：
+     * 后续 icon 路径要用它排除"早就存在的纯名旧行"，避免把旧文件当成刚转存的新文件。*/
     const exactCand = [];
     const baseCand = [];
     for (const r of rows) {
       const cur = String(r.name || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
       if (!cur) continue;
+      if (stripMarkerBlock(cur) !== cur) continue;   /* 已带 [bgm] 前缀的历史改名行，不参与匹配 */
       const curKey = getComparableFileName(cur);
       const rs = stripDedupSuffix(cur);
       if (curKey === wantName) { exactCand.push({ r, cur, suffix: rs.suffix }); continue; }
@@ -2700,8 +2687,44 @@
         baseCand.push({ r, cur, suffix: rs.suffix });
       }
     }
-    const exactAlreadySaved = Array.isArray(savedBefore) && savedBefore.some(si => isSameFile(si, { name: savedName }));
+    const exactAlreadySaved = Array.isArray(savedBefore)
+      && savedBefore.some(si => isSameFile(si, { name: savedName, sizeStr: (saved && saved.sizeStr) || '', iconSig: (saved && saved.iconSig) || '' }));
+
+    /* ① 图标签名一致（首选）。
+     * 但必须先按名字收敛，且必须**唯一**：
+     * - 同目录同类型视频的缩略图签名可能相同（query 里才带 fid），不过滤名字会命中一整片；
+     * - 命中多行或大小列未加载时不能猜（猜错就是改错文件）；
+     * - 若"纯名旧行"本来就在转存记录里（exactAlreadySaved），那么 icon 命中它就一定是错的
+     *   （正确的新行可能是懒加载/无缩略图）→ 直接弃用 icon 路径，交给名字路径挑带后缀的新行。*/
+    if (isIdentifiableIconSig(savedIcon)) {
+      const nameOk = r => {
+        const cur = String(r.name || '');
+        const curKey = getComparableFileName(cur);
+        if (curKey === wantName) return true;
+        const rs = stripDedupSuffix(cur);
+        return rs.suffix > 0 && getComparableFileName(rs.base) === wantName;
+      };
+      const oldRows = exactAlreadySaved ? new Set(exactCand.map(c => c.r)) : new Set();
+      const byIcon = rows.filter(r => nameOk(r) && !oldRows.has(r) && sameIconSig(r.iconSig, savedIcon));
+      if (byIcon.length) {
+        const sized = savedSize ? byIcon.filter(r => normSizeKey(r.sizeStr) === savedSize) : [];
+        const allSized = byIcon.every(r => !!normSizeKey(r.sizeStr));
+        if (savedSize && allSized && sized.length === 1) return mk(sized[0], 'icon');
+        if (!savedSize && byIcon.length === 1 && normSizeKey(byIcon[0].sizeStr)) return mk(byIcon[0], 'icon');
+        log(` ★ 改名：${savedName} 的缩略图命中 ${byIcon.length} 行（大小可辨=${allSized}），无法唯一确定，改走名字匹配`);
+      }
+    }
+
+    /* ② 名字一致或只差 (n) 后缀。
+     * 关键判定：如果"与转存名完全相同"的那一行**本来就在转存记录里**（=旧文件），
+     * 那这次新转存进来的是带后缀的那个 → 取后缀号最大的候选。
+     * （"最大后缀号 = 新文件"依赖夸克的分配规则，日志会打出来，真机可核对。）*/
     const suffixed = exactCand.filter(c => c.suffix > 0).concat(baseCand);
+    if (!exactAlreadySaved && exactCand.length && baseCand.length) {
+      /* 纯名旧行 + 带后缀行同时存在，但我们不知道哪个是刚转存的 → 不猜（宁可不改，不可改错） */
+      warn(` ⚠️ 改名：${savedName} 同时存在 ${exactCand.length} 个同名行与 ${baseCand.length} 个带后缀行，无法判定哪个是刚转存的，跳过`);
+      return null;
+    }
     const cand = (exactAlreadySaved && suffixed.length) ? suffixed : (exactCand.length ? exactCand : baseCand);
     if (cand.length) {
       let pool = cand;
@@ -2727,6 +2750,8 @@
     const { map: nameByShare, conflict } = collectShareNameMap(bd);
     /* 先给每个"转存结果"配上列表里真实的行与未被转存前就存在的同名文件 */
     const items = [];
+    const usedFids = new Set();
+    const usedRows = new Set();
     for (const entry of (Array.isArray(savedByUrl) ? savedByUrl : [])) {
       if (!entry || !Array.isArray(entry.files) || !entry.files.length) continue;
       const acgName = nameByShare.get(entry.url);
@@ -2738,8 +2763,19 @@
       for (const f of entry.files) {
         const savedName = String((f && f.name) || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
         if (!savedName) continue;
-        const m = matchSavedToListRow(f, listRows, alreadySaved);
-        if (!m) { log(` ★ 改名：列表里找不到 ${savedName}（转存后可能尚未显示），跳过`); continue; }
+        /* 同一个列表行只允许被一个转存结果占用：同名多渠道转存时，不能让两个结果抢同一行
+         * （否则 seenOld 会静默丢掉一个，等于漏改）。
+         * 无 fid 的行用行对象本身当占用键，避免 fid 为空时过滤失效。*/
+        const freeRows = listRows.filter(r => !usedRows.has(r) && !(r.fid && usedFids.has(r.fid)));
+        const m = matchSavedToListRow(f, freeRows, alreadySaved);
+        if (!m) {
+          const exists = !!matchSavedToListRow(f, listRows, alreadySaved);
+          log(exists
+            ? ` ★ 改名：${savedName} 对应的行已被另一个同批文件占用，跳过（宁可不改，不可改错）`
+            : ` ★ 改名：列表里找不到 ${savedName} 对应的行（转存后可能尚未显示），跳过`);
+          continue;
+        }
+        if (m.row) { usedRows.add(m.row); if (m.row.fid) usedFids.add(m.row.fid); }
         items.push({ savedName, acgName, currentName: m.currentName, base: m.base, row: m.row, how: m.how });
       }
     }
@@ -2951,8 +2987,14 @@
         let planBuildOk = true;
         try {
           /* 把"转存结果"对上列表真实行：夸克重名会加 (2) 后缀，所以要拿当前列表行来比对。
+           * 用**全表滚动扫描**而不是只看渲染行 —— 虚拟滚动下新文件可能不在视野内，
+           * 只比对可见区会误配到旧的同名行。
            * savedNamesBefore：本轮转存前的已转存名单（区分旧同名文件与刚转存的新文件）。*/
-          const listRows = qa.scanFileRows(document) || [];
+          let listRows = [];
+          try {
+            listRows = await scanAllRowsByScroll(qa, document, { key: currentCacheKey(), useCache: false }) || [];
+          } catch (e) { warn('⚠️ 改名：全表扫描失败，退回可见区', e); listRows = qa.scanFileRows(document) || []; }
+          log(` ★ 改名：列表共扫到 ${listRows.length} 行用于匹配`);
           plan = buildRenamePlan(savedByUrl, loadBangumiData(), listRows, savedNamesBefore);
         } catch (e) { warn('⚠️ 改名计划构建失败', e); planBuildOk = false; }
         if (!planBuildOk) {

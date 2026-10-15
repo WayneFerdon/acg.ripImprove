@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      5.4.0
+// @version      5.6.0
 // @description  夸克网盘平台层：UI + DOM 工具 + 批量下载 + 下载记录 + 暂停控制 + 底层删除工具（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -64,6 +64,11 @@
     while (isPaused()) await sleep(400);
     setStatus('继续中...', 'running');
     log('▶ 已恢复');
+  }
+
+  /* ===== 桥接忙碌标志（下载由桥接在改名确认后触发，这里只挡 boot 抢跑） ===== */
+  function isBridgeBusy() {
+    try { return sessionStorage.getItem(BUSY_KEY) === '1'; } catch { return false; }
   }
 
   /* ===== 页面识别 ===== */
@@ -623,6 +628,12 @@
       setStatus('已暂停', 'running');
       return;
     }
+    /* 桥接正在转存/改名：不下载（改名确认后由桥接自己调用本流程） */
+    if (isBridgeBusy()) {
+      log('⛔ 桥接脚本处理中（转存/刷新/改名），跳过下载');
+      setStatus('桥接处理中，暂不下载', 'running');
+      return;
+    }
 
     downloadRunning = true;
     log('===== 开始批量自动下载 =====');
@@ -1128,7 +1139,7 @@
 
   /* ===== 对外 API ===== */
   unsafeWindow.quarkAssistant = {
-    version: '5.4.0',
+    version: '5.6.0',
     isReady: () => true,
     isListPage, isSharePage,
 
@@ -1152,6 +1163,7 @@
     isLoadingAnimPresent, isEmptyUiVisible, isListLoaded, isTableVirtual, isWholeListRendered,
 
     isPaused, setPaused, waitWhilePaused,
+    isBridgeBusy,
 
     autoDownloadWorkflow,
     collectApiLinks,
@@ -1177,17 +1189,17 @@
       installListPageActions();
       if (isPaused()) {
         setStatus('已暂停', 'running');
-        log('平台层就绪（个人页，暂停中）v5.4.0');
+        log('平台层就绪（个人页，暂停中）v5.6.0');
       } else {
         setStatus('待机（个人页）');
-        log('平台层就绪（个人页）v5.4.0');
+        log('平台层就绪（个人页）v5.6.0');
       }
 
       setTimeout(() => { tryAutoDownloadOnBoot(); }, 3000);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v5.4.0');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v5.6.0');
     } else {
-      log('平台层就绪（其他页）v5.4.0');
+      log('平台层就绪（其他页）v5.6.0');
     }
 
     startGrayPolling();

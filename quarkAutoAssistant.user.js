@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      5.6.1
+// @version      5.6.2
 // @description  夸克网盘平台层：UI + DOM 工具 + 批量下载 + 下载记录 + 暂停控制 + 底层删除工具（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -256,8 +256,14 @@
   /* 文件图标签名。**保留完整 URL（含 ?fid=…）**：fid 是该文件的身份，改名/转存都不会变。
    * svg/cls 只有类型信息（同类型文件完全相同），不能当身份用。*/
   function getFileIconSig(row) {
-    /* 图标容器：只在图标元素内部找 —— 回退到整行会把操作列/角标等无关背景图当成缩略图。*/
-    const iconEl = row.querySelector('.file-icon, [class*="file-icon"], [class*="FileIcon"], [class*="thumb"]');
+    /* 图标容器：优先 .file-icon；找不到时只做**受控回退**（只认缩略图特征元素），
+     * 绝不整行乱扫 —— 否则会把操作列/角标的背景图当成缩略图。*/
+    let iconEl = row.querySelector('.file-icon, [class*="file-icon"], [class*="FileIcon"]');
+    if (!iconEl) {
+      const cand = row.querySelector('img[src*="thumbnail"], [style*="thumbnail"], [style*="fid="], [class*="thumb"]');
+      /* 回退候选必须是单元格内的小图标，不是整行/整格 */
+      if (cand && cand !== row && !/^(TD|TR|TBODY|TABLE)$/.test(cand.tagName)) iconEl = cand;
+    }
     if (!iconEl) return '';
     const scope = iconEl;
 
@@ -1176,7 +1182,7 @@
 
   /* ===== 对外 API ===== */
   unsafeWindow.quarkAssistant = {
-    version: '5.6.1',
+    version: '5.6.2',
     isReady: () => true,
     isListPage, isSharePage,
 

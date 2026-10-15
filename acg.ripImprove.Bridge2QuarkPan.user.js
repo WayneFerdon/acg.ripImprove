@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.1.0
+// @version 3.1.2
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 [bgm]名称[bgm]原始文件名）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -1335,93 +1335,150 @@
     return files.find(f => getComparableFileName(f.name) === want) || null;
   }
 
+  /* 原样名精确比对（**不能**用 findListRowByName 做改名确认）：
+   * 它的比较键会把 [bgm]…[bgm] 剥掉，导致"改名后的新名"与"改名前的旧名"键相等，
+   * 于是"看见新名"永远为真 —— 那是同义反复，会把没改成的也判成功。*/
+  function findRowByExactName(qa, name, doc = document) {
+    const want = String(name ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    if (!want) return null;
+    const files = qa.scanFileRows(doc) || [];
+    return files.find(f => String(f.name ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim() === want) || null;
+  }
+
   /* 行内用来触发重命名/右键的元素（scanFileRows 只给 row，没有 nameEl） */
   function getNameElInRow(row) {
     if (!row || typeof row.querySelector !== 'function') return null;
     return row.querySelector('.filename-text, [class*="filename-text"], .file-name, [class*="file-name"]') || row;
   }
 
-  /* 打开"重命名"对话框（按钮 / 右键菜单 / 双击文件名 三条路径） */
+  /* 只点真正的文件名单元格（返回 null 表示拿不到，调用方不要退回整行） */
+  function getNameCellOnly(row) {
+    if (!row || typeof row.querySelector !== 'function') return null;
+    return row.querySelector('.filename-text, [class*="filename-text"], .file-name, [class*="file-name"]');
+  }
+
+  /* 当前渲染出来的选中行 fid */
+  function getSelectedFids(doc = document) {
+    return [...doc.querySelectorAll('tr.ant-table-row-selected')]
+    .map(r => r.getAttribute('data-row-key') || '')
+    .filter(Boolean);
+  }
+
+  function findRowByFid(fid, doc = document) {
+    if (!fid) return null;
+    return doc.querySelector(`tr.ant-table-row[data-row-key="${fid}"]`);
+  }
+
+  /* 把勾选收敛到目标一行。
+   * 夸克助手没有导出 selectRow，这里直接点该行的 checkbox label；
+   * 最后用表头三态复核：只有确定"当前只剩这一行被勾选"时才允许走顶栏按钮路径
+   * （虚拟滚动下看不到的行也可能被勾选，看不见就一律不点按钮，避免批量重命名）。*/
+  async function resetSelectionToRow(qa, file, doc = document) {
+    if (!file || !file.fid) return { ok: false, reason: 'no-fid' };
+    try { await qa.clearAllSelection(); } catch {}
+
+    let row = (file.row && file.row.isConnected) ? file.row : findRowByFid(file.fid, doc);
+    if (!row) return { ok: false, reason: 'row-gone' };
+
+    const isSel = () => {
+      const cur = findRowByFid(file.fid, doc) || row;
+      const input = cur && cur.querySelector('input.ant-checkbox-input');
+      return !!(cur && (cur.classList.contains('ant-table-row-selected') || (input && input.checked)));
+    };
+    if (!isSel()) {
+      const lbl = row.querySelector('label.ant-checkbox-wrapper');
+      if (lbl) { try { qa.realClick(lbl); } catch {} }
+      else { try { const cb = row.querySelector('input.ant-checkbox-input'); if (cb) cb.click(); } catch {} }
+      await until(isSel, 100, 1500);
+    }
+
+    const state = getHeaderCheckState(doc);
+    const fids = getSelectedFids(doc);
+    if (state !== 'partial' || fids.length !== 1 || fids[0] !== file.fid) {
+      return { ok: false, reason: `${state}/${fids.length}` };
+    }
+    return { ok: true };
+  }
+
+  /* 打开改名入口：优先行内编辑（夸克真实实现），其次"重命名"按钮弹窗。
+   * 返回 input 元素（行内编辑）或弹窗元素（modal），两者都用 querySelector 取输入框。*/
   async function openRenameDialog(qa, row, nameCell, originalName, doc = document) {
-    /* ① 顶栏"重命名"按钮（需先确保只有目标行被选中，严禁批量改名） */
-    try {
-      const file = findListRowByName(qa, originalName, doc);
-      if (!file || !file.fid) return null;
-      await qa.clearAllSelection();
-      const picked = await (qa.selectRow ? qa.selectRow(file.row) : false);
-      if (!picked) {
-        warn(' ⚠️ 改名：行勾选失败，放弃按钮路径');
-        return null;
-      }
-      const selected = [...doc.querySelectorAll('tr.ant-table-row-selected')]
-      .map(r => r.getAttribute('data-row-key') || '')
-      .filter(Boolean);
-      const other = selected.filter(k => k !== file.fid);
-      if (other.length) {
-        warn(` ⚠️ 改名：勾选了 ${selected.length} 行（含其它行），放弃按钮路径以免批量改名`);
-        await qa.clearAllSelection();
-        return null;
-      }
-
-      let btn = await qa.until(() => {
-        for (const el of doc.querySelectorAll('.btn-group button.btn-file, .btn-group button.ant-btn, button')) {
-          const txt = (el.textContent || '').replace(/\s+/g, '');
-          if (!/^重命名$|^重新命名$|^改名$/.test(txt)) continue;
-          if (!_isVisible(el) || isRenamePanel(el)) continue;
-          return el;
-        }
-        return null;
-      }, 150, 2000);
-
-      if (btn) {
-        log(' → 改名：点击顶栏「重命名」按钮');
-        qa.realClick(btn);
-        let dlg = await waitRenameDialog(originalName, doc, 2500);
-        if (!dlg) { qa.realClick(btn); dlg = await waitRenameDialog(originalName, doc, 2000); }
-        if (dlg) return dlg;
-      }
-    } catch (e) { warn(' ⚠️ 改名：按钮路径异常', e); }
-
-    /* ② 右键菜单（虚拟滚动下重扫一次，避免用到失效 DOM 引用） */
-    try {
+    if (!row || !row.isConnected) {
       const fresh = findListRowByName(qa, originalName, doc);
-      const cell = (fresh && fresh.row) || (nameCell && nameCell.isConnected ? nameCell : null);
-      if (cell && cell.isConnected) {
-        const t = (cell.querySelector && (cell.querySelector('span, .filename-text, .file-name') || cell)) || cell;
-        log(' → 改名：尝试右键菜单');
-        dispatchContextMenu(t);
-        const item = await untilVisibleMatch(2500, /^重命名$|^重新命名$|^改名$/);
-        if (item) {
-          qa.realClick(item.closest('li') || item);
-          const dlg = await waitRenameDialog(originalName, doc, 2500);
-          if (dlg) return dlg;
+      row = fresh && fresh.row;
+      if (!nameCell || !nameCell.isConnected) nameCell = getNameElInRow(row);
+    }
+    if (!row || !row.isConnected) { warn(` ⚠️ 改名：列表里找不到该行 —— ${originalName}`); return null; }
+
+    /* ① 行内编辑：点文件名单元格原地改（DOM 实测路径）。
+     * 先把勾选收敛到这一行：用户实测里"正在被编辑的那行"同时带 ant-table-row-selected，
+     * 所以不要清空勾选就点名字。*/
+    const file = findListRowByName(qa, originalName, doc);
+    if (file && file.fid) {
+      const sel = await resetSelectionToRow(qa, file, doc);
+      if (!sel.ok) warn(` ⚠️ 改名：勾选收敛未达预期（${sel.reason}），行内编辑可能不生效`);
+      row = file.row;
+      nameCell = getNameCellOnly(file.row) || nameCell;
+    }
+
+    const inline = await openInlineRename(qa, nameCell, originalName, doc);
+    if (inline) return inline;
+
+    /* ② 顶栏「重命名」按钮：**故意不自动点**。
+     * 夸克该按钮作用于"所有被勾选的行"，而列表是虚拟滚动：看不见的行也可能处于勾选状态，
+     * clearAllSelection 只能清掉渲染出来的行 → 无法证明"当前只勾选了目标行"，
+     * 一旦点下去就是跨屏批量重命名（不可逆）。用户实测的可用路径是行内编辑（①），
+     * 所以这里只记日志提示，绝不代点。*/
+    log(`   ↳ 行内编辑没打开；顶栏「重命名」按钮需要手动单选后再点（自动点有批量改名风险，已跳过）`);
+
+    /* ③ 悬停操作条的"更多"菜单里可能藏着重命名。
+     * 只在目标行**确实有** .hoitem-more 时才走这条路，且菜单项只认"点击后新出现的下拉"，
+     * 避免命中页面上其它残留的菜单把新名写到别的文件上。*/
+    try {
+      if (row && row.isConnected) {
+        const closer = row.closest('.filename') || row;
+        dispatchHover(qa, getNameElInRow(row));
+        const more = await untilVisibleMatch(1200, /.*/, '.hoitem-more, .hover-oper-item.ant-dropdown-trigger', closer);
+        if (!more) {
+          log('   ↳ 悬停条里没有「更多」入口，跳过菜单路径');
         } else {
-          log('   ↳ 未出现右键菜单（或菜单项不是"重命名"）');
+          const before = new Set([...doc.querySelectorAll('.ant-dropdown, .ant-dropdown-menu, .ant-menu')]);
+          try { qa.realClick(more); } catch {}
+          const fresh = [...doc.querySelectorAll('.ant-dropdown, .ant-dropdown-menu, .ant-menu')]
+          .filter(el => !before.has(el) && _isVisible(el));
+          let item = null;
+          const t0 = Date.now();
+          while (!item && Date.now() - t0 < 1500) {
+            for (const menu of fresh) {
+              for (const el of menu.querySelectorAll('li, .ant-dropdown-menu-item, [role="menuitem"]')) {
+                const txt = (el.textContent || '').replace(/\s+/g, '').trim();
+                if (/^重命名$|^重新命名$|^改名$/.test(txt)) { item = el; break; }
+              }
+              if (item) break;
+            }
+            if (!item) await sleep(120);
+          }
+          if (item) {
+            log(' → 改名：点击菜单里的「重命名」');
+            qa.realClick(item.closest('li') || item);
+            const dlg = await waitRenameDialog(originalName, doc, 2000);
+            if (dlg) return dlg;
+          } else {
+            log('   ↳ 新出现的菜单里没有「重命名」，关闭菜单');
+            try { pressKeyOn(more, 'Escape'); } catch {}
+          }
         }
       }
-    } catch (e) { warn(' ⚠️ 改名：右键路径异常', e); }
-
-    /* ③ 双击文件名（同样重扫） */
-    try {
-      const fresh = findListRowByName(qa, originalName, doc);
-      const cell = (fresh && fresh.row) || (nameCell && nameCell.isConnected ? nameCell : null);
-      const t = cell && ((cell.querySelector && (cell.querySelector('.filename-text, .file-name, span') || cell)) || cell);
-      if (t && t.isConnected) {
-        log(' → 改名：尝试双击文件名');
-        doubleClickEl(t);
-        const dlg = await waitRenameDialog(originalName, doc, 2500);
-        if (dlg) return dlg;
-      }
-    } catch (e) { warn(' ⚠️ 改名：双击路径异常', e); }
+    } catch (e) { warn(' ⚠️ 改名：菜单路径异常', e); }
 
     return null;
   }
 
-  /* 在 [0, timeout] 内轮询匹配可见元素 */
-  async function untilVisibleMatch(timeout, re) {
+  /* 在 [0, timeout] 内轮询匹配可见元素（默认只扫菜单项类元素，避免误点页面导航里的 li） */
+  async function untilVisibleMatch(timeout, re, selector = 'li, .ant-dropdown-menu-item, [role="menuitem"], .ant-menu-item, .ant-modal-footer button, .ant-drawer button', scope = document) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeout) {
-      for (const el of document.querySelectorAll('li, .ant-dropdown-menu-item, [role="menuitem"], .ant-menu-item, .ant-modal-footer button, .ant-drawer button')) {
+      for (const el of scope.querySelectorAll(selector)) {
         if (isRenamePanel(el) || !_isVisible(el)) continue;
         const txt = (el.textContent || '').replace(/\s+/g, '').trim();
         if (re.test(txt)) return el;
@@ -1431,51 +1488,224 @@
     return null;
   }
 
-  function dispatchContextMenu(el) {
-    const win = el.ownerDocument.defaultView || window;
-    const r = el.getBoundingClientRect();
-    const x = Math.round(r.left + Math.min(r.width / 2, 40));
-    const y = Math.round(r.top + r.height / 2);
-    const opts = {
-      bubbles: true, cancelable: true, view: win, button: 2, buttons: 2,
-      clientX: x, clientY: y, screenX: x, screenY: y,
-    };
-    try { el.dispatchEvent(new win.PointerEvent('pointerdown', { ...opts, button: 2, buttons: 2, pointerId: 1, pointerType: 'mouse', isPrimary: true })); } catch {}
-    try { el.dispatchEvent(new win.MouseEvent('mousedown', opts)); } catch {}
-    try { el.dispatchEvent(new win.PointerEvent('pointerup', { ...opts, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true })); } catch {}
-    try { el.dispatchEvent(new win.MouseEvent('mouseup', { ...opts, buttons: 0 })); } catch {}
-    try { el.dispatchEvent(new win.MouseEvent('contextmenu', opts)); } catch {}
+  /* ===== 行内改名（夸克真实实现）=====
+   * 文件名单元格：`<div class="filename-text editable-cell editable-cell-allow" title="原名">原名</div>`
+   * 点它 → 原地变成 `<input class="ant-input input-edit" maxlength="250" value="原名">`（无弹窗）。
+   * 输入新名后按 Enter 或失焦提交。*/
+
+  function findInlineRenameInput(originalName = '', doc = document) {
+    const want = getComparableFileName(originalName);
+    const inputs = [...doc.querySelectorAll('input.input-edit, input.ant-input.input-edit, .filename input.ant-input')]
+    .filter(i => !isRenamePanel(i) && i.isConnected && _isVisible(i));
+    if (!inputs.length) return null;
+    if (!originalName) return inputs[0];
+    const exact = inputs.find(i => String(i.value ?? '') === originalName);
+    if (exact) return exact;
+    return inputs.find(i => getComparableFileName(i.value) === want) || null;
   }
 
-  function doubleClickEl(el) {
-    const win = el.ownerDocument.defaultView || window;
-    const base = { bubbles: true, cancelable: true, view: win, button: 0, detail: 2 };
-    try {
-      el.dispatchEvent(new win.MouseEvent('dblclick', base));
-    } catch {
+  /* 行内编辑是否还开着：绑定到具体元素 + 可见性判断（不要用"全文还有没有 input-edit"） */
+  function isEditorOpen(input) {
+    return !!(input && input.isConnected && _isVisible(input));
+  }
+
+  /* 点开行内编辑：单击 → 两次点击 → F2，每一步都记日志，便于真机定位。
+   * 不用 dblclick：夸克列表页双击文件名会打开/预览文件（mp4 会拉播放器）。*/
+  async function openInlineRename(qa, nameCell, originalName, doc = document) {
+    if (!nameCell || !nameCell.isConnected) {
+      const row = (findListRowByName(qa, originalName, doc) || {}).row;
+      /* 只取真正的文件名单元格：getNameElInRow 会兜底返回整行，点整行会打开/选中文件 */
+      nameCell = getNameCellOnly(row);
+    }
+    if (!nameCell || !nameCell.isConnected) {
+      warn(` ⚠️ 改名：拿不到文件名单元格 —— ${originalName}`);
+      return null;
+    }
+
+    const row = nameCell.closest('tr');
+    log(` 改名·目标单元格：<${nameCell.tagName.toLowerCase()} class="${nameCell.className}"> text="${(nameCell.textContent || '').trim().slice(0, 40)}"`
+      + ` | 行选中=${!!(row && row.classList.contains('ant-table-row-selected'))}`
+      + ` 可编辑=${nameCell.classList.contains('editable-cell-allow') || nameCell.classList.contains('editable-cell')}`);
+
+    /* 鼠标先移到该行，让 hover-oper 就位（不改变勾选） */
+    try { dispatchHover(qa, nameCell); } catch {}
+
+    /* 手势顺序：单击 → 两次点击（选中后进入编辑）→ F2 → Enter（Enter 放最后，副作用最大）。
+     * 不用 dblclick：夸克列表页双击文件名会打开/预览文件（mp4 会拉播放器）。*/
+    for (const how of ['click', 'slowclick', 'f2', 'enterkey']) {
       try {
-        el.dispatchEvent(new MouseEvent('click', { ...base, detail: 1 }));
-        el.dispatchEvent(new MouseEvent('click', base));
+        if (how === 'click') qa.realClick(nameCell);
+        else if (how === 'slowclick') {
+          qa.realClick(nameCell);
+          await sleep(600);
+          if (!isEditorOpen(findInlineRenameInput(originalName, doc))) {
+            if (!nameCell.isConnected) {
+              const fresh = findListRowByName(qa, originalName, doc);
+              const el = fresh ? getNameCellOnly(fresh.row) : null;
+              /* 只点真正的文件名单元格；坚决不退回整行（点行会打开/选中文件） */
+              nameCell = el;
+            }
+            if (nameCell && nameCell.isConnected) qa.realClick(nameCell);
+          }
+        } else if (how === 'enterkey') {
+          /* 有些可编辑单元格要先聚焦，再按 Enter 才进编辑态 */
+          try { if (!nameCell.hasAttribute('tabindex')) nameCell.setAttribute('tabindex', '-1'); } catch {}
+          try { nameCell.focus(); } catch {}
+          pressKeyOn(nameCell, 'Enter');
+        } else pressKeyOn(nameCell, 'F2');
+      } catch (e) { warn(` ⚠️ 改名：${how} 手势异常`, e); }
+      const input = await waitInlineRenameInput(originalName, doc, how === 'click' ? 1500 : 1200);
+      if (input) {
+        log(` → 改名：进入行内编辑（${how}）`);
+        return input;
+      }
+    }
+    return null;
+  }
+
+  async function waitInlineRenameInput(originalName, doc = document, timeout = 1500) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      const input = findInlineRenameInput(originalName, doc);
+      if (input) return input;
+      await sleep(100);
+    }
+    return null;
+  }
+
+  /* 发键盘事件。
+   * 注意：KeyboardEventInit **不接收** keyCode/which，必须用 defineProperty 补，
+   * 否则 e.keyCode 恒为 0 —— 有些组件只认 keyCode 判 Enter/Esc/F2。*/
+  function pressKeyOn(el, key) {
+    const win = (el && el.ownerDocument ? el.ownerDocument.defaultView : window) || window;
+    const code = { Enter: 13, Escape: 27, F2: 113 }[key] || 0;
+    const base = { key, code: key, bubbles: true, cancelable: true, view: win };
+    const fire = type => {
+      let ev = null;
+      try { ev = new win.KeyboardEvent(type, base); } catch { return; }
+      try {
+        Object.defineProperty(ev, 'keyCode', { get: () => code });
+        Object.defineProperty(ev, 'which', { get: () => code });
       } catch {}
+      try { el.dispatchEvent(ev); } catch {}
+    };
+    fire('keydown');
+    fire('keypress');
+    fire('keyup');
+  }
+
+  function dispatchHover(qa, el) {
+    const win = el.ownerDocument.defaultView || window;
+    const r = el.getBoundingClientRect();
+    const cx = r.left + r.width / 2;
+    const cy = r.top + r.height / 2;
+    const base = { bubbles: true, cancelable: true, view: win, clientX: cx, clientY: cy, button: 0, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true };
+    for (const [type, ctor] of [['pointerover', win.PointerEvent], ['pointerenter', win.PointerEvent], ['pointermove', win.PointerEvent], ['mouseover', win.MouseEvent], ['mouseenter', win.MouseEvent], ['mousemove', win.MouseEvent]]) {
+      try { el.dispatchEvent(new ctor(type, base)); } catch {}
     }
   }
 
-  /* 找改名的 ant-modal：优先"输入框的值=原文件名（去标识符后同名）"，其次弹窗文本含"重命名"。
-   * 两者都不满足就不认（宁可不改，也不误改预览/分享弹窗里的输入框）。*/
+  /* 行内改名：写入新名 → Enter / 失焦提交。
+   * fid：目标行的 data-row-key（改名不换 fid，用它做绑定复核，比按名比对可靠）。
+   * 返回 'ok' | 'fail' | 'unverified'。*/
+  async function applyRenameViaInlineEditor(qa, input, oldName, newName, doc = document, fid = '') {
+    if (!input || !input.isConnected) return 'fail';
+
+    try { input.focus(); } catch {}
+    try { input.select(); } catch {}
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    if (setter) { try { setter.call(input, newName); } catch {} }
+    if (input.value !== newName) input.value = newName;
+    try { input.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+    try { input.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+
+    if (input.value !== newName) {
+      warn(` ⚠️ 改名：行内输入框未接受新名（当前="${input.value}"）`);
+      return 'fail';
+    }
+
+    /* 编辑态判定绑定到这一个 input，不看"全文还有没有 input-edit" */
+    const editorClosed = () => !isEditorOpen(input);
+
+    pressKeyOn(input, 'Enter');
+    let closed = await until(() => editorClosed() || findRowByExactName(qa, newName, doc), 150, 6000);
+
+    if (!closed) {
+      /* Enter 没提交：先试失焦（夸克行内编辑通常失焦即提交） */
+      try { input.blur(); } catch {}
+      closed = await until(() => editorClosed() || findRowByExactName(qa, newName, doc), 150, 4000);
+    }
+    if (!closed) {
+      /* 还没关：按 Esc 收尾，避免残留编辑器污染后面的行 */
+      pressKeyOn(input, 'Escape');
+      await until(() => editorClosed(), 120, 1500);
+      warn(' ⚠️ 改名：行内编辑未提交（Enter/失焦都无效），已按 Esc 放弃');
+      return 'fail';
+    }
+
+    /* 正向确认：优先用 fid 绑定复核（改名不换 fid），再退回原样名比对。
+     * 不能用 findListRowByName 做判据 —— 它的比较键会把 [bgm]…[bgm] 剥掉，
+     * "新名"与"旧名"键相同 → 恒真，会把没改成的判成功。*/
+    const wantName = String(newName ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    const oldRaw = String(oldName ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    const liveText = el => {
+      if (!el) return '';
+      const t = (el.getAttribute && el.getAttribute('title')) || '';
+      const raw = `${t} ${el.textContent || ''}`;
+      return raw.replace(/\s+/g, ' ').trim();
+    };
+    const rowState = () => {
+      const row = fid ? findRowByFid(fid, doc) : null;
+      if (!row) return null;
+      const cell = row.querySelector('.filename-text, [class*="filename-text"], .file-name, [class*="file-name"]');
+      return liveText(cell || row);
+    };
+
+    const judge = () => {
+      const txt = rowState();
+      if (txt != null) {
+        if (wantName && txt.includes(wantName)) return 'ok';
+        if (oldRaw && txt.includes(oldRaw)) return 'fail';
+      }
+      if (findRowByExactName(qa, newName, doc)) return 'ok';
+      return null;
+    };
+
+    let verdict = null;
+    const t0 = Date.now();
+    while (Date.now() - t0 < 6000) {
+      verdict = judge();
+      if (verdict) break;
+      await sleep(200);
+    }
+    if (verdict) return verdict;
+
+    /* 还没结论：滚动再找一次（虚拟滚动下行可能被移出渲染窗口） */
+    if (fid) { try { await scrollToRowByName(qa, doc, newName, { cacheKey: currentCacheKey(), maxMs: 4000 }); } catch {} }
+    verdict = judge();
+    if (verdict) return verdict;
+
+    if (findRowByExactName(qa, oldName, doc)) {
+      warn(` ⚠️ 改名：编辑已关闭但列表仍是旧名 —— ${oldName}`);
+      return 'fail';
+    }
+    return 'unverified';
+  }
+
+  /* 找改名的 ant-modal：输入框的值必须就是原文件名（或去标识符后同名）。
+   * 不做"弹窗文本含重命名"的兜底 —— 那会把别的行的改名弹窗也认下来，改错文件。*/
   function findRenameModal(originalName, doc = document) {
     const want = getComparableFileName(originalName);
     const modals = doc.querySelectorAll('.ant-modal, [role="dialog"], .ant-drawer-content, .base-confirm-modal .ant-modal');
     for (const m of modals) {
       if (!_isVisible(m)) continue;
       const inputs = [...m.querySelectorAll('input[type="text"], input:not([type]), input.ant-input')]
-      .filter(i => !isRenamePanel(i));
+      .filter(i => !isRenamePanel(i) && i.isConnected && _isVisible(i));
       if (!inputs.length) continue;
       for (const i of inputs) {
         const v = String(i.value ?? '');
         if (v && (v === originalName || getComparableFileName(v) === want)) return m;
       }
-      const txt = (m.textContent || '').replace(/\s+/g, '');
-      if (/重命名|重新命名|改名/.test(txt)) return m;
     }
     return null;
   }
@@ -1490,17 +1720,22 @@
     return null;
   }
 
-  /* 输入新名 → 确认 → 等弹窗关闭（含 React 受控输入的 setter 回退） */
-  async function applyRenameInDialog(qa, modal, originalName, newName, doc = document) {
+  /* 输入新名 → 确认 → 等关闭。
+   * scope 可能是行内编辑的 <input>（夸克真实路径）或改名弹窗（改动后的 Quark 版本）。*/
+  async function applyRenameInDialog(qa, scope, originalName, newName, doc = document, fid = '') {
+    if (!scope || !scope.isConnected) { warn(' ⚠️ 改名：改名编辑器已消失'); return false; }
+
+    const inpSel = 'input.input-edit, input[type="text"], input:not([type]), input.ant-input';
+    const collect = () => (typeof scope.querySelectorAll === 'function' && !(scope.tagName === 'INPUT'))
+    ? [...scope.querySelectorAll(inpSel)].filter(i => !isRenamePanel(i))
+    : [scope];
+    const inputs = collect();
     const want = getComparableFileName(originalName);
-    const input = [...modal.querySelectorAll('input[type="text"], input:not([type]), input.ant-input')]
-    .filter(i => !isRenamePanel(i))
-    .find(i => {
+    const input = inputs.find(i => {
       const v = String(i.value ?? '');
       return v && (v === originalName || getComparableFileName(v) === want);
-    }) || [...modal.querySelectorAll('input[type="text"], input:not([type]), input.ant-input')]
-    .filter(i => !isRenamePanel(i))[0];
-    if (!input) return false;
+    }) || inputs[0];
+    if (!input) { warn(' ⚠️ 改名：找不到改名输入框'); return false; }
 
     const setInputValue = v => {
       try { input.focus(); } catch {}
@@ -1511,6 +1746,11 @@
       try { input.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
     };
 
+    /* 行内编辑：Enter 或失焦提交；弹窗：点确认按钮 */
+    if (input.classList.contains('input-edit')) {
+      return await applyRenameViaInlineEditor(qa, input, originalName, newName, doc, fid);
+    }
+
     setInputValue(newName);
     if (input.value !== newName) {
       warn(` ⚠️ 改名：输入框未接受新名（当前="${input.value}"）`);
@@ -1519,7 +1759,7 @@
 
     const btn = await qa.until(() => {
       for (const t of RENAME_CONFIRM_TEXTS) {
-        for (const el of modal.querySelectorAll('.ant-modal-footer button, .ant-drawer-footer button, button')) {
+        for (const el of scope.querySelectorAll('.ant-modal-footer button, .ant-drawer-footer button, button')) {
           if (!_isVisible(el) || isRenamePanel(el)) continue;
           if (el.disabled || el.classList.contains('ant-btn-loading')) continue;
           if ((el.textContent || '').replace(/\s+/g, '') === t) return el;
@@ -1529,15 +1769,15 @@
     }, 100, 2500);
 
     if (!btn) {
-      const btns = [...modal.querySelectorAll('button')].map(b => (b.textContent || '').trim()).filter(Boolean);
+      const btns = [...scope.querySelectorAll('button')].map(b => (b.textContent || '').trim()).filter(Boolean);
       warn(' ⚠️ 改名：未找到确认按钮，弹窗内按钮：', btns);
       return false;
     }
 
     qa.realClick(btn);
     const gone = await qa.until(() => !findRenameModal(originalName, doc), 150, 6000);
-    if (!gone) { warn(' ⚠️ 改名：确认后弹窗未关闭'); return false; }
-    return true;
+    if (!gone) { warn(' ⚠️ 改名：确认后弹窗未关闭'); return 'fail'; }
+    return 'ok';
   }
 
   /* 刷新后等列表出现本次转存的文件名（用尾巴 token 匹配，避免被标识符影响）。
@@ -1563,28 +1803,37 @@
     return false;
   }
 
-  /* 单行改名（返回 true/false） */
+  /* 单行改名：返回 true 表示"确认已改名"。
+   * 行不在可见区时（虚拟滚动）先滚动定位，再做正向确认，避免把"没改成"当成功。*/
   async function renameOneRow(qa, m, doc = document) {
     const row = (m.row && m.row.isConnected) ? m.row : ((findListRowByName(qa, m.old, doc) || {}).row || null);
-    const dlg = await openRenameDialog(qa, row, m.nameEl || getNameElInRow(row), m.old, doc);
-    if (!dlg) { warn(` ⚠️ 改名：未能打开重命名对话框 —— ${m.old}`); return false; }
+    const editor = await openRenameDialog(qa, row, m.nameEl || getNameElInRow(row), m.old, doc);
+    if (!editor) { warn(` ⚠️ 改名：打不开改名编辑器（行内编辑与按钮都没成功） —— ${m.old}`); return false; }
 
-    const ok = await applyRenameInDialog(qa, dlg, m.old, m.next, doc);
-    if (!ok) {
+    const r = await applyRenameInDialog(qa, editor, m.old, m.next, doc, m.fid || '');
+    if (r === 'fail' || r === false) {
       try {
-        const close = dlg.querySelector('.ant-modal-close, .ant-drawer-close');
+        const close = editor.querySelector && editor.querySelector('.ant-modal-close, .ant-drawer-close');
         if (close) qa.realClick(close);
+        else if (editor.blur) editor.blur();
       } catch {}
       return false;
     }
+    if (r === 'ok' || r === true) return true;
 
-    const cur = findListRowByName(qa, m.next, doc);
-    if (cur) return true;
-    const still = findListRowByName(qa, m.old, doc);
-    if (still) { warn(` ⚠️ 改名：弹窗已关闭但列表仍是旧名 —— ${m.old}`); return false; }
-    /* 行可能被虚拟滚动移出可见区；弹窗正常关闭即视为成功 */
-    log(`   ↳ 改名后该行不在可见区，按成功计：${m.next}`);
-    return true;
+    /* unverified：编辑器已关闭但可见区没看到新名 —— 滚动再找一次 */
+    const found = await findRowByScrolling(qa, doc, m.next);
+    if (found) return true;
+    const oldStill = await findRowByScrolling(qa, doc, m.old);
+    if (oldStill) { warn(` ⚠️ 改名：滚动确认后列表仍是旧名 —— ${m.old}`); return false; }
+    warn(` ⚠️ 改名：无法确认结果（行不在可见区）—— ${m.old} → ${m.next}`);
+    return false;
+  }
+
+  /* 用已有的滚动定位按名找行（虚拟滚动场景） */
+  async function findRowByScrolling(qa, doc, name, maxMs = 5000) {
+    const hit = await scrollToRowByName(qa, doc, name, { cacheKey: currentCacheKey(), maxMs });
+    return !!hit;
   }
 
   /* 批量改名：把已转存文件改成 [bgm]acg最终名称[bgm]原始文件名
@@ -1593,29 +1842,42 @@
     const doc = opts.doc || document;
     const waitMs = Number(opts.waitMs) > 0 ? Number(opts.waitMs) : 8000;
     const entries = Array.isArray(plan) ? plan.filter(x => x && x.old && x.next) : [];
-    if (!entries.length) { log('★ 改名：无需要改名的文件'); return { renamed: 0, failed: 0, skipped: 0, pairs: [] }; }
+    if (!entries.length) { log('★ 改名：无需要改名的文件'); return { renamed: 0, failed: 0, skipped: 0, confirmed: [], pairs: [] }; }
 
     log(`★ 改名：待改名 ${entries.length} 个 → ${FILE_NAME_MARKER}acg名称${FILE_NAME_MARKER}原始文件名`);
     for (const e of entries) log(` - ${e.old}  →  ${e.next}`);
 
     let renamed = 0, failed = 0, skipped = 0;
+    const confirmed = [];
     for (let i = 0; i < entries.length; i++) {
       const e = entries[i];
-      const loaded = await until(() => findListRowByName(qa, e.old, doc), 200, waitMs);
+      /* 行可能在可见区外（虚拟滚动）：先滚动定位 */
+      let loaded = findListRowByName(qa, e.old, doc);
+      if (!loaded) loaded = await until(() => findListRowByName(qa, e.old, doc), 200, waitMs);
+      if (!loaded) loaded = await scrollToRowByName(qa, doc, e.old, { cacheKey: currentCacheKey(), maxMs: 6000 });
       if (!loaded) {
         warn(` ⚠️ 改名：[${i + 1}/${entries.length}] 列表里找不到该文件，跳过：${e.old}`);
         skipped++;
         continue;
       }
-      const r = await renameOneRow(qa, { row: loaded.row, nameEl: getNameElInRow(loaded.row), old: e.old, next: e.next }, doc);
-      if (r) { renamed++; log(` ✓ 改名 [${i + 1}/${entries.length}] ${e.old} → ${e.next}`); }
-      else { failed++; warn(` ✗ 改名失败 [${i + 1}/${entries.length}] ${e.old}`); }
+      const r = await renameOneRow(qa, { row: loaded.row, nameEl: getNameElInRow(loaded.row), old: e.old, next: e.next, fid: loaded.fid }, doc);
+      if (r) {
+        renamed++;
+        log(` ✓ 改名 [${i + 1}/${entries.length}] ${e.old} → ${e.next}`);
+        /* 只有确认改成功的行才拿去做记录同步与 pairs */
+        const row = findRowByExactName(qa, e.next, doc);
+        confirmed.push({ old: e.old, next: e.next, fid: row ? row.fid : (loaded.fid || '') });
+      } else {
+        failed++;
+        warn(` ✗ 改名失败 [${i + 1}/${entries.length}] ${e.old}`);
+      }
+      try { await qa.clearAllSelection(); } catch {}
       await sleep(250);
     }
 
     try { qa.refreshGray(); } catch {}
     log(`★ 改名完成：成功 ${renamed}，失败 ${failed}，跳过 ${skipped}`);
-    return { renamed, failed, skipped, pairs: [] };
+    return { renamed, failed, skipped, confirmed, pairs: [] };
   }
 
   /* 改名自检：对当前可见的第一个文件加/改标识符前缀，用于验证改名路径是否可用 */
@@ -1641,6 +1903,47 @@
     } else {
       alert(`❌ 改名失败（成功 ${rep.renamed} / 失败 ${rep.failed} / 跳过 ${rep.skipped}）\n\n请看控制台 [桥接] 日志里的按钮文本与失败原因。`);
     }
+  }
+
+  /* 改名诊断（只读）：不改动任何文件，只报告入口元素/按钮/勾选状态，便于真机排查 */
+  function runRenameDiagnose(qa, doc = document) {
+    const lines = [];
+    const files = (qa.scanFileRows(doc) || []).filter(f => f.fid && f.row && !isFolderFile(f));
+    lines.push(`可见文件行：${files.length}`);
+
+    const f = files[0];
+    if (!f) {
+      const msg = lines.join('\n') + '\n\n当前可见区没有文件行（列表可能还在加载）';
+      log('=== 改名诊断 ===\n' + msg);
+      alert(msg);
+      return;
+    }
+
+    const cell = getNameCellOnly(f.row);
+    lines.push(`首个文件：${f.name}`);
+    lines.push(`fid：${f.fid}`);
+    lines.push(`行 class：${f.row.className}`);
+    lines.push(`行选中：${f.row.classList.contains('ant-table-row-selected')}`);
+    lines.push(`名字单元格：${cell ? `<${cell.tagName.toLowerCase()} class="${cell.className}">` : '未找到 .filename-text'}`);
+    if (cell) {
+      lines.push(`title：${cell.getAttribute('title')}`);
+      lines.push(`可编辑标记：editable-cell-allow=${cell.classList.contains('editable-cell-allow')} editable-cell=${cell.classList.contains('editable-cell')}`);
+      const style = (cell.ownerDocument.defaultView || window).getComputedStyle(cell);
+      lines.push(`样式：pointer-events=${style.pointerEvents} user-select=${style.userSelect} cursor=${style.cursor}`);
+    }
+
+    const btns = [...doc.querySelectorAll('.btn-group button.btn-file')]
+    .map(b => (b.textContent || '').replace(/\s+/g, '') || b.className).filter(Boolean);
+    lines.push(`顶栏按钮：${btns.join(' | ') || '（无）'}`);
+    lines.push(`表头全选状态：${getHeaderCheckState(doc)}`);
+    lines.push(`可见选中行：${getSelectedFids(doc).length}`);
+    lines.push(`当前行内编辑 input：${findInlineRenameInput('', doc) ? '有' : '无'}`);
+    const closer = f.row.closest('.filename') || f.row;
+    lines.push(`目标行内 .hoitem-more：${closer.querySelectorAll('.hoitem-more, .hover-oper-item.ant-dropdown-trigger').length} 个`);
+
+    const msg = lines.join('\n');
+    log('=== 改名诊断 ===\n' + msg);
+    alert(msg + '\n\n（本诊断不改动任何文件；详细内容见控制台 [桥接] 日志）');
   }
 
   /* ===== 逐行勾选（虚拟滚动兼容） ===== */
@@ -2159,8 +2462,7 @@
     }
 
     const out = [];
-    const seenOld = new Set();
-    for (const entry of (Array.isArray(savedByUrl) ? savedByUrl : [])) {
+    const seenOld = new Set();    for (const entry of (Array.isArray(savedByUrl) ? savedByUrl : [])) {
       for (const f of ((entry && entry.files) || [])) {
         const oldName = String(f && f.name || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
         if (!oldName || seenOld.has(oldName)) continue;
@@ -2352,17 +2654,13 @@
             renameReport = await applyListRenames(qa, plan, { waitMs: ok ? 8000 : 1500 });
           } catch (e) { warn('⚠️ 改名过程异常', e); }
 
+          /* pairs 只取"本次确认为改成功"的行（不要用比较键反推：它会剥掉标识符，新旧名键相同） */
           if (renameReport.renamed > 0) {
-            const reported = new Set();
-            renameReport.pairs = [];
-            for (const e of plan) {
-              if (reported.has(e.old)) continue;
-              reported.add(e.old);
-              const stale = findListRowByName(qa, e.old, document);
-              const hit = findListRowByName(qa, e.next, document);
-              if (hit) renameReport.pairs.push({ fid: hit.fid, old: e.old, next: e.next });
-              else if (stale) warn(` ⚠️ 改名：列表里仍是旧名，未同步下载记录 —— ${e.old}`);
-            }
+            renameReport.pairs = (renameReport.confirmed || [])
+            .filter(c => c && c.fid)
+            .map(c => ({ fid: c.fid, old: c.old, next: c.next }));
+            const missingFid = (renameReport.confirmed || []).filter(c => !c.fid).length;
+            if (missingFid) warn(` ⚠️ 改名：${missingFid} 个已改名文件拿不到 fid，未同步下载记录名（不影响下载判定）`);
             try {
               const n = refreshDlRecordsAfterRename(renameReport.pairs);
               if (n) log(` ★ 改名：同步 ${n} 条下载记录到新名`);
@@ -2861,6 +3159,11 @@
           label: '🏷️ 测试改名', color: '#da9328',
           title: '对当前可见的第一个文件试改名（只加标识符前缀，用于验证改名路径）',
           onclick: () => runRenameSmokeTest(qa),
+        },
+        {
+          label: '🔍 改名诊断', color: '#8c8c8c',
+          title: '只报告改名入口的 DOM/按钮/勾选状态，不改动任何文件',
+          onclick: () => runRenameDiagnose(qa),
         },
       ]);
       qa.setStatus('待机（个人页）');

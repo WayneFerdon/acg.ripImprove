@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.5.2
+// @version 3.6.2
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 [bgm]名称[bgm]原始文件名）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -1393,7 +1393,17 @@
    * （虚拟滚动下看不到的行也可能被勾选，看不见就一律不点按钮，避免批量重命名）。*/
   async function resetSelectionToRow(qa, file, doc = document) {
     if (!file || !file.fid) return { ok: false, reason: 'no-fid' };
-    try { await qa.clearAllSelection(); } catch {}
+
+    /* 先清空勾选，且**必须证明清干净了**：qa.clearAllSelection() 只遍历渲染出来的行，
+     * 虚拟滚动外的勾选行清不掉 —— 若残留隐藏勾选，顶栏「重命名」会对它们一起生效（批量改名，不可逆）。
+     * 表头三态反映的是整个数据模型，所以以"表头回到 none"作为清空成功的唯一判据。*/
+    const cleared = await clearAllViaHeader(qa, doc);
+    if (!cleared.ok || getHeaderCheckState(doc) !== 'none') {
+      try { await qa.clearAllSelection(); } catch {}
+      if (getHeaderCheckState(doc) !== 'none') {
+        return { ok: false, reason: `clear-incomplete(${getHeaderCheckState(doc)})` };
+      }
+    }
 
     let row = (file.row && file.row.isConnected) ? file.row : findRowByFid(file.fid, doc);
     if (!row) return { ok: false, reason: 'row-gone' };
@@ -1410,6 +1420,8 @@
       await until(isSel, 100, 1500);
     }
 
+    /* 等 React 把表头三态更新成 partial 再复核 */
+    await until(() => getHeaderCheckState(doc) === 'partial', 100, 800);
     const state = getHeaderCheckState(doc);
     const fids = getSelectedFids(doc);
     if (state !== 'partial' || fids.length !== 1 || fids[0] !== file.fid) {
@@ -1418,8 +1430,111 @@
     return { ok: true };
   }
 
-  /* 打开改名入口：优先行内编辑（夸克真实实现），其次"重命名"按钮弹窗。
-   * 返回 input 元素（行内编辑）或弹窗元素（modal），两者都用 querySelector 取输入框。*/
+  /* 顶栏「重命名」按钮：`.btn-group` 里文本精确匹配；**显式排除 `.btn-main`**
+   * （下载助手/上传文件/新建文件夹/添加备份）。真机上「重命名」可能是 button 或 span/a，
+   * 所以放宽元素类型，但始终返回**可点击的最近祖先**。*/
+  function findToolbarRenameButton(doc = document) {
+    const els = [...doc.querySelectorAll(
+      '.btn-group button, .btn-group [role="button"], .btn-group span, .btn-group a, .section-header button.btn-file'
+    )];
+    for (const el of els) {
+      if (el.closest && el.closest('.btn-main')) continue;      /* 上传/新建等区域，明确排除 */
+      if (isRenamePanel(el)) continue;
+      const txt = (el.textContent || '').replace(/\s+/g, '').trim();
+      if (!/^(重命名|重新命名|改名)$/.test(txt)) continue;
+      /* 优先父级可点击元素（span 在 button 内），否则自身 */
+      const clickable = (el.closest && el.closest('button, [role="button"], a')) || el;
+      if (clickable.closest && clickable.closest('.btn-main')) continue;
+      return clickable;
+    }
+    return null;
+  }
+
+  /* 点击顶栏「重命名」后新出现、且确实像"改名"的弹窗：
+   * 必须①点击后才出现、②可见、③含文本框，且（输入框值=原文件名 或 文案明确提到"重命名/修改名称"）。
+   * 不能用"名称/文件名"这类宽泛词 —— 会把"新建文件夹/移动到"等弹窗当改名框。*/
+  function findNewRenameModal(beforeSet, originalName, doc = document) {
+    const want = getComparableFileName(originalName);
+    const modals = [...doc.querySelectorAll('.ant-modal, [role="dialog"], .ant-drawer-content')];
+    for (const m of modals) {
+      if (beforeSet.has(m) || !_isVisible(m)) continue;
+      const inputs = [...m.querySelectorAll('input')]
+      .filter(i => i.isConnected && _isVisible(i) && !isRenamePanel(i));
+      if (!inputs.length) continue;
+      const valMatch = inputs.some(i => {
+        const v = String(i.value ?? '');
+        return !!v && (v === originalName || getComparableFileName(v) === want);
+      });
+      if (valMatch) return m;
+      const txt = (m.textContent || '').replace(/\s+/g, '');
+      if (/重命名|重新命名|修改名称/.test(txt)) return m;
+    }
+    return null;
+  }
+
+  /* 关掉"点了顶栏按钮但没被采纳"的残留弹窗/下拉，避免它挡住后续行内编辑 */
+  async function dismissStrayModals(qa, beforeSet, doc = document) {
+    try {
+      const stray = [...doc.querySelectorAll('.ant-modal, [role="dialog"], .ant-drawer-content, .ant-dropdown')]
+      .filter(el => !beforeSet.has(el) && _isVisible(el));
+      for (const el of stray) {
+        const close = el.querySelector('.ant-modal-close, .ant-drawer-close');
+        if (close) { try { qa.realClick(close); } catch {} }
+      }
+      if (stray.length) {
+        await until(() => !stray.some(el => _isVisible(el)), 150, 2000);
+        /* 还没关掉就按 Esc */
+        if (stray.some(el => _isVisible(el))) { try { pressKeyOn(doc.body, 'Escape'); } catch {} }
+        await sleep(150);
+      }
+    } catch {}
+  }
+
+  /* 顶栏「重命名」路径（用户实测主路径）：先单选该行 → 点按钮 → 等弹窗/行内编辑。
+   * **安全闸门**：只有表头三态 + fid 列表证明"仅勾选目标行"时才点按钮
+   * （该按钮作用于所有勾选行，虚拟滚动下看不见的行也可能被勾选 → 误触发就是批量改名）。*/
+  async function openRenameViaToolbar(qa, file, originalName, doc = document) {
+    if (!file || !file.fid) return null;
+
+    const sel = await resetSelectionToRow(qa, file, doc);
+    if (!sel.ok) {
+      warn(` ⚠️ 改名：单选复核未通过（${sel.reason}）→ 不点顶栏「重命名」（防批量改名）`);
+      return null;
+    }
+
+    const btn = findToolbarRenameButton(doc);
+    if (!btn) { log('   ↳ 顶栏没有「重命名」按钮，改走行内编辑'); return null; }
+    if (btn.disabled || btn.getAttribute('aria-disabled') === 'true' || btn.classList.contains('ant-btn-disabled')) {
+      warn(' ⚠️ 改名：顶栏「重命名」按钮处于禁用态，跳过');
+      return null;
+    }
+
+    /* before 用与 dismissStrayModals 相同的选择器集合 —— 否则"点击前就打开的下拉"会被当残留关掉 */
+    const STRAY_SEL = '.ant-modal, [role="dialog"], .ant-drawer-content, .ant-dropdown';
+    const before = new Set([...doc.querySelectorAll(STRAY_SEL)]);
+    log(` → 改名：点击顶栏「重命名」（已确认仅勾选 1 行）`);
+    try { qa.realClick(btn); } catch (e) { warn(' ⚠️ 改名：点击顶栏「重命名」异常', e); return null; }
+
+    const t0 = Date.now();
+    while (Date.now() - t0 < 2500) {
+      const inline = findInlineRenameInput(originalName, doc);
+      if (inline) { log(' ✓ 顶栏「重命名」进入行内编辑'); return inline; }
+      const dlg = findNewRenameModal(before, originalName, doc);
+      if (dlg) {
+        log(` ✓ 顶栏「重命名」打开弹窗：${(dlg.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 60)}`);
+        return dlg;
+      }
+      await sleep(150);
+    }
+    warn(' ⚠️ 改名：点了顶栏「重命名」但没等到弹窗/编辑框');
+    /* 点了按钮却什么都没等到：可能弹出了"没被采纳"的残留弹窗/遮罩，
+     * 清掉它，否则会挡住后面的行内编辑点击。*/
+    await dismissStrayModals(qa, before, doc);
+    return null;
+  }
+
+  /* 打开改名入口：**优先顶栏「重命名」**（用户实测：单选该行 → 点按钮），
+   * 其次行内编辑（点文件名单元格），最后悬停「更多」菜单。*/
   async function openRenameDialog(qa, row, nameCell, originalName, doc = document) {
     if (!row || !row.isConnected) {
       const fresh = findListRowByName(qa, originalName, doc);
@@ -1428,10 +1543,17 @@
     }
     if (!row || !row.isConnected) { warn(` ⚠️ 改名：列表里找不到该行 —— ${originalName}`); return null; }
 
-    /* ① 行内编辑：点文件名单元格原地改（DOM 实测路径）。
-     * 先把勾选收敛到这一行：用户实测里"正在被编辑的那行"同时带 ant-table-row-selected，
-     * 所以不要清空勾选就点名字。*/
     const file = findListRowByName(qa, originalName, doc);
+
+    /* ① 顶部栏「重命名」（主路径；内部已用单选复核把门） */
+    if (file && file.fid) {
+      const viaToolbar = await openRenameViaToolbar(qa, file, originalName, doc);
+      if (viaToolbar) return viaToolbar;
+      row = file.row;
+      nameCell = getNameCellOnly(file.row) || nameCell;
+    }
+
+    /* ② 行内编辑（退路）：夸克的行内编辑要求该行处于选中态，先把勾选收敛到这一行 */
     if (file && file.fid) {
       const sel = await resetSelectionToRow(qa, file, doc);
       if (!sel.ok) warn(` ⚠️ 改名：勾选收敛未达预期（${sel.reason}），行内编辑可能不生效`);
@@ -1441,13 +1563,6 @@
 
     const inline = await openInlineRename(qa, nameCell, originalName, doc);
     if (inline) return inline;
-
-    /* ② 顶栏「重命名」按钮：**故意不自动点**。
-     * 夸克该按钮作用于"所有被勾选的行"，而列表是虚拟滚动：看不见的行也可能处于勾选状态，
-     * clearAllSelection 只能清掉渲染出来的行 → 无法证明"当前只勾选了目标行"，
-     * 一旦点下去就是跨屏批量重命名（不可逆）。用户实测的可用路径是行内编辑（①），
-     * 所以这里只记日志提示，绝不代点。*/
-    log(`   ↳ 行内编辑没打开；顶栏「重命名」按钮需要手动单选后再点（自动点有批量改名风险，已跳过）`);
 
     /* ③ 悬停操作条的"更多"菜单里可能藏着重命名。
      * 只在目标行**确实有** .hoitem-more 时才走这条路，且菜单项只认"点击后新出现的下拉"，
@@ -1888,8 +2003,19 @@
     }
 
     qa.realClick(btn);
-    const gone = await qa.until(() => !findRenameModal(originalName, doc), 150, 6000);
-    if (!gone) { warn(' ⚠️ 改名：确认后弹窗未关闭'); return 'fail'; }
+    /* 等**同一个弹窗元素**真正关闭：不能用 findRenameModal(originalName) —— 输入框值已改成新名，
+     * 那个判据在改值瞬间就恒为 null，等于没等（残留遮罩会挡住后续每个文件的点击）。*/
+    const modalEl = (scope && scope.tagName !== 'INPUT' && scope.isConnected) ? scope : null;
+    const closed = await qa.until(
+      () => (modalEl ? (!modalEl.isConnected || !_isVisible(modalEl)) : !findRenameModal(originalName, doc)),
+      150, 6000
+    );
+    if (!closed) {
+      warn(' ⚠️ 改名：确认后弹窗未关闭，已按 Esc 收尾');
+      try { pressKeyOn(doc.body, 'Escape'); } catch {}
+      await sleep(200);
+      return 'fail';
+    }
     log(' ⏳ 改名：弹窗已提交，等待列表确认新名…');
     return 'submitted';
   }
@@ -2102,6 +2228,10 @@
     const btns = [...doc.querySelectorAll('.btn-group button.btn-file')]
     .map(b => (b.textContent || '').replace(/\s+/g, '') || b.className).filter(Boolean);
     lines.push(`顶栏按钮：${btns.join(' | ') || '（无）'}`);
+    const tbRename = findToolbarRenameButton(doc);
+    lines.push(`顶栏「重命名」按钮：${tbRename
+      ? `已找到（disabled=${!!(tbRename.disabled || tbRename.classList.contains('ant-btn-disabled'))}）`
+      : '未找到'}`);
     lines.push(`表头全选状态：${getHeaderCheckState(doc)}`);
     lines.push(`可见选中行：${getSelectedFids(doc).length}`);
     lines.push(`当前行内编辑 input：${findInlineRenameInput('', doc) ? '有' : '无'}`);

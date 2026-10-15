@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      5.3.8
+// @version      5.4.0
 // @description  夸克网盘平台层：UI + DOM 工具 + 批量下载 + 下载记录 + 暂停控制 + 底层删除工具（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -265,6 +265,55 @@
       seen.add(name);
     }
     return out;
+  }
+
+  /* ===== 文件名标识符（与桥接脚本同规则）=====
+   * 改名后的文件名形如：[bgm]acg最终名称[bgm]原始文件名
+   * 两边比对文件名时，一律排除两个标识符及其之间的文本（只拿"原始文件名"部分比对）。
+   * 大小写不敏感（`[BGM]` 视为同一标识符）：与桥接脚本 getFileNameMarkerRe 的 'gi' 保持一致，
+   * 否则两个脚本对"是否同一文件"可能给出不同结论。*/
+  const FILE_NAME_MARKER = '[bgm]';
+
+  function fileNameMarkerRe() {
+    const esc = String(FILE_NAME_MARKER).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`${esc}[\\s\\S]*?${esc}`, 'gi');
+  }
+
+  /** 比对用文件名：去零宽字符 + 排除两个标识符及其之间的文本 + trim */
+  function normalizeFileName(s) {
+    return String(s ?? '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(fileNameMarkerRe(), '')
+    .trim();
+  }
+
+  /** 名称比对唯一入口：仅比名称（排除标识符及其间文本） */
+  function compareFileNames(a, b) {
+    const na = normalizeFileName(a);
+    const nb = normalizeFileName(b);
+    if (!na || !nb) return false;
+    return na === nb;
+  }
+
+  /** 规范化文件大小：去空白、统一单位大小写，占位符视为未知（与桥接脚本同口径） */
+  function normalizeSizeStr(s) {
+    const t = String(s ?? '').trim();
+    if (!t) return '';
+    if (t === '--' || t === '-' || t === '—' || /^未知|loading/i.test(t)) return '';
+    return t.replace(/\s+/g, '').toUpperCase();
+  }
+
+  /** 与 compareFileNames 同规则，另加大小/图标兜底（跨脚本判定"同一个文件"用） */
+  function isSameFileInfo(a, b) {
+    if (!a || !b) return false;
+    if (!compareFileNames(a.name, b.name)) return false;
+    const sa = normalizeSizeStr(a.sizeStr);
+    const sb = normalizeSizeStr(b.sizeStr);
+    if (!sa || !sb) return true;
+    if (sa === sb) return true;
+    const ia = String(a.iconSig ?? '').trim();
+    const ib = String(b.iconSig ?? '').trim();
+    return !!(ia && ib && ia === ib);
   }
 
   /* ===== 下载记录（GM） =====
@@ -1079,7 +1128,7 @@
 
   /* ===== 对外 API ===== */
   unsafeWindow.quarkAssistant = {
-    version: '5.3.8',
+    version: '5.4.0',
     isReady: () => true,
     isListPage, isSharePage,
 
@@ -1091,6 +1140,8 @@
 
     isVisible, getVisibleText, realClick, sleep, until,
     scanFileRows, getFileIconSig,
+
+    FILE_NAME_MARKER, normalizeFileName, compareFileNames, isSameFileInfo, normalizeSizeStr,
 
     findVisibleModal,
 
@@ -1126,17 +1177,17 @@
       installListPageActions();
       if (isPaused()) {
         setStatus('已暂停', 'running');
-        log('平台层就绪（个人页，暂停中）v5.3.8');
+        log('平台层就绪（个人页，暂停中）v5.4.0');
       } else {
         setStatus('待机（个人页）');
-        log('平台层就绪（个人页）v5.3.8');
+        log('平台层就绪（个人页）v5.4.0');
       }
 
       setTimeout(() => { tryAutoDownloadOnBoot(); }, 3000);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v5.3.8');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v5.4.0');
     } else {
-      log('平台层就绪（其他页）v5.3.8');
+      log('平台层就绪（其他页）v5.4.0');
     }
 
     startGrayPolling();

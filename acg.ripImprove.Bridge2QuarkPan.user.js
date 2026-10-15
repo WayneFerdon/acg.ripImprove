@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.0.10
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单）
+// @version 3.1.0
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 [bgm]名称[bgm]原始文件名）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -33,6 +33,9 @@
   const GM_TASKS = 'acgrip_bridge_tasks';
   const GM_RESULTS = 'acgrip_bridge_results';
   const BUSY_KEY = 'acgrip_bridge_busy';
+  /* 夸克助手的历史键：改名后同步记录用（失败不影响主流程） */
+  const GM_DL_RECORDS = 'quark_auto_dl_records';
+  const GM_QRECORDS = 'quark_download_records';
 
   const TASK_TTL = 3 * 60 * 1000;
   const TAB_RESULT_TIMEOUT = 90 * 1000;
@@ -46,6 +49,12 @@
   const warn = (...a) => console.warn('[桥接]', ...a);
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  /* 桥接忙碌标志：夸克助手的 boot 自动下载据此跳过。
+   * 必须一直持有到"转存 → 刷新 → 改名"全部结束（改名完成前放开会让下载抢跑，
+   * 落盘文件名就还是原始名），所以只在流程 finally 里释放。*/
+  function acquireBusy() { try { sessionStorage.setItem(BUSY_KEY, '1'); } catch {} }
+  function releaseBusy() { try { sessionStorage.removeItem(BUSY_KEY); } catch {} }
 
   async function until(fn, delay = 200, timeout = 10000) {
     const t0 = Date.now();
@@ -153,11 +162,86 @@
     return t.replace(/\s+/g, '').toUpperCase();
   }
 
-  /* 规范化文件名：去零宽字符 + trim */
-  function normalizeFileName(s) {
+  /* ===== 文件名标识符（改名标记）=====
+   * 改名后的文件名形如：[bgm]acg最终名称[bgm]原始文件名
+   * 桥接脚本与夸克脚本比对文件名时，一律排除两个标识符及其之间的文本
+   * （即只拿"原始文件名"部分比对）。*/
+  const FILE_NAME_MARKER = '[bgm]';
+
+  function escapeRegExp(s) {
+    return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  }
+
+  /* 标识符块（非贪婪、忽略大小写；不配对则不动）。
+   * 大小写不敏感：文件系统本身不区分，`[BGM]` 视为同一标识符。*/
+  function getFileNameMarkerRe() {
+    return new RegExp(`${escapeRegExp(FILE_NAME_MARKER)}[\\s\\S]*?${escapeRegExp(FILE_NAME_MARKER)}`, 'gi');
+  }
+
+  /* 去掉零宽字符 + 排除所有标识符块 */
+  function sanitizeFileName(s) {
     return String(s ?? '')
     .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(getFileNameMarkerRe(), '')
     .trim();
+  }
+
+  /* 规范化文件名：去零宽字符 + 排除两个标识符及其之间的文本 + trim */
+  function normalizeFileName(s) {
+    return sanitizeFileName(s);
+  }
+
+  /* 去掉标识符块后是否已为空（仅剩标识符时视为空名） */
+  function isBlankFileName(s) {
+    return !sanitizeFileName(s);
+  }
+
+  /* 比对用文件名（唯一入口）：排除两个标识符及其之间的文本 */
+  function getComparableFileName(s) {
+    return normalizeFileName(s);
+  }
+
+  /* 只剥"开头连续出现的标识符块"，保留其余空白与字符（零宽字符顺带清掉）。
+   * 循环剥离：`[bgm]a[bgm][bgm]b[bgm]01.mp4` 这类叠加残留能一次还原成 `01.mp4`，
+   * 否则每次运行都会再判"需要改名"，把标识符越叠越多。*/
+  function stripMarkerBlock(s) {
+    let cur = String(s ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '');
+    const re = new RegExp(`^(?:${escapeRegExp(FILE_NAME_MARKER)}[\\s\\S]*?${escapeRegExp(FILE_NAME_MARKER)})+`, 'i');
+    for (let i = 0; i < 20; i++) {
+      const next = cur.replace(re, '');
+      if (next === cur) break;
+      cur = next;
+    }
+    return cur;
+  }
+
+  /* 目标改名后应有的完整文件名（超长则返回空串：宁可保留原名，也不让改名失败） */
+  function buildRenamedFileName(acgName, originalName) {
+    const base = String(originalName ?? '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .trim();
+    const nm = String(acgName ?? '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(new RegExp(escapeRegExp(FILE_NAME_MARKER), 'g'), '')
+    .replace(/\s+/g, ' ')
+    .trim();
+    if (!base || !nm) return '';
+    const full = `${FILE_NAME_MARKER}${nm}${FILE_NAME_MARKER}${base}`;
+    const bytes = new TextEncoder().encode(full).length;
+    if (bytes > 250) return '';
+    return full;
+  }
+
+  /* 是否需要改名。
+   * 入参约定：currentName = 列表页当前名（可能已带标识符块）；acgName = 纯 acg 名称（不含标识符块）。
+   * 不能拿"当前名"与"acg 名称"各自归一化后比较 —— 当前名带块时的归一化结果与裸 acg 名称无关；
+   * 正确做法：把当前名开头已有的标识符块剥掉还原出原始文件名，按目标格式重建后再与原样当前名比较。
+   * 返回 true 表示"当前名（原样）与目标名不同"，调用方应把 currentName 原样作为 old 传给列表页定位。*/
+  function needRename(currentName, acgName) {
+    const raw = String(currentName ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    const target = buildRenamedFileName(acgName, stripMarkerBlock(raw).trim());
+    if (!raw || !target) return false;
+    return raw !== target;
   }
 
   function isSameFile(a, b) {
@@ -271,6 +355,88 @@
       }
     }
     return keys;
+  }
+
+  /* ===== acg 名称数据（最终名称：中文 > 原始名称）=====
+   * 桥接不读 acg.ripImprove 的内部函数，只按同一优先级自行解析：
+   * 「中文」列非空取中文，否则取「名称」列（两列为空时回退 BGMID 内嵌的 名称,中文）。*/
+  function getAcgDisplayName(row) {
+    if (!row) return '';
+    const pick = v => {
+      const s = String(v ?? '')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+      return s === '' ? '' : s;
+    };
+    const cn = pick(row['中文']);
+    const nm = pick(row['名称']);
+    if (cn) return cn;
+    if (nm) return nm;
+    let parsed = {};
+    try { parsed = parseBgmIdRef(row.BGMID) || {}; } catch {}
+    return pick(parsed['中文']) || pick(parsed['名称']) || '';
+  }
+
+  /* 从 BGMID 文本里取兜底名称（id,名称,中文,…） */
+  function parseBgmIdRef(text) {
+    if (!text) return {};
+    const plain = String(text)
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&amp;/gi, '&')
+    .trim();
+    const parts = plain.split(',');
+    return {
+      id: (parts[0] || '').trim(),
+      名称: (parts[1] || '').trim(),
+      中文: (parts[2] || '').trim(),
+    };
+  }
+
+  /* 每行可能带多个夸克链接（资源 + 规则，且 @ / @@ 会展开成集数）。
+   * 一行内所有展开结果都指向同一个作品 → 一律取该行的最终名称。*/
+  function collectShareNamesFromRow(row) {
+    if (!row) return [];
+    const finalName = getAcgDisplayName(row);
+    const out = [];
+    for (const f of ['资源', '规则']) {
+      const raw = String(row[f] || '').trim();
+      if (!raw) continue;
+      let expanded = raw;
+      try { expanded = expandUrl(raw, row); } catch {}
+      const re = /pan\.quark\.cn\/s\/([a-zA-Z0-9]+)/g;
+      let m;
+      while ((m = re.exec(expanded))) out.push({ key: `https://pan.quark.cn/s/${m[1]}`, finalName });
+    }
+    return out;
+  }
+
+  /* shareKey → acg 最终名称。
+   * 同一 key 出现多个不同名称（同名作品 / 复用链接，无法判定）→ 该 key 不改名。*/
+  function collectShareNameMap(bd) {
+    const map = new Map();
+    const conflict = new Map();
+    for (const row of ((bd && Array.isArray(bd.rows)) ? bd.rows : [])) {
+      for (const { key, finalName } of collectShareNamesFromRow(row)) {
+        if (!finalName) continue;
+        if (conflict.has(key)) continue;
+        const prev = map.get(key);
+        if (prev === undefined) { map.set(key, finalName); continue; }
+        if (prev !== finalName) {
+          map.delete(key);
+          conflict.set(key, `"${prev}" / "${finalName}"`);
+        }
+      }
+    }
+    return { map, conflict };
+  }
+
+  /* 从当前页地址推 key（与记录 key 同源：https://pan.quark.cn/s/<shareId>） */
+  function shareKeyFromUrl(url) {
+    const m = String(url || '').match(/\/s\/([a-zA-Z0-9]+)/);
+    return m ? `https://pan.quark.cn/s/${m[1]}` : '';
   }
 
   /* 清理过期记录：只依据 acg.ripImprove 清单，清单里已不存在的分享即过期。
@@ -1149,6 +1315,334 @@
     return { ok: getHeaderCheckState(doc) === 'none', reason: 'not-cleared' };
   }
 
+  /* ===== 列表页改名（按 acg 最终名称）=====
+   * 时序：转存完成 → 页面内刷新 → ★ 改名 → 触发下载。
+   * 已下载记录按 fid 记录，改名不换 fid，因此改名后仍不会重复下载。*/
+
+  const RENAME_CONFIRM_TEXTS = ['确定', '确认', '保存', '完成', '确 定'];
+
+  function isRenamePanel(el) {
+    try {
+      return !!(el && el.closest && (el.closest('#quark-auto-panel') || el.closest('#quark-share-progress')));
+    } catch { return false; }
+  }
+
+  /* 行名按"排除标识符后"比对：既能找到 [bgm]名[bgm]原始名，也能找到原始名 */
+  function findListRowByName(qa, name, doc = document) {
+    const want = getComparableFileName(name);
+    if (!want) return null;
+    const files = qa.scanFileRows(doc) || [];
+    return files.find(f => getComparableFileName(f.name) === want) || null;
+  }
+
+  /* 行内用来触发重命名/右键的元素（scanFileRows 只给 row，没有 nameEl） */
+  function getNameElInRow(row) {
+    if (!row || typeof row.querySelector !== 'function') return null;
+    return row.querySelector('.filename-text, [class*="filename-text"], .file-name, [class*="file-name"]') || row;
+  }
+
+  /* 打开"重命名"对话框（按钮 / 右键菜单 / 双击文件名 三条路径） */
+  async function openRenameDialog(qa, row, nameCell, originalName, doc = document) {
+    /* ① 顶栏"重命名"按钮（需先确保只有目标行被选中，严禁批量改名） */
+    try {
+      const file = findListRowByName(qa, originalName, doc);
+      if (!file || !file.fid) return null;
+      await qa.clearAllSelection();
+      const picked = await (qa.selectRow ? qa.selectRow(file.row) : false);
+      if (!picked) {
+        warn(' ⚠️ 改名：行勾选失败，放弃按钮路径');
+        return null;
+      }
+      const selected = [...doc.querySelectorAll('tr.ant-table-row-selected')]
+      .map(r => r.getAttribute('data-row-key') || '')
+      .filter(Boolean);
+      const other = selected.filter(k => k !== file.fid);
+      if (other.length) {
+        warn(` ⚠️ 改名：勾选了 ${selected.length} 行（含其它行），放弃按钮路径以免批量改名`);
+        await qa.clearAllSelection();
+        return null;
+      }
+
+      let btn = await qa.until(() => {
+        for (const el of doc.querySelectorAll('.btn-group button.btn-file, .btn-group button.ant-btn, button')) {
+          const txt = (el.textContent || '').replace(/\s+/g, '');
+          if (!/^重命名$|^重新命名$|^改名$/.test(txt)) continue;
+          if (!_isVisible(el) || isRenamePanel(el)) continue;
+          return el;
+        }
+        return null;
+      }, 150, 2000);
+
+      if (btn) {
+        log(' → 改名：点击顶栏「重命名」按钮');
+        qa.realClick(btn);
+        let dlg = await waitRenameDialog(originalName, doc, 2500);
+        if (!dlg) { qa.realClick(btn); dlg = await waitRenameDialog(originalName, doc, 2000); }
+        if (dlg) return dlg;
+      }
+    } catch (e) { warn(' ⚠️ 改名：按钮路径异常', e); }
+
+    /* ② 右键菜单（虚拟滚动下重扫一次，避免用到失效 DOM 引用） */
+    try {
+      const fresh = findListRowByName(qa, originalName, doc);
+      const cell = (fresh && fresh.row) || (nameCell && nameCell.isConnected ? nameCell : null);
+      if (cell && cell.isConnected) {
+        const t = (cell.querySelector && (cell.querySelector('span, .filename-text, .file-name') || cell)) || cell;
+        log(' → 改名：尝试右键菜单');
+        dispatchContextMenu(t);
+        const item = await untilVisibleMatch(2500, /^重命名$|^重新命名$|^改名$/);
+        if (item) {
+          qa.realClick(item.closest('li') || item);
+          const dlg = await waitRenameDialog(originalName, doc, 2500);
+          if (dlg) return dlg;
+        } else {
+          log('   ↳ 未出现右键菜单（或菜单项不是"重命名"）');
+        }
+      }
+    } catch (e) { warn(' ⚠️ 改名：右键路径异常', e); }
+
+    /* ③ 双击文件名（同样重扫） */
+    try {
+      const fresh = findListRowByName(qa, originalName, doc);
+      const cell = (fresh && fresh.row) || (nameCell && nameCell.isConnected ? nameCell : null);
+      const t = cell && ((cell.querySelector && (cell.querySelector('.filename-text, .file-name, span') || cell)) || cell);
+      if (t && t.isConnected) {
+        log(' → 改名：尝试双击文件名');
+        doubleClickEl(t);
+        const dlg = await waitRenameDialog(originalName, doc, 2500);
+        if (dlg) return dlg;
+      }
+    } catch (e) { warn(' ⚠️ 改名：双击路径异常', e); }
+
+    return null;
+  }
+
+  /* 在 [0, timeout] 内轮询匹配可见元素 */
+  async function untilVisibleMatch(timeout, re) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      for (const el of document.querySelectorAll('li, .ant-dropdown-menu-item, [role="menuitem"], .ant-menu-item, .ant-modal-footer button, .ant-drawer button')) {
+        if (isRenamePanel(el) || !_isVisible(el)) continue;
+        const txt = (el.textContent || '').replace(/\s+/g, '').trim();
+        if (re.test(txt)) return el;
+      }
+      await sleep(120);
+    }
+    return null;
+  }
+
+  function dispatchContextMenu(el) {
+    const win = el.ownerDocument.defaultView || window;
+    const r = el.getBoundingClientRect();
+    const x = Math.round(r.left + Math.min(r.width / 2, 40));
+    const y = Math.round(r.top + r.height / 2);
+    const opts = {
+      bubbles: true, cancelable: true, view: win, button: 2, buttons: 2,
+      clientX: x, clientY: y, screenX: x, screenY: y,
+    };
+    try { el.dispatchEvent(new win.PointerEvent('pointerdown', { ...opts, button: 2, buttons: 2, pointerId: 1, pointerType: 'mouse', isPrimary: true })); } catch {}
+    try { el.dispatchEvent(new win.MouseEvent('mousedown', opts)); } catch {}
+    try { el.dispatchEvent(new win.PointerEvent('pointerup', { ...opts, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true })); } catch {}
+    try { el.dispatchEvent(new win.MouseEvent('mouseup', { ...opts, buttons: 0 })); } catch {}
+    try { el.dispatchEvent(new win.MouseEvent('contextmenu', opts)); } catch {}
+  }
+
+  function doubleClickEl(el) {
+    const win = el.ownerDocument.defaultView || window;
+    const base = { bubbles: true, cancelable: true, view: win, button: 0, detail: 2 };
+    try {
+      el.dispatchEvent(new win.MouseEvent('dblclick', base));
+    } catch {
+      try {
+        el.dispatchEvent(new MouseEvent('click', { ...base, detail: 1 }));
+        el.dispatchEvent(new MouseEvent('click', base));
+      } catch {}
+    }
+  }
+
+  /* 找改名的 ant-modal：优先"输入框的值=原文件名（去标识符后同名）"，其次弹窗文本含"重命名"。
+   * 两者都不满足就不认（宁可不改，也不误改预览/分享弹窗里的输入框）。*/
+  function findRenameModal(originalName, doc = document) {
+    const want = getComparableFileName(originalName);
+    const modals = doc.querySelectorAll('.ant-modal, [role="dialog"], .ant-drawer-content, .base-confirm-modal .ant-modal');
+    for (const m of modals) {
+      if (!_isVisible(m)) continue;
+      const inputs = [...m.querySelectorAll('input[type="text"], input:not([type]), input.ant-input')]
+      .filter(i => !isRenamePanel(i));
+      if (!inputs.length) continue;
+      for (const i of inputs) {
+        const v = String(i.value ?? '');
+        if (v && (v === originalName || getComparableFileName(v) === want)) return m;
+      }
+      const txt = (m.textContent || '').replace(/\s+/g, '');
+      if (/重命名|重新命名|改名/.test(txt)) return m;
+    }
+    return null;
+  }
+
+  async function waitRenameDialog(originalName, doc = document, timeout = 2500) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeout) {
+      const m = findRenameModal(originalName, doc);
+      if (m) return m;
+      await sleep(120);
+    }
+    return null;
+  }
+
+  /* 输入新名 → 确认 → 等弹窗关闭（含 React 受控输入的 setter 回退） */
+  async function applyRenameInDialog(qa, modal, originalName, newName, doc = document) {
+    const want = getComparableFileName(originalName);
+    const input = [...modal.querySelectorAll('input[type="text"], input:not([type]), input.ant-input')]
+    .filter(i => !isRenamePanel(i))
+    .find(i => {
+      const v = String(i.value ?? '');
+      return v && (v === originalName || getComparableFileName(v) === want);
+    }) || [...modal.querySelectorAll('input[type="text"], input:not([type]), input.ant-input')]
+    .filter(i => !isRenamePanel(i))[0];
+    if (!input) return false;
+
+    const setInputValue = v => {
+      try { input.focus(); } catch {}
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+      if (setter) { try { setter.call(input, v); } catch {} }
+      if (input.value !== v) input.value = v;
+      try { input.dispatchEvent(new Event('input', { bubbles: true })); } catch {}
+      try { input.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
+    };
+
+    setInputValue(newName);
+    if (input.value !== newName) {
+      warn(` ⚠️ 改名：输入框未接受新名（当前="${input.value}"）`);
+      return false;
+    }
+
+    const btn = await qa.until(() => {
+      for (const t of RENAME_CONFIRM_TEXTS) {
+        for (const el of modal.querySelectorAll('.ant-modal-footer button, .ant-drawer-footer button, button')) {
+          if (!_isVisible(el) || isRenamePanel(el)) continue;
+          if (el.disabled || el.classList.contains('ant-btn-loading')) continue;
+          if ((el.textContent || '').replace(/\s+/g, '') === t) return el;
+        }
+      }
+      return null;
+    }, 100, 2500);
+
+    if (!btn) {
+      const btns = [...modal.querySelectorAll('button')].map(b => (b.textContent || '').trim()).filter(Boolean);
+      warn(' ⚠️ 改名：未找到确认按钮，弹窗内按钮：', btns);
+      return false;
+    }
+
+    qa.realClick(btn);
+    const gone = await qa.until(() => !findRenameModal(originalName, doc), 150, 6000);
+    if (!gone) { warn(' ⚠️ 改名：确认后弹窗未关闭'); return false; }
+    return true;
+  }
+
+  /* 刷新后等列表出现本次转存的文件名（用尾巴 token 匹配，避免被标识符影响）。
+   * 超时不算失败：后续 applyListRenames 会自己再等一次并逐个跳过找不到的行。*/
+  async function waitRowsForRename(qa, plan, timeout = 8000, doc = document) {
+    const tokens = [];
+    for (const e of plan) {
+      const base = normalizeFileName(e.old);
+      const tail = (base.split(/[\s_]+/).filter(Boolean).pop() || base).slice(0, 24);
+      if (tail) tokens.push({ tail, name: base });
+    }
+    if (!tokens.length) return true;
+
+    const hitAll = () => {
+      const rows = qa.scanFileRows(doc) || [];
+      const names = rows.map(r => normalizeFileName(r.name));
+      return tokens.every(t => names.some(n => n === t.name || n.endsWith(t.tail)));
+    };
+
+    const got = await until(hitAll, 200, timeout);
+    if (got) { log(' ✓ 刷新后列表已出现本次转存文件，开始改名'); return true; }
+    warn(` ⚠️ 改名：${timeout}ms 内列表未出现全部目标文件（可能仍在加载），继续尝试改名`);
+    return false;
+  }
+
+  /* 单行改名（返回 true/false） */
+  async function renameOneRow(qa, m, doc = document) {
+    const row = (m.row && m.row.isConnected) ? m.row : ((findListRowByName(qa, m.old, doc) || {}).row || null);
+    const dlg = await openRenameDialog(qa, row, m.nameEl || getNameElInRow(row), m.old, doc);
+    if (!dlg) { warn(` ⚠️ 改名：未能打开重命名对话框 —— ${m.old}`); return false; }
+
+    const ok = await applyRenameInDialog(qa, dlg, m.old, m.next, doc);
+    if (!ok) {
+      try {
+        const close = dlg.querySelector('.ant-modal-close, .ant-drawer-close');
+        if (close) qa.realClick(close);
+      } catch {}
+      return false;
+    }
+
+    const cur = findListRowByName(qa, m.next, doc);
+    if (cur) return true;
+    const still = findListRowByName(qa, m.old, doc);
+    if (still) { warn(` ⚠️ 改名：弹窗已关闭但列表仍是旧名 —— ${m.old}`); return false; }
+    /* 行可能被虚拟滚动移出可见区；弹窗正常关闭即视为成功 */
+    log(`   ↳ 改名后该行不在可见区，按成功计：${m.next}`);
+    return true;
+  }
+
+  /* 批量改名：把已转存文件改成 [bgm]acg最终名称[bgm]原始文件名
+   * opts.waitMs：单个文件在列表里等待出现的上限（未成功刷新时可缩短，避免白等） */
+  async function applyListRenames(qa, plan, opts = {}) {
+    const doc = opts.doc || document;
+    const waitMs = Number(opts.waitMs) > 0 ? Number(opts.waitMs) : 8000;
+    const entries = Array.isArray(plan) ? plan.filter(x => x && x.old && x.next) : [];
+    if (!entries.length) { log('★ 改名：无需要改名的文件'); return { renamed: 0, failed: 0, skipped: 0, pairs: [] }; }
+
+    log(`★ 改名：待改名 ${entries.length} 个 → ${FILE_NAME_MARKER}acg名称${FILE_NAME_MARKER}原始文件名`);
+    for (const e of entries) log(` - ${e.old}  →  ${e.next}`);
+
+    let renamed = 0, failed = 0, skipped = 0;
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      const loaded = await until(() => findListRowByName(qa, e.old, doc), 200, waitMs);
+      if (!loaded) {
+        warn(` ⚠️ 改名：[${i + 1}/${entries.length}] 列表里找不到该文件，跳过：${e.old}`);
+        skipped++;
+        continue;
+      }
+      const r = await renameOneRow(qa, { row: loaded.row, nameEl: getNameElInRow(loaded.row), old: e.old, next: e.next }, doc);
+      if (r) { renamed++; log(` ✓ 改名 [${i + 1}/${entries.length}] ${e.old} → ${e.next}`); }
+      else { failed++; warn(` ✗ 改名失败 [${i + 1}/${entries.length}] ${e.old}`); }
+      await sleep(250);
+    }
+
+    try { qa.refreshGray(); } catch {}
+    log(`★ 改名完成：成功 ${renamed}，失败 ${failed}，跳过 ${skipped}`);
+    return { renamed, failed, skipped, pairs: [] };
+  }
+
+  /* 改名自检：对当前可见的第一个文件加/改标识符前缀，用于验证改名路径是否可用 */
+  async function runRenameSmokeTest(qa, doc = document) {
+    const files = (qa.scanFileRows(doc) || []).filter(f => f.fid && f.row && !isFolderFile(f));
+    if (!files.length) { alert('当前可见区没有可改名的文件行'); return; }
+
+    const f = files[0];
+    const base = normalizeFileName(f.name);
+    const next = buildRenamedFileName('测试改名', base);
+    if (!next) { alert('难以构造测试文件名'); return; }
+
+    log('=== 改名自检 ===');
+    log(` 当前名：${f.name}`);
+    log(` 目标名：${next}`);
+    const btns = [...doc.querySelectorAll('.btn-group button, button')]
+    .map(b => (b.textContent || '').replace(/\s+/g, '')).filter(Boolean);
+    log(' 页面按钮文本：', btns.join(' | '));
+
+    const rep = await applyListRenames(qa, [{ old: f.name, next }]);
+    if (rep.renamed) {
+      alert(`✅ 改名成功\n\n${f.name}\n→ ${next}\n\n（自检用，验证完可手动改回）`);
+    } else {
+      alert(`❌ 改名失败（成功 ${rep.renamed} / 失败 ${rep.failed} / 跳过 ${rep.skipped}）\n\n请看控制台 [桥接] 日志里的按钮文本与失败原因。`);
+    }
+  }
+
   /* ===== 逐行勾选（虚拟滚动兼容） ===== */
   async function applyTargetChecks(qa, doc, targets, opts = {}) {
     if (!targets || !targets.size) return { ok: true, applied: 0, failed: 0 };
@@ -1633,7 +2127,95 @@
     }
     return true;
   }
-  /* ===== 批量转存 ===== */
+  /* 本次转存结果 → 改名计划（[bgm]acg最终名称[bgm]原始文件名）。
+   * old 一律保留"列表页当前名"原样（applyListRenames 靠它定位行，可能已经带标识符块）。
+   * 同一个原始文件名出现在多个分享、但 acg 最终名称不一致 → 无法判定，跳过不改名。*/
+  function buildRenamePlan(savedByUrl, bd) {
+    const { map: nameByShare, conflict } = collectShareNameMap(bd);
+    const targetByBase = new Map(); // 去标识符后的原始文件名 → acg 最终名称
+    const conflictNames = new Set();
+    let tooLong = 0;
+
+    for (const entry of (Array.isArray(savedByUrl) ? savedByUrl : [])) {
+      if (!entry || !Array.isArray(entry.files) || !entry.files.length) continue;
+      const name = nameByShare.get(entry.url);
+      if (!name) {
+        const why = conflict.has(entry.url) ? `名称冲突（${conflict.get(entry.url)}）` : '清单里没有该分享的最终名称';
+        log(` ★ 改名：跳过 ${entry.url} —— ${why}`);
+        continue;
+      }
+      for (const f of entry.files) {
+        const base = stripMarkerBlock(String(f && f.name || '')).trim();
+        if (!base) continue;
+        if (!buildRenamedFileName(name, base)) { tooLong++; continue; }
+        const prev = targetByBase.get(base);
+        if (prev === undefined) { targetByBase.set(base, name); continue; }
+        if (prev !== name) { targetByBase.delete(base); conflictNames.add(base); }
+      }
+    }
+
+    if (tooLong) {
+      warn(` ⚠️ 改名：${tooLong} 个文件加上 ${FILE_NAME_MARKER}acg名称${FILE_NAME_MARKER} 前缀后超过 250 字节，保留原名不改（如需改名请缩短 acg 名称）`);
+    }
+
+    const out = [];
+    const seenOld = new Set();
+    for (const entry of (Array.isArray(savedByUrl) ? savedByUrl : [])) {
+      for (const f of ((entry && entry.files) || [])) {
+        const oldName = String(f && f.name || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+        if (!oldName || seenOld.has(oldName)) continue;
+        seenOld.add(oldName);
+
+        const base = stripMarkerBlock(oldName).trim();
+        if (conflictNames.has(base)) {
+          log(` ★ 改名：跳过 ${oldName} —— 同名文件对应了不同的 acg 名称`);
+          continue;
+        }
+        const name = targetByBase.get(base);
+        if (!name) continue;
+        const next = buildRenamedFileName(name, base);
+        if (!next) continue;
+        if (!needRename(oldName, name)) continue;
+        out.push({ old: oldName, next });
+      }
+    }
+    return out;
+  }
+
+  /* 改名成功 → 下载记录里那一行也换成新名（fid 不变，不会重复下载）。
+     记录键可能是 fid（夸克助手）或名字（历史遗留键），两种都覆盖；只改命中的那条。
+     整表只读写一次，避免与夸克助手并发整表覆盖；ts 保留原值（不因改名延长 TTL）。*/
+  function refreshDlRecordsAfterRename(pairs) {
+    if (!Array.isArray(pairs) || !pairs.length) return 0;
+    let n = 0;
+
+    const byFid = gmGet(GM_DL_RECORDS, {}) || {};
+    let fidDirty = false;
+    for (const p of pairs) {
+      if (!p || !p.fid) continue;
+      const rec = byFid[p.fid];
+      if (!rec || typeof rec !== 'object') continue;
+      byFid[p.fid] = { ...rec, name: p.next };
+      fidDirty = true;
+      n++;
+    }
+    if (fidDirty) gmSet(GM_DL_RECORDS, byFid);
+
+    const byName = gmGet(GM_QRECORDS, {}) || {};
+    let nameDirty = false;
+    for (const p of pairs) {
+      if (!p || !p.old || !byName[p.old]) continue;
+      byName[p.next] = { ...byName[p.old], name: p.next };
+      delete byName[p.old];
+      nameDirty = true;
+      n++;
+    }
+    if (nameDirty) gmSet(GM_QRECORDS, byName);
+
+    return n;
+  }
+
+  /* 批量转存 */
   async function runSaveAllFlow(qa, pendingUrlsOverride) {
     let pending;
 
@@ -1661,13 +2243,15 @@
 
     if (!pending.length) return;
 
-    try { sessionStorage.setItem(BUSY_KEY, '1'); } catch {}
+    acquireBusy();
     log('★ 已标记桥接忙碌，QuarkAutoAssistant 暂停自动下载');
 
     try {
       qa.setStatus('转存中...', 'running');
       let successCount = 0;
       let partialCount = 0;
+      /* 本次真正转存成功的文件：按来源分享收集，供改名使用 */
+      const savedByUrl = [];
 
       for (let i = 0; i < pending.length; i++) {
         if (qa.isPaused && qa.isPaused()) {
@@ -1714,6 +2298,13 @@
           } else {
             log(`✅ 已记录 ${merged.length} 条到 ${key}`);
           }
+
+          if (Array.isArray(r.savedFiles) && r.savedFiles.length) {
+            savedByUrl.push({
+              url: key,
+              files: r.savedFiles.map(f => ({ name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig })),
+            });
+          }
         } else if (r.kind === 'all-saved') {
           const files = Array.isArray(r.files) ? r.files.join(', ') : '?';
           log(`⏭️ 该 URL 所有文件都已转存（fileCount=${r.fileCount}, files=${files}）: ${url}`);
@@ -1733,18 +2324,70 @@
 
       if (successCount + partialCount > 0) {
         log('★ 有新转存，点击页面内刷新按钮触发列表更新...');
-        try { sessionStorage.removeItem(BUSY_KEY); } catch {}
+        /* 注意：此处不放开 BUSY_KEY —— 刷新和改名期间放开会让夸克助手的 boot 自动下载抢跑 */
         await sleep(500);
 
         const ok = await clickListRefreshAndWait(qa, document, {
           appearedTimeout: 3000,
           settleTimeout: 12000,
         });
+        if (ok) log('✓ 已点击页面内刷新按钮，等待列表更新完成');
+        else warn('⚠️ 未找到页面内刷新按钮：列表可能还是旧行，改名多半会失败（会逐个跳过），最后回退整页重载');
 
-        if (ok) {
-          log('✓ 已点击页面内刷新按钮，等待列表更新完成');
+        /* ===== 刷新完成 → ★ 按 acg 最终名称改名 → 触发下载 ===== */
+        let plan = [];
+        try {
+          plan = buildRenamePlan(savedByUrl, loadBangumiData());
+        } catch (e) { warn('⚠️ 改名计划构建失败', e); }
+
+        if (plan.length && ok) {
+          await waitRowsForRename(qa, plan);
+        } else if (plan.length) {
+          warn(` ★ 改名：未成功刷新，直接在当前列表上尝试改名（找不到的行会跳过）；本次未改名成功的文件不会自动补做`);
+        }
+
+        let renameReport = { renamed: 0, failed: 0, skipped: 0, pairs: [] };
+        if (plan.length) {
+          try {
+            renameReport = await applyListRenames(qa, plan, { waitMs: ok ? 8000 : 1500 });
+          } catch (e) { warn('⚠️ 改名过程异常', e); }
+
+          if (renameReport.renamed > 0) {
+            const reported = new Set();
+            renameReport.pairs = [];
+            for (const e of plan) {
+              if (reported.has(e.old)) continue;
+              reported.add(e.old);
+              const stale = findListRowByName(qa, e.old, document);
+              const hit = findListRowByName(qa, e.next, document);
+              if (hit) renameReport.pairs.push({ fid: hit.fid, old: e.old, next: e.next });
+              else if (stale) warn(` ⚠️ 改名：列表里仍是旧名，未同步下载记录 —— ${e.old}`);
+            }
+            try {
+              const n = refreshDlRecordsAfterRename(renameReport.pairs);
+              if (n) log(` ★ 改名：同步 ${n} 条下载记录到新名`);
+            } catch (e) { warn('⚠️ 同步下载记录失败（不影响下载）', e); }
+          }
         } else {
-          warn('⚠️ 未找到页面内刷新按钮，回退整页重载');
+          log('★ 改名：本次无需改名（无计划或清单里没有对应最终名称）');
+        }
+
+        await sleep(600);
+
+        /* 改名完成，放开忙碌标志后再触发下载 */
+        releaseBusy();
+        if (qa.isPaused && qa.isPaused()) {
+          log('⏸ 夸克助手已暂停，跳过自动下载触发');
+        } else if (typeof qa.autoDownloadWorkflow === 'function') {
+          log('★ 改名后触发下载（autoDownloadWorkflow）...');
+          await qa.autoDownloadWorkflow();
+          log('★ 下载流程已结束');
+        } else {
+          warn('⚠️ quarkAssistant.autoDownloadWorkflow 不可用，无法触发下载');
+        }
+
+        if (!ok) {
+          warn('⚠️ 未找到页面内刷新按钮，回退整页重载（改名已在上方就地完成）');
           await sleep(1000);
           location.reload();
         }
@@ -1752,7 +2395,7 @@
         log('无新转存文件，跳过刷新');
       }
     } finally {
-      try { sessionStorage.removeItem(BUSY_KEY); } catch {}
+      releaseBusy();
     }
   }
 
@@ -2211,8 +2854,13 @@
       qa.setActions([
         {
           label: '▶️ 转存', color: '#09AAFF',
-          title: '处理 pending_urls 或 bangumiData 里的分享，逐条转存',
+          title: '处理 pending_urls 或 bangumiData 里的分享，逐条转存；刷新后按 acg 最终名称改名再触发下载',
           onclick: () => runSaveAllFlow(qa, null),
+        },
+        {
+          label: '🏷️ 测试改名', color: '#da9328',
+          title: '对当前可见的第一个文件试改名（只加标识符前缀，用于验证改名路径）',
+          onclick: () => runRenameSmokeTest(qa),
         },
       ]);
       qa.setStatus('待机（个人页）');

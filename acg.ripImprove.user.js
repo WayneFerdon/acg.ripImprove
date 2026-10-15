@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.3.1
+// @version      1.3.2
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -5404,7 +5404,7 @@ function initAjax() {
  * ===================================================================== */
 if (/^acg\.rip$/i.test(location.hostname)) {
   unsafeWindow.acgripApi = {
-    version: '1.3.1',
+    version: '1.4.0',
 
     /** 读取 bangumiData（含原脚本已写入的 _airDate 字段） */
     getBangumiData: () => getValue('bangumiData'),
@@ -5415,11 +5415,21 @@ if (/^acg\.rip$/i.test(location.hostname)) {
       return getValue('bangumiData');
     },
 
+    /** 最终名称（与面板显示、排序同一口径：中文 > 名称 > BGMID 内嵌），供桥接改名使用 */
+    getDisplayName: (row) => {
+      try {
+        return getDisplayName(row || {}, parseBGMID((row || {}).BGMID));
+      } catch (e) {
+        console.error('[acgripApi] getDisplayName:', e);
+        return '';
+      }
+    },
+
     /** 通用存取：桥接可读写自己的 GM 键，无需引入 GM_* 权限 */
     getValue,
     setValue,
   };
-  console.log('[acgripApi] 已暴露 v1.3.1');
+  console.log('[acgripApi] 已暴露 v1.4.0');
 }
 
 /* =====================================================================

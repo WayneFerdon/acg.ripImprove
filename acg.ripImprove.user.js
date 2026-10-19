@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.3.2
+// @version      1.3.3
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -38,7 +38,7 @@ let inferredTimesCache = {}, _inferredCacheLoaded = false, _inferScannedThisSess
 let inferenceStatus = { phase: 'idle', pending: 0, found: 0, page: 0, message: '', scanning: false };
 const IMPORT_HEADER_ALIASES = {
   '下集':'下集','中文':'中文','名称':'名称','年':'年','开播':'开播','放送':'放送','最大':'最大',
-  '初始':'初始','前季':'前季','更新':'更新','BGMID':'BGMID','资源':'资源','规则':'规则',
+  '初始':'初始','前季':'前季','更新':'更新','BGMID':'BGMID','BGMIDURL':'BGMIDURL','资源':'资源','规则':'规则',
   '延周':'延周','延日':'延日','已下载':'已下载','记录':'已下载',
 };
 let _gmEditRelayout = null;
@@ -108,10 +108,8 @@ function handleGlobalResize() {
     const shouldSplit = vw >= 1400;
 
     if (uiVisible) {
-      // UI 打开：交给内部完整重新布局（含 split class 设置 + 浮标位置）
       if (_gmEditRelayout) _gmEditRelayout();
     } else {
-      // UI 未打开：只调整 split class + 刷新浮标
       if (document.body.classList.contains('acgrip-split') !== shouldSplit) {
         if (shouldSplit) document.body.classList.add('acgrip-split');
         else document.body.classList.remove('acgrip-split');
@@ -127,11 +125,8 @@ window.addEventListener('resize', handleGlobalResize);
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (!IS_ACGRIP_PAGE) return;
-  // 界面已打开时由内部 handler 处理
   if (_gmEditOverlay && _gmEditOverlay.style.display !== 'none') return;
-  // 导入子窗口已打开时由内部处理
   if (document.getElementById('importOverlay')) return;
-  // 其它输入框正在编辑时不干扰
   const ae = document.activeElement;
   if (ae && ae !== document.body && ae !== document.documentElement) {
     const tag = ae.tagName;
@@ -157,7 +152,6 @@ function saveLastData() {
   const viewedVal = (lastViewed != null && !Number.isNaN(url2num(lastViewed))) ? url2num(lastViewed) : '';
   setValue(LAST_KEY, { id: idVal, match: lastDownload ?? '', viewed: viewedVal });
 
-  // 面板打开时同步 last 三个输入框（未手动修改的字段）
   if (_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none'
       && typeof _gmEditOverlay._refreshLastInputs === 'function') {
     _gmEditOverlay._refreshLastInputs();
@@ -223,6 +217,57 @@ function isRuleInferable(key) {
   return true;
 }
 
+/* ===== BGMID 拆分 / 迁移 ===== */
+/* 从粘贴的 HTML 中提取 BGMID 的文本部分和 URL 部分。 */
+function splitBGMIDHtml(html) {
+  if (!html) return { text: '', url: '' };
+  const tmp = document.createElement('div');
+  tmp.innerHTML = String(html);
+  let url = '';
+  const a = tmp.querySelector('a[href]');
+  if (a) url = decodeHtmlEntities(a.getAttribute('href') || '').trim();
+  const parts = [];
+  const walk = (node) => {
+    for (const ch of node.childNodes) {
+      if (ch.nodeType === Node.TEXT_NODE) parts.push(ch.textContent);
+      else if (ch.nodeType === Node.ELEMENT_NODE) {
+        if (ch.tagName === 'BR') parts.push('\n');
+        else walk(ch);
+      }
+    }
+  };
+  walk(tmp);
+  const text = decodeHtmlEntities(parts.join('')).replace(/\s+/g, ' ').trim();
+  return { text, url };
+}
+
+/* 迁移用：旧版本 BGMID 存的是含 <a href> 的 HTML；新版本 BGMID 存纯文本，URL 存 BGMIDURL。 */
+function migrateBGMIDFields(row) {
+  if (!row) return { changed: false, text: '', url: '' };
+  const rawBGMID = String(row.BGMID ?? '');
+  const existingURL = String(row.BGMIDURL ?? '').trim();
+  if (existingURL) {
+    if (/</.test(rawBGMID)) {
+      const { text } = splitBGMIDHtml(rawBGMID);
+      row.BGMID = text;
+      return { changed: true, text, url: existingURL };
+    }
+    return { changed: false, text: rawBGMID.trim(), url: existingURL };
+  }
+  if (!rawBGMID) return { changed: false, text: '', url: '' };
+  if (!/</.test(rawBGMID)) {
+    return { changed: false, text: rawBGMID.trim(), url: '' };
+  }
+  const { text, url } = splitBGMIDHtml(rawBGMID);
+  row.BGMID = text;
+  if (url) row.BGMIDURL = url;
+  return { changed: true, text, url };
+}
+
+/* 行签名比较用的列与数值列。 */
+const CMP_ROW_FIELDS = ['下集','中文','名称','年','开播','放送','最大','初始','前季','更新','BGMID','BGMIDURL','资源','规则','延周','延日','已下载'];
+const CMP_NUMERIC_FIELDS = new Set(['下集', '初始', '最大', '前季']);
+
 /* ===== 修复历史污染 & 数据加载 ===== */
 function repairBangumiRows(bd) {
   if (!Array.isArray(bd.rows)) return false;
@@ -241,7 +286,7 @@ function repairBangumiRows(bd) {
     const existing = Array.isArray(target.已下载) ? target.已下载.slice() : [];
     const incoming = Array.isArray(r.已下载) ? r.已下载.slice() : [];
     target.已下载 = Array.from(new Set([...existing, ...incoming]));
-    for (const f of ['资源','下集','中文','名称','年','开播','放送','最大','初始','前季','更新','BGMID','延周','延日']) {
+    for (const f of ['资源','下集','中文','名称','年','开播','放送','最大','初始','前季','更新','BGMID','BGMIDURL','延周','延日']) {
       const tv = String(target[f] ?? '').trim(), rv = String(r[f] ?? '').trim();
       if (!tv && rv) target[f] = r[f];
     }
@@ -282,13 +327,18 @@ function loadDatas() {
   if (repairBangumiRows(bd)) { migrated = true; setUpdated({ bangumi: 0 }); }
   if (bd.tracking) { delete bd.tracking; migrated = true; }
   if (bd.trackingDownloaded) { delete bd.trackingDownloaded; migrated = true; }
+  /* BGMID 迁移：旧版本 BGMID 存 HTML，新版本 BGMID 存纯文本，URL 单独存 BGMIDURL */
+  for (const r of bd.rows) {
+    const mig = migrateBGMIDFields(r);
+    if (mig.changed) migrated = true;
+  }
   // 用推断缓存回填空的「资源」列（缓存命中过但从未写回存储）
   for (const r of bd.rows) {
     const rule = String(r.规则 || '').trim();
     if (!rule) continue;
-    if (isDHHMM(r.资源)) continue;            // 资源已填，跳过
+    if (isDHHMM(r.资源)) continue;
     const cached = inferredTimesCache[rule];
-    if (isDHHMM(cached)) {                     // 兼容数字或字符串
+    if (isDHHMM(cached)) {
       r.资源 = cached;
       migrated = true;
     }
@@ -356,7 +406,6 @@ function saveBangumiData() {
     if (list) row.已下载 = parseDownloadedToList(list);
   }
   for (const row of bd.rows) cleanRowObject(row);
-  // 为每行预计算播出时间戳 _airDate，供外部脚本复用
   const delayData = (bd.delay && Array.isArray(bd.delay.rows)) ? bd.delay : { rows: [] };
   for (const row of bd.rows) {
     try {
@@ -578,13 +627,11 @@ async function asyncDownloadTorrents() {
         if (done = (url2num(href) <= url2num(last))) return;
         if (!found || isDownloaded(found, href)) return;
 
-        // 命中规则且未下载过就下载，不校验集数
         const bd = getValue('bangumiData') ?? { rows: [] };
         const row = (bd.rows || []).find(r => String(r.规则 || '').trim() === key);
         if (row) {
           const parsed = parseBGMID(row.BGMID);
           const max = Number(parsed.最大) || 0, next = Number(row.下集) || 0;
-          // 已完结兜底：下集已超过最大集则不再补下
           if (max > 0 && next > max) return;
         }
 
@@ -692,21 +739,24 @@ async function autoReload() {
     return (((dd * _1d / _1h + h) * _1h / _1m + m) * _1m / _1s + s) * _1s;
   }
   function getRemain([i, t], current) {
-    // 跨日编码规范化：前一日 24:00~27:59 折算为当日 00:00~03:59
-    const rawDay  = Math.floor(t / digits / digits);     // 1~7
-    const rawHour = Math.floor((t / digits) % digits);   // 0~27
-    const rawMin  = t % digits;                          // 0~59
+    const rawDay  = Math.floor(t / digits / digits);
+    const rawHour = Math.floor((t / digits) % digits);
+    const rawMin  = t % digits;
     let day = rawDay, hour = rawHour;
     if (hour >= 24) {
       hour -= 24;
-      day = day === 7 ? 1 : day + 1;   // 周日 24 点归入下周一 0 点
+      day = day === 7 ? 1 : day + 1;
     }
     const time = (day - 1) * _1d + hour * _1h + rawMin * _1m;
     const delta = time + waitDuration - current;
     return [i, t, delta <= 0 ? time + 7 * _1d + waitDuration - current : delta];
   }
   function findNext(current) {
+    /* 倒计时只针对"规则是纯文本或正则"的条目；
+     * 规则是 URL（分享链接等）的条目即使资源字段里填了 DHHMM 时间，
+     * 也不进入倒计时——它们不是"到期去看 torrent 列表"的规则。 */
     let items = Object.entries(trackingItems)
+    .filter(([k]) => isRuleInferable(k))
     .map(([k, t]) => [k, isDHHMM(t) ? t : (inferredTimes[k] || 0)])
     .filter(([, t]) => t);
     if (!items.length) return null;
@@ -743,8 +793,11 @@ async function autoReload() {
       inferredTimes = { ...inferredTimesCache, ...buildInferredTimesFromCurrentPage() };
       const current = computeCurrent();
       const item = findNext(current);
-      if (item) { [next, nextTime, total] = getRemain(item, current); total = Math.abs(total - waitDuration); continue; }
-      const pendingKeys = Object.keys(trackingItems).filter(k => !isDHHMM(trackingItems[k]) && isRuleInferable(k));
+      if (item) { [next, nextTimeRaw, total] = getRemain(item, current); total = Math.abs(total - waitDuration); continue; }
+      const pendingKeys = [];
+      for (const k of Object.keys(trackingItems)) {
+        if (!isDHHMM(trackingItems[k]) && isRuleInferable(k)) pendingKeys.push(k);
+      }
       const lines = ['@' + last, '（等待调度信息…）'];
       lines.push(`待推断: ${pendingKeys.length} 条 | 已推断: ${Object.keys(inferredTimesCache).length} 条`);
       lines.push(inferenceStatus.message || inferenceStatus.phase);
@@ -823,6 +876,12 @@ function effective(row, key, parsed) {
   if (v !== '' && v != null) return v;
   return parsed?.[key] ?? '';
 }
+/* 最终显示名：中文 > 名称 > 空
+ * 原本定义在 showEditDialog 内部，但 acgripApi.getDisplayName 在模块作用域调用它，
+ * 需提升到模块作用域。面板内的引用全部指向这一份。 */
+function getDisplayName(row, parsed) {
+  return String(effective(row, '中文', parsed) || effective(row, '名称', parsed) || '').trim();
+}
 function parseBGMID(text) {
   if (!text) return {};
   const plain = decodeHtmlEntities(String(text).replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').trim());
@@ -847,6 +906,19 @@ function formatDHHMM(v) {
     return String(newD * 10000 + (hh + 24) * 100 + mm);
   }
   return String(n);
+}
+/* 把 DHHMM 文本的分钟个位替换为资源域名首字母。
+ * 大小写规则：被省去的分钟个位 >= 5 → 大写，否则小写。 */
+function formatDHHMMWithLetter(dhhmmValue, letter) {
+  const formatted = String(formatDHHMM(dhhmmValue) ?? '');
+  if (!formatted) return '';
+  const lastChar = formatted.charAt(formatted.length - 1);
+  const lastDigit = Number(lastChar);
+  if (!Number.isInteger(lastDigit)) return formatted;
+  const initial = String(letter || '');
+  if (!initial) return formatted;
+  const cased = lastDigit >= 5 ? initial.toUpperCase() : initial.toLowerCase();
+  return formatted.slice(0, -1) + cased;
 }
 function isHttpUrl(v) { return /^https?:\/\//i.test(decodeHtmlEntities(String(v ?? '').trim())); }
 function extractDomainLastTwo(url) {
@@ -876,11 +948,45 @@ function getResourceDisplayInfo(row) {
   const rawRes = String(row.资源 ?? '').trim();
   const ruleStr = expandResourceUrl(rawRule, row);
   const resStr = expandResourceUrl(rawRes, row);
-  if (isDHHMM(row.资源)) return { text: formatDHHMM(row.资源), href: '' };
-  if (isHttpUrl(ruleStr)) return { text: extractDomainLastTwo(ruleStr), href: ruleStr };
-  if (isHttpUrl(resStr)) return { text: extractDomainLastTwo(resStr), href: resStr };
-  if (ruleStr) return { text: '-', href: '' };
-  return { text: resStr, href: '' };
+  const resIsTime = isDHHMM(row.资源);
+
+  let url = '';
+  if (isHttpUrl(ruleStr)) url = ruleStr;
+  else if (!resIsTime && isHttpUrl(resStr)) url = resStr;
+  else if (!resIsTime && isHttpUrl(rawRes)) url = rawRes;
+
+  const initialOf = u => {
+    const d = extractDomainLastTwo(u);
+    return d ? String(d).charAt(0) : '';
+  };
+
+  /* highlight 字段含义：
+   *   'last'  → 只高亮文本最后 1 个字符（域名首字母）。表示"资源时间真实存在"。
+   *   'full'  → 整条高亮。表示"资源时间缺失"（用播出时间推算或退回域名文本）。
+   *   ''      → 不高亮。 */
+  if (resIsTime) {
+    const initial = initialOf(url);
+    if (url && initial) return { text: formatDHHMMWithLetter(row.资源, initial), href: url, highlight: 'last' };
+    if (url) return { text: formatDHHMM(row.资源), href: url, highlight: '' };
+    return { text: formatDHHMM(row.资源), href: '', highlight: '' };
+  }
+
+  if (url) {
+    const initial = initialOf(url);
+    if (initial && typeof row._airDate === 'number' && row._airDate > 0) {
+      const d = new Date(row._airDate);
+      if (!isNaN(d.getTime())) {
+        const dh = timeToDHHMM(d.getTime());
+        if (isDHHMM(dh)) {
+          return { text: formatDHHMMWithLetter(dh, initial), href: url, highlight: 'full' };
+        }
+      }
+    }
+    return { text: extractDomainLastTwo(url), href: url, highlight: 'full' };
+  }
+
+  if (ruleStr) return { text: '-', href: '', highlight: '' };
+  return { text: resStr, href: '', highlight: '' };
 }
 function normalizeKai(kai) {
   const n = Number(kai) || 0;
@@ -1032,10 +1138,9 @@ function evalDelayFormula(expr, row) {
 function timeToDHHMM(ms) {
   const d = new Date(ms);
   if (isNaN(d.getTime())) return 0;
-  let day = d.getDay() || 7;       // 1~7
+  let day = d.getDay() || 7;
   let hh = d.getHours();
   const mm = d.getMinutes();
-  // 0:00~3:59 视为前一日 24:00~27:59
   if (hh < 4) {
     hh += 24;
     day = day === 1 ? 7 : day - 1;
@@ -1047,6 +1152,16 @@ function loadInferredCache() {
   if (_inferredCacheLoaded) return;
   _inferredCacheLoaded = true;
   inferredTimesCache = getUpdated().schedule;
+  /* 清理历史脏数据：URL 类型（不可推断）的键不应该出现在推断缓存中。
+   * 旧版本可能往 schedule 里写入过 URL 的 key，会让倒计时误把 URL 当成"下一刷新条目"。 */
+  let dirty = false;
+  for (const k of Object.keys(inferredTimesCache)) {
+    if (!isRuleInferable(k)) {
+      delete inferredTimesCache[k];
+      dirty = true;
+    }
+  }
+  if (dirty) saveInferredCache();
 }
 function saveInferredCache() { setUpdated({ schedule: { ...inferredTimesCache } }); }
 function writeInferredTime(key, val) {
@@ -1081,7 +1196,10 @@ function buildInferredTimesFromCurrentPage() {
 }
 async function buildInferredTimes() {
   let waitCount = 0;
-  while (downloadInProgress && waitCount < 60) await sleep(_1s), waitCount++;
+  while (downloadInProgress && waitCount < 60) {
+    await sleep(_1s);
+    waitCount++;
+  }
   const allPending = Object.keys(trackingItems).filter(k => !isDHHMM(trackingItems[k]) && isRuleInferable(k));
   if (!allPending.length) return { ...inferredTimesCache };
   if (inferenceStatus.scanning || _inferScannedThisSession) {
@@ -1180,13 +1298,11 @@ function syncNextEpisode(key, title) {
 
     if (newNextValue == null) return false;
 
-    // 同步面板（如果打开）
     if (_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none'
         && typeof _gmEditOverlay._syncRowUpdate === 'function') {
       _gmEditOverlay._syncRowUpdate(key, newNextValue);
     }
 
-    // 同步草稿（如果存在），避免下次打开面板读到旧值
     try {
       const draftRaw = localStorage.getItem(DRAFT_KEY);
       if (draftRaw) {
@@ -1308,26 +1424,32 @@ function computeAirTimeText(row, parsed, delayGetter) {
   return `${base} ${pad(displayH)}:${pad(mm)}`;
 }
 const BG_LEVELS = [
-  '#000000', // -1: 空值专用（= 标题栏纯黑），仅由 getBgByLevel(-1) 触发
-  '#121212', // 0: 今天 4:00 之前
-  '#1e1e1e', // 1: 今日已播出
-  '#2a2a2a', // 2: 今日稍后
-  '#363636', // 3: 明天
-  '#424242', // 4: 后天
-  '#4e4e4e', // 5: +3
-  '#5a5a5a', // 6: +4
-  '#666666', // 7: +5
-  '#727272', // 8: +6
-  '#7e7e7e', // 9: 7 天以后 / 未定
+  '#000000',
+  '#121212',
+  '#1e1e1e',
+  '#2a2a2a',
+  '#363636',
+  '#424242',
+  '#4e4e4e',
+  '#5a5a5a',
+  '#666666',
+  '#727272',
+  '#7e7e7e',
 ];
-
-// 空值格的"上一时间段"下限允许到 -1（纯黑）
 const BG_EMPTY_MIN_LEVEL = -1;
+
+function align4(date) {
+  const d = new Date(date);
+  d.setHours(0, 0, 0, 0);
+  if (date.getHours() < 4) d.setDate(d.getDate() - 1);
+  return d;
+}
 
 function getBgLevel(airDate) {
   if (!airDate) return 9;
   const now = new Date();
-  const today4 = new Date(now); today4.setHours(4, 0, 0, 0);
+  const today4 = new Date(align4(now));
+  today4.setHours(4, 0, 0, 0);
   if (now < today4) today4.setDate(today4.getDate() - 1);
   const nowMs = now.getTime();
   const today4Ms = today4.getTime();
@@ -1349,7 +1471,6 @@ function getBgByLevel(level, allowNegative) {
   const minLevel = allowNegative ? -1 : 0;
   if (level < minLevel) level = minLevel;
   if (level > 9) level = 9;
-  // BG_LEVELS 索引 = level + 1（因为多了 -1 项）
   return BG_LEVELS[level + 1];
 }
 
@@ -1394,7 +1515,15 @@ function importTableHtml(html) {
       const mapped = IMPORT_HEADER_ALIASES[headers[j]];
       if (!mapped) continue;
       const cell = cells[j];
-      if (mapped === 'BGMID') obj[mapped] = cell.innerHTML;
+      if (mapped === 'BGMID') {
+        const { text, url } = splitBGMIDHtml(cell.innerHTML);
+        obj.BGMID = text;
+        if (url) obj.BGMIDURL = url;
+      }
+      else if (mapped === 'BGMIDURL') {
+        const u = cell.textContent.trim();
+        if (u) obj.BGMIDURL = u;
+      }
       else if (mapped === '资源') resourceCell = cell;
       else obj[mapped] = cell.textContent.trim();
     }
@@ -1425,11 +1554,12 @@ function cleanPastedHtml(html) {
   walk(tmp);
   return result.join('');
 }
+/* BGMID 现在存纯文本；这个函数只负责把可能的 HTML 转为纯文本。 */
 function cleanBGMID(html) {
   if (!html) return '';
-  const cleaned = cleanPastedHtml(html);
-  if (!cleaned.replace(/\n/g, '').replace(/&nbsp;/g, '').replace(/<[^>]+>/g, '').trim()) return '';
-  return cleaned.trim();
+  const tmp = document.createElement('div');
+  tmp.innerHTML = String(html);
+  return (tmp.textContent || '').replace(/\s+/g, ' ').trim();
 }
 
 /* ===== Bangumi 定时更新 ===== */
@@ -1472,25 +1602,19 @@ function parseBangumiSubject(html, subjectId) {
   }
   const prg = doc.querySelectorAll('.prg_list li');
   for (const ep of prg) { if (ep.classList.contains('subtitle')) break; eps++; }
-  const bgmId = officialUrl
-    ? `<a href="${officialUrl}"><span style="color:#8F8F8F">${subjectId},${bgmName},${bgmTrans},${y},${md},${eps}</span></a>`
-    : `<span style="color:#8F8F8F">${subjectId},${bgmName},${bgmTrans},${y},${md},${eps}</span>`;
-  return { bgmId, bgmName, bgmTrans, y, md, eps, officialUrl };
+  const bgmText = `${subjectId},${bgmName},${bgmTrans},${y},${md},${eps}`;
+  const bgmUrl = officialUrl || '';
+  return { bgmText, bgmUrl, bgmName, bgmTrans, y, md, eps, officialUrl };
 }
 function rowIsEmpty(r) {
   if (!r) return true;
-  const keys = ['下集','中文','名称','年','开播','放送','最大','初始','前季','更新','BGMID','资源','规则','延周','延日','已下载'];
+  const keys = ['下集','中文','名称','年','开播','放送','最大','初始','前季','更新','BGMID','BGMIDURL','资源','规则','延周','延日','已下载'];
   return keys.every(k => {
     const v = r[k];
     if (Array.isArray(v)) return v.length === 0;
     return String(v ?? '').trim() === '';
   });
 }
-/* 行签名比较用的列与数值列。
- * 必须定义在模块作用域：rowCompareKey 会在面板构造期被调用，
- * 若放在 showEditDialog 内部（其后的 const）会触发 TDZ。 */
-const CMP_ROW_FIELDS = ['下集','中文','名称','年','开播','放送','最大','初始','前季','更新','BGMID','资源','规则','延周','延日','已下载'];
-const CMP_NUMERIC_FIELDS = new Set(['下集', '初始', '最大', '前季']);
 async function fetchBangumiHomeIds() {
   const html = await $ajax.fetch('https://bangumi.tv/', null, 'GET');
   const doc = document.implementation.createHTMLDocument('');
@@ -1538,7 +1662,11 @@ async function autoUpdateFromBangumi() {
       let target = null;
       if (bd.rows.length && rowIsEmpty(bd.rows[bd.rows.length - 1])) target = bd.rows[bd.rows.length - 1];
       if (!target) { target = {}; bd.rows.push(target); }
-      Object.assign(target, { 下集: '01', 中文: '', 名称: '', 年: '', 开播: '', 放送: '', 最大: '', 初始: '', 前季: '', 更新: '', BGMID: info.bgmId, 资源: '', 规则: '', 延周: '', 延日: '', 已下载: [] });
+      Object.assign(target, {
+        下集: '01', 中文: '', 名称: '', 年: '', 开播: '', 放送: '', 最大: '', 初始: '', 前季: '', 更新: '',
+        BGMID: info.bgmText, BGMIDURL: info.bgmUrl || '',
+        资源: '', 规则: '', 延周: '', 延日: '', 已下载: [],
+      });
       existingIds.add(id); added++;
     } catch (e) { console.error('fetchBangumiSubject failed:', id, e); }
     await sleep(_1s);
@@ -1563,10 +1691,15 @@ async function autoUpdateQuarter() {
     const missYear = !String(parsed.年 ?? '').trim();
     const missKai = !String(parsed.开播 ?? '').trim();
     const missMax = !String(parsed.最大 ?? '').trim();
-    const missUrl = !extractFirstUrl(r.BGMID);
+    const missUrl = !String(r.BGMIDURL ?? '').trim() && !extractFirstUrl(r.BGMID);
     if (!(missCN || missYear || missKai || missMax || missUrl)) continue;
-    try { const info = await fetchBangumiSubject(bgmId); r.BGMID = info.bgmId; changed = true; }
-    catch (e) { console.error('quarter update failed:', bgmId, e); }
+    try {
+      const info = await fetchBangumiSubject(bgmId);
+      r.BGMID = info.bgmText;
+      if (info.bgmUrl) r.BGMIDURL = info.bgmUrl;
+      else delete r.BGMIDURL;
+      changed = true;
+    } catch (e) { console.error('quarter update failed:', bgmId, e); }
     await sleep(_1s);
   }
   if (changed) setValue('bangumiData', bd);
@@ -1576,7 +1709,6 @@ async function updateFromBangumiSubjectPage() {
   if (!m) return;
   const subjectId = m[1];
 
-  // 复用已有的解析器：从当前页面 HTML 提取最新信息
   const info = parseBangumiSubject(document.documentElement.innerHTML, subjectId);
 
   const bd = getValue('bangumiData');
@@ -1588,8 +1720,10 @@ async function updateFromBangumiSubjectPage() {
     const id = getBgmIdFromBGMID(row.BGMID);
     if (id !== subjectId) continue;
     rowCount++;
-    if (row.BGMID !== info.bgmId) {
-      row.BGMID = info.bgmId;
+    if (row.BGMID !== info.bgmText || (row.BGMIDURL || '') !== (info.bgmUrl || '')) {
+      row.BGMID = info.bgmText;
+      if (info.bgmUrl) row.BGMIDURL = info.bgmUrl;
+      else delete row.BGMIDURL;
       changed = true;
     }
   }
@@ -1598,7 +1732,6 @@ async function updateFromBangumiSubjectPage() {
     setValue('bangumiData', bd);
     console.log('[SubjectPage] 已更新 BGMID', subjectId, `(影响 ${rowCount} 行)`);
     showToast(`已更新条目信息（${rowCount} 行）`);
-    // 若同浏览器其他标签打开了编辑面板，需手动关闭再打开以看到更新
   } else {
     console.log('[SubjectPage] 无需更新', subjectId);
   }
@@ -1633,15 +1766,13 @@ function showEditDialog() {
   const overlay = cE('div');
   overlay.id = 'gmEditOverlay';
   overlay.style.cssText = `position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,0.8);z-index:1000;display:flex;justify-content:center;align-items:center;color-scheme:dark;box-sizing:border-box;`;
-  let hideDialog = () => {};   // 末尾赋值
+  let hideDialog = () => {};
   const dialog = cE('div');
   dialog.style.cssText = `background:#1e1e1e;color:#d4d4d4;padding:12px;border-radius:8px;width:max-content;max-width:calc(100vw - 40px);max-height:calc(100vh - 20px);overflow:hidden;display:flex;flex-direction:column;box-shadow:0 4px 12px rgba(0,0,0,0.6);border:1px solid #333;box-sizing:border-box;`;
   const styleTag = cE('style');
   styleTag.textContent = `
-    /* ---------- 普通列文字颜色 ---------- */
     #gmEditOverlay .u-main-table td:nth-child(6) input,
     #gmEditOverlay .u-main-table td:nth-child(7) input,
-    #gmEditOverlay .u-main-table td:nth-child(8) .u-bgmid,
     #gmEditOverlay .u-main-table td:nth-child(9) input,
     #gmEditOverlay .u-main-table td:nth-child(10) input,
     #gmEditOverlay .u-main-table td:nth-child(11) input,
@@ -1653,57 +1784,52 @@ function showEditDialog() {
     #gmEditOverlay .u-main-table td:nth-child(17) input,
     #gmEditOverlay .u-main-table td:nth-child(18) textarea.u-downloaded { color: #8F8F8F; }
 
-    /* ---------- placeholder ---------- */
     #gmEditOverlay .u-main-table td:nth-child(9) input::placeholder,
     #gmEditOverlay .u-main-table td:nth-child(10) input::placeholder,
     #gmEditOverlay .u-main-table td:nth-child(11) input::placeholder,
     #gmEditOverlay .u-main-table td:nth-child(12) input::placeholder,
     #gmEditOverlay .u-main-table td:nth-child(14) input::placeholder { color: #5a5a5a; }
 
-    /* ---------- 基础主题 ---------- */
     #gmEditOverlay, #gmEditOverlay * { color-scheme: dark; font-size: 12pt; }
     #gmEditOverlay { color:#d4d4d4; }
     #gmEditOverlay h2 { font-size: 15pt; margin: 0 0 6px 0; display:flex; align-items:center; }
     #gmEditOverlay .info-icon { display:inline-block; margin-left:8px; cursor:help; color:#66c6ff; font-size:13pt; user-select:none; }
 
-    /* ---------- 按钮 ---------- */
     #gmEditOverlay button { background:#2d2d2d; color:#d4d4d4; border:1px solid #444; border-radius:4px; cursor:pointer; padding:2px 10px; font-size: 12pt; line-height: 1.3; }
     #gmEditOverlay button:hover { background:#3a3a3a; }
 
-    /* ---------- 输入框 / 下拉框 ---------- */
     #gmEditOverlay input,
     #gmEditOverlay select { background:#252525; color:#d4d4d4; border:1px solid #444; font-size: 12pt; }
     #gmEditOverlay textarea { color:#d4d4d4; border:1px solid #444; font-size: 12pt; }
     #gmEditOverlay input:focus, #gmEditOverlay textarea:focus { outline:1px solid #555; }
     #gmEditOverlay .hint { color:#909090; font-size: 11pt; line-height: 1.5; }
 
-    /* ---------- 主表 ---------- */
     #gmEditOverlay table.u-main-table { border-collapse: collapse; table-layout: fixed; width: max-content; }
     #gmEditOverlay table.u-main-table th {
-      padding:0 2px; border:1px solid #444; background:#000000; color:#cfcfcf;
+      padding:0 2px; border-right:1px solid #444; background:#000000; color:#cfcfcf;
       height:22px; white-space:nowrap; position:sticky; top:0; z-index:10;
       overflow:hidden; text-overflow:ellipsis; font-size: 12pt; line-height: 22px;
     }
-        #gmEditOverlay .divider-row td { border-left: 1px solid #444; }
+    #gmEditOverlay .divider-row td { border-left: 1px solid #444; }
 
-        #gmEditOverlay table.u-main-table thead th:first-child {
+    #gmEditOverlay table.u-main-table thead th:first-child {
       left: 0;
       z-index: 15;
       will-change: transform;
       transform: translateZ(0);
     }
-       #gmEditOverlay table.u-main-table tbody td.u-cell:first-child {
+    #gmEditOverlay table.u-main-table tbody td.u-cell:first-child {
       position: sticky;
       left: 0;
-      z-index: 2;
+      z-index: 3;
       will-change: transform;
       transform: translateZ(0);
     }
-        #gmEditOverlay .divider-row td { padding: 0; }
+    #gmEditOverlay .divider-row td { padding: 0; position: relative; z-index: 1; }
     #gmEditOverlay .divider-row .divider-inner {
       position: sticky;
       left: 0;
-      z-index: 6;
+      z-index: 1;
       display: block;
       width: max-content;
       padding: 2px 8px;
@@ -1715,11 +1841,10 @@ function showEditDialog() {
       transform: translateZ(0);
     }
 
-    /* ---------- 单元格基础 ---------- */
     #gmEditOverlay .u-cell {
       padding:0 1px; border:1px solid #333; height:22px; max-height:22px;
       overflow:hidden; white-space:nowrap; vertical-align:middle; text-overflow:ellipsis;
-      color:#d4d4d4; font-size: 12pt; line-height: 22px; position: relative;
+      color:#d4d4d4; font-size: 12pt; line-height: 22px; position: relative; z-index: 2;
     }
     #gmEditOverlay .u-cell input {
       width:100%; height:20px; line-height:20px; padding:0 1px; box-sizing:border-box;
@@ -1732,7 +1857,6 @@ function showEditDialog() {
     #gmEditOverlay .u-cell input.u-extd.extd-formula {
       font-weight: bold;
     }
-    /* ---------- 名称 / 中文 / 更新列：强制左对齐 ---------- */
     #gmEditOverlay .u-cell input.u-name,
     #gmEditOverlay .u-cell input.u-cn,
     #gmEditOverlay .u-cell input.u-update {
@@ -1753,25 +1877,24 @@ function showEditDialog() {
       unicode-bidi: plaintext !important;
     }
 
-    /* ---------- 高亮：结尾 / 警告 ---------- */
-    /* 结尾（END）：紫色，对应 VBA highLightFontColor(1) = -104775 = #B966FE */
     #gmEditOverlay .hl-end { color: #B966FE !important; font-weight:bold; }
-
-    /* 警告（放送≥24:00、无效开播、EP01）：琥珀色，对应 VBA highLightFontColor(0) = -16727809 = #FFC000 */
     #gmEditOverlay .hl-warn { color: #FFC000 !important; font-weight:bold; }
-
-    /* 输入框 / td 上的 hl-warn（覆盖 CSS 里的 #8F8F8F 默认色） */
     #gmEditOverlay input.hl-warn,
     #gmEditOverlay td.hl-warn input {
       color: #FFC000 !important;
       font-weight: bold !important;
     }
+    #gmEditOverlay .u-res-display a .hl-warn,
+    #gmEditOverlay .u-res-display .hl-warn {
+      color: #FFC000 !important;
+      font-weight: bold !important;
+    }
 
-    /* ---------- 链接 / 默认值 ---------- */
     #gmEditOverlay a { color: inherit !important; text-decoration: underline; }
+    #gmEditOverlay .u-res-display a[href],
+    #gmEditOverlay .u-bgmid-display[href] { cursor: pointer; }
     #gmEditOverlay .from-default { font-weight: bold; }
 
-    /* ---------- 资源列（复合：显示层 + 编辑层） ---------- */
     #gmEditOverlay .u-res-display { cursor:default; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0; }
     #gmEditOverlay .u-res-edit-btn { cursor:pointer; background:none; border:none; padding:0 2px; flex-shrink:0; color:#ccc; font-size: 12pt; line-height: 20px; }
     #gmEditOverlay .u-res-display-layer,
@@ -1784,7 +1907,50 @@ function showEditDialog() {
       background: #1e1e1e; border: 1px solid #4a9eff; padding: 0 2px;
       border-radius: 3px; box-shadow: 0 2px 10px rgba(0,0,0,0.8);
       box-sizing: border-box; height: 22px;
-      /* max-width 由 JS autoResizeEditLayer 动态设置 */
+    }
+    #gmEditOverlay .u-cell.u-combined.u-focus-expand {
+      overflow: visible;
+      z-index: 20;
+    }
+    /* 普通列（名称 raw / 中文 / 更新）聚焦展开：也要解除 overflow，否则 input 溢出部分被裁剪，
+     * 内容短时恰好落在 td 外 → 视觉上完全空白。 */
+    #gmEditOverlay .u-cell.u-focus-expand {
+      overflow: visible;
+      z-index: 20;
+    }
+    #gmEditOverlay .u-cell.u-combined.u-focus-expand .u-res-display-layer {
+      position: absolute;
+      left: 0;
+      top: 0;
+      min-width: 100%;
+      width: max-content;
+      max-width: calc(100vw - 80px);
+      z-index: 30;
+      background: #1e1e1e;
+      border: 1px solid #4a9eff;
+      border-radius: 3px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.8);
+      box-sizing: border-box;
+      height: auto;
+      overflow: visible;
+      padding: 2px 4px;
+      display: flex;
+      flex-direction: row;
+      align-items: flex-start;
+      gap: 4px;
+    }
+    #gmEditOverlay .u-cell.u-combined.u-focus-expand .u-res-display-layer > .u-res-display,
+    #gmEditOverlay .u-cell.u-combined.u-focus-expand .u-res-display-layer > .u-res-display a {
+      white-space: pre-wrap;
+      word-break: break-all;
+      overflow: visible;
+      text-overflow: clip;
+      cursor: text;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
+    #gmEditOverlay .u-cell.u-combined.u-focus-expand .u-res-display-layer > a.u-res-display[href] {
+      cursor: pointer;
     }
     #gmEditOverlay .u-res-edit-layer input {
       height:20px; line-height:20px; padding:0 2px; box-sizing:border-box;
@@ -1794,15 +1960,40 @@ function showEditDialog() {
     #gmEditOverlay .u-res-edit-layer input.u-res { width:60px; flex-shrink:0; }
     #gmEditOverlay .u-res-edit-layer input.u-rule { flex:1; min-width:0; }
 
-    /* ---------- 编辑态展开：input / textarea / contenteditable ---------- */
+    /* ===== BGMID 复合单元格（文本 + URL） ===== */
+    #gmEditOverlay .c-bgmid.u-combined { position: relative; }
+    #gmEditOverlay .c-bgmid .u-res-display-layer { display:flex; align-items:center; gap:2px; height:100%; width:100%; }
+    #gmEditOverlay .c-bgmid .u-bgmid-display {
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+      flex: 1; min-width: 0;
+      color: inherit;
+      text-decoration: underline;
+    }
+    #gmEditOverlay .c-bgmid .u-bgmid-display:not([href]) {
+      text-decoration: none;
+      cursor: default;
+    }
+    #gmEditOverlay .c-bgmid.editing .u-bgmid-edit-layer {
+      position: absolute; left: 0; top: 0; min-width: 260px; z-index: 30;
+      background: #1e1e1e; border: 1px solid #4a9eff; padding: 4px;
+      border-radius: 3px; box-shadow: 0 2px 10px rgba(0,0,0,0.8);
+      box-sizing: border-box;
+      display: flex; flex-direction: column; gap: 4px;
+    }
+    #gmEditOverlay .c-bgmid .u-bgmid-text-input,
+    #gmEditOverlay .c-bgmid .u-bgmid-url-input {
+      width: 100%; box-sizing: border-box;
+      height: 20px; line-height: 20px; padding: 0 2px;
+      border: 1px solid #444; background: #252525; color: #d4d4d4; font-size: 12pt; font-family: inherit;
+    }
+
     #gmEditOverlay .u-cell.editing-expand {
       overflow: visible;
       z-index: 20;
     }
     #gmEditOverlay .u-cell.editing-expand input,
     #gmEditOverlay .u-cell.editing-expand select,
-    #gmEditOverlay .u-cell.editing-expand .u-bgmid,
-    #gmEditOverlay .u-cell.u-focus-expand .u-bgmid {
+    #gmEditOverlay .u-cell.u-focus-expand input {
       position: absolute;
       right: 0;
       left: auto;
@@ -1825,6 +2016,31 @@ function showEditDialog() {
       text-overflow: clip;
       white-space: pre-wrap;
       word-break: break-all;
+    }
+    /* 名称 / 中文 / 更新：聚焦时展开为完整宽度（非编辑态） */
+    #gmEditOverlay .u-cell.u-focus-expand input.u-name,
+    #gmEditOverlay .u-cell.u-focus-expand input.u-cn,
+    #gmEditOverlay .u-cell.u-focus-expand input.u-update {
+      position: absolute;
+      right: 0;
+      left: auto;
+      top: 0;
+      height: auto;
+      min-height: 22px;
+      background: #1e1e1e;
+      border: 1px solid #4a9eff;
+      border-radius: 3px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.8);
+      box-sizing: border-box;
+      padding: 2px 4px;
+      z-index: 30;
+      color: #d4d4d4;
+      font-size: 12pt;
+      font-family: inherit;
+      outline: none;
+      overflow: hidden;
+      text-overflow: clip;
+      white-space: pre;
     }
     #gmEditOverlay .u-cell.c-bgmid { overflow: visible; }
     #gmEditOverlay .u-cell.editing-expand textarea {
@@ -1850,32 +2066,10 @@ function showEditDialog() {
       font-size: 12pt;
       font-family: inherit;
       outline: none;
-      /* 宽度/最大宽度由 JS autoResizeTextarea 动态设置 */
-    }
-    #gmEditOverlay .u-cell.editing-expand .u-bgmid {
-      display: block;
-      white-space: pre-wrap;
-      word-break: break-all;
-      overflow: auto;
-      text-overflow: clip;
-      height: auto;
-      min-height: 22px;
-      max-height: 40vh;
-      /* 宽度/最大宽度由 JS autoResizeInput 动态设置 */
     }
 
-    /* ---------- BGMID contenteditable ---------- */
-    #gmEditOverlay .u-bgmid {
-      min-height:20px; max-height:20px; overflow:hidden;
-      padding:0 1px; line-height:20px; white-space:nowrap; outline:none;
-      box-sizing:border-box; text-overflow:ellipsis; color:#d4d4d4; font-size: 12pt;
-    }
-    #gmEditOverlay .u-bgmid:focus { background:#2f2f2f; }
-
-    /* ---------- 分隔行 ---------- */
     #gmEditOverlay .divider-row td { user-select:none; color:#cfcfcf; font-weight:bold; font-size: 12pt; }
 
-    /* ---------- 行选中轮廓 ---------- */
     #gmEditOverlay tr.row-selected .u-cell:first-child { box-shadow: inset 2px 0 0 0 #4a9eff; }
     #gmEditOverlay tr.row-selected.sel-top .u-cell:first-child { box-shadow: inset 2px 0 0 0 #4a9eff, inset 0 2px 0 0 #4a9eff; }
     #gmEditOverlay tr.row-selected.sel-bottom .u-cell:first-child { box-shadow: inset 2px 0 0 0 #4a9eff, inset 0 -2px 0 0 #4a9eff; }
@@ -1887,24 +2081,46 @@ function showEditDialog() {
     #gmEditOverlay tr.row-selected.sel-top .u-cell:not(:first-child):not(:last-child) { box-shadow: inset 0 2px 0 0 #4a9eff; }
     #gmEditOverlay tr.row-selected.sel-bottom .u-cell:not(:first-child):not(:last-child) { box-shadow: inset 0 -2px 0 0 #4a9eff; }
     #gmEditOverlay tr.row-selected.sel-top.sel-bottom .u-cell:not(:first-child):not(:last-child) { box-shadow: inset 0 2px 0 0 #4a9eff, inset 0 -2px 0 0 #4a9eff; }
-    /* ---------- 展示列聚焦样式 ---------- */
     #gmEditOverlay .u-cell.c-disp:focus,
     #gmEditOverlay .u-cell.c-total:focus,
     #gmEditOverlay .u-cell.c-air:focus {
       outline: 1px solid #4a9eff;
       outline-offset: -2px;
     }
-
-    /* ---------- 列宽 ---------- */
-    #gmEditOverlay .u-main-table th:nth-child(1), #gmEditOverlay .u-main-table td:nth-child(1) { width: 220px !important; min-width: 220px !important; max-width: 220px !important; }
+    /* 首列（名称 display）聚焦浮层：显示完整名称（通常被 ellipsis 截断） */
+    #gmEditOverlay .u-cell.c-disp.u-focus-expand {
+      overflow: visible;
+      z-index: 20;
+    }
+    #gmEditOverlay .u-disp-float {
+      position: absolute;
+      left: 0;
+      top: 0;
+      z-index: 30;
+      background: #1e1e1e;
+      border: 1px solid #4a9eff;
+      border-radius: 3px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.8);
+      padding: 2px 4px;
+      min-width: 100%;
+      width: max-content;
+      overflow: visible;
+      white-space: pre-wrap;
+      word-break: break-all;
+      font-size: 12pt;
+      font-family: inherit;
+      color: #d4d4d4;
+      box-sizing: border-box;
+      line-height: 1.4;
+    }
+    #gmEditOverlay .u-main-table th:nth-child(1), #gmEditOverlay .u-main-table td:nth-child(1) { width: 210px !important; min-width: 210px !important; max-width: 210px !important; }
     #gmEditOverlay .u-main-table th:nth-child(2), #gmEditOverlay .u-main-table td:nth-child(2) { width: 73px !important; max-width: 73px !important; }
     #gmEditOverlay .u-main-table th:nth-child(5), #gmEditOverlay .u-main-table td:nth-child(5) { width: 135px !important; max-width: 135px !important; }
-    #gmEditOverlay .u-main-table th:nth-child(8), #gmEditOverlay .u-main-table td:nth-child(8) { width: 90px !important; max-width: 90px !important; }
+    #gmEditOverlay .u-main-table th:nth-child(8), #gmEditOverlay .u-main-table td:nth-child(8) { width: 100px !important; min-width: 100px !important; max-width: 100px !important; }
     #gmEditOverlay .u-main-table th:nth-child(9), #gmEditOverlay .u-main-table td:nth-child(9) { width: 64px !important; max-width: 64px !important; }
     #gmEditOverlay .u-main-table th:nth-child(12), #gmEditOverlay .u-main-table td:nth-child(12),
     #gmEditOverlay .u-main-table th:nth-child(13), #gmEditOverlay .u-main-table td:nth-child(13) { min-width: 46px !important; }
 
-    /* ---------- 记录列 textarea ---------- */
     #gmEditOverlay .u-cell textarea.u-downloaded {
       width: 100%;
       height: 20px;
@@ -1948,13 +2164,10 @@ function showEditDialog() {
       white-space: pre;
       z-index: 30;
       text-align: left;
-      /* 宽度/最大宽度由 JS autoResizeTextarea 动态设置 */
     }
-    /* ---------- 临时编辑过的格子：深蓝背景 ---------- */
     #gmEditOverlay .u-cell.cell-temp-edited { background: #1a2f5a !important; }
     #gmEditOverlay .u-cell.cell-temp-edited textarea.u-downloaded { background: transparent !important; }
 
-    /* ---------- last 表 ---------- */
     #gmEditOverlay #lastTableHost { background:#242424; border:1px solid #3a3a3a; border-radius:4px; padding:6px 8px; }
     #gmEditOverlay #lastTableHost table { border-collapse:collapse; width:100%; }
     #gmEditOverlay #lastTableHost th { background:#2a2a2a; color:#cfcfcf; border:1px solid #444; padding:2px 6px; font-size:12pt; text-align:left; }
@@ -1962,7 +2175,6 @@ function showEditDialog() {
     #gmEditOverlay #lastTableHost input.last-temp-edited {
       background: #1a2f5a !important;
     }
-    /* ---------- 延周表 ---------- */
     #gmEditOverlay #delayTableHost { background:#1a1a1a; border:1px solid #3a3a3a; }
     #gmEditOverlay #delayTableHost th { background:#2a2a2a !important; color:#cfcfcf !important; border:1px solid #444 !important; padding: 2px 4px; }
     #gmEditOverlay #delayTableHost td { background:#1f1f1f !important; border:1px solid #333 !important; padding: 2px 4px; }
@@ -1973,11 +2185,6 @@ function showEditDialog() {
       font-weight: bold !important;
       background: #2a2418 !important;
     }
-    /* ---------- 滚动条 ---------- *//*
-    #gmEditOverlay ::-webkit-scrollbar { width:12px; height:12px; }
-    #gmEditOverlay ::-webkit-scrollbar-track { background:#1a1a1a; }
-    #gmEditOverlay ::-webkit-scrollbar-thumb { background:#3a3a3a; border-radius:6px; }*/
-    /* ---------- 并排模式：原页面收缩到左半，UI 占右半 ---------- */
     body.acgrip-split { overflow-x: hidden !important; }
     body.acgrip-split > header.navbar,
     body.acgrip-split > header.navbar > .container,
@@ -1994,6 +2201,22 @@ function showEditDialog() {
       padding-left: 12px !important;
       padding-right: 12px !important;
     }
+    #unifiedTableHost::-webkit-scrollbar { display: none; width: 0; height: 0; }
+    /* 展开态 td 提升合成层与 z-index，避免下一行 sticky td 遮挡浮层 */
+    #gmEditOverlay table.u-main-table tbody td.u-cell.u-focus-expand,
+    #gmEditOverlay table.u-main-table tbody td.u-cell.editing-expand {
+      z-index: 50 !important;
+      transform: translateZ(0);
+      will-change: transform;
+    }
+    #gmEditOverlay .u-disp-float,
+    #gmEditOverlay .u-cell.u-focus-expand .u-res-display-layer,
+    #gmEditOverlay .u-cell.editing-expand .u-res-edit-layer,
+    #gmEditOverlay .u-cell.editing-expand .u-bgmid-edit-layer,
+    #gmEditOverlay .u-cell.u-focus-expand > input,
+    #gmEditOverlay .u-cell.u-focus-expand > textarea {
+      transform: translateZ(0);
+    }
   `;
   dialog.appendChild(styleTag);
 
@@ -2004,6 +2227,7 @@ function showEditDialog() {
         <h2 style="flex-shrink:0;">编辑数据<span class="info-icon" title="资源/规则列：@ 表示当前下集（1、2、10、101），@@ 表示补零两位（01、02、10、101）。
 延日列：支持算式与函数，@ 表示当前下集数字。如 @*2、@+7、@-5；
 或 =SUM((@&gt;={8,10,12,14,16})*-1) 表示下集达到 8,10,12,14,16 时各提前 1 天，并累计。
+BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进入编辑，可分别填写文本与 URL。粘贴含链接的富文本时会自动拆到两个 input。
 开播列：输入 &lt;100 的数字视为月份，自动转换为该月 1 号（如 10 → 1001）。
 
 快捷键：
@@ -2030,7 +2254,7 @@ function showEditDialog() {
       <button type="button" id="openAiredResourceBtn" title="打开所有播出时间已过、且有资源链接的条目">已播出</button>
     </div></h2>
 <div id="gmEditScroll" style="flex:1;min-height:0;min-width:0;overflow-y:auto;overflow-x:hidden;margin-top:6px;display:flex;flex-direction:column;">
-            <div id="unifiedTableHost" style="border:1px solid #333;background:#1a1a1a;box-sizing:border-box;width:100%;flex:1 0 auto;min-width:0;min-height:0;overflow:auto;"></div>
+            <div id="unifiedTableHost" style="border:1px solid #333;background:#1a1a1a;box-sizing:border-box;width:100%;flex:1 0 auto;min-width:0;min-height:0;overflow-y:auto;overflow-x:hidden;scrollbar-width:none;-ms-overflow-style:none;"></div>
       <div style="margin-top:10px;border:1px solid #3a3a3a;border-radius:4px;padding:6px 8px;background:#242424;box-sizing:border-box;width:100%;flex-shrink:0;">
         <div style="margin-bottom:10px;padding-bottom:8px;border-bottom:1px dashed #3a3a3a;">
           <label><strong>延周计算</strong>：</label>
@@ -2059,7 +2283,6 @@ function showEditDialog() {
   dialog.appendChild(form);
   overlay.appendChild(dialog);
   document.body.appendChild(overlay);
-  /* ===== last 三个输入框的临时修改跟踪 ===== */
   const inpLastViewed = dialog.querySelector('#inpLastViewed');
   const inpLast = dialog.querySelector('#inpLast');
   const inpLastDownload = dialog.querySelector('#inpLastDownload');
@@ -2099,17 +2322,48 @@ function showEditDialog() {
     }
   };
   const host = dialog.querySelector('#unifiedTableHost');
+  const _activeFloats = new Set();
+  let _floatPadRafPending = false;
+  function _recomputeFloatPad() {
+    if (_floatPadRafPending) return;
+    _floatPadRafPending = true;
+    requestAnimationFrame(() => {
+      _floatPadRafPending = false;
+      const hostEl = document.getElementById('unifiedTableHost');
+      if (!hostEl) return;
+      const hostRect = hostEl.getBoundingClientRect();
+      const curPad = parseInt(hostEl.style.paddingBottom, 10) || 0;
+      /* 基于"去掉当前 padding 的内容底边"计算，避免上一次的 padding 影响本次结果 */
+      const contentBottom = hostRect.bottom - curPad;
+      let maxPad = 0;
+      for (const el of [..._activeFloats]) {
+        if (!el || !el.isConnected) { _activeFloats.delete(el); continue; }
+        /* 只统计仍处于展开/编辑态的 td 内的浮层，避免切换格子时旧浮层残留干扰 */
+        const ownerTd = el.closest('td.u-cell');
+        if (ownerTd && !ownerTd.classList.contains('u-focus-expand') &&
+            !ownerTd.classList.contains('editing-expand')) {
+          _activeFloats.delete(el);
+          continue;
+        }
+        const r = el.getBoundingClientRect();
+        if (!r.width && !r.height) continue;
+        const overflow = r.bottom - contentBottom;
+        if (overflow > maxPad) maxPad = overflow;
+      }
+      const target = maxPad > 0 ? Math.ceil(maxPad + 12) : 0;
+      if (target !== curPad) {
+        hostEl.style.paddingBottom = target > 0 ? target + 'px' : '';
+      }
+    });
+  }
   const tbody = cE('tbody');
   const delayHost = dialog.querySelector('#delayTableHost');
   const delayTbody = cE('tbody');
-  /* ===== 快照基准：以存储中的行为准，草稿里的行与之对比 ===== */
   const storedRowsForBaseline = (() => {
     const bd = getValue('bangumiData');
     return (bd && Array.isArray(bd.rows)) ? bd.rows : [];
   })();
 
-  /* 打开面板时存储里已有的行（身份键 + 内容签名）。
-   * 供"立即更新/立即匹配"补行时区分：基线里没有的才算新增行；基线里有而面板里没有的是用户删的，不补回。 */
   const baselineRowKeys = (() => {
     const ids = new Set(), content = new Set();
     for (const r of storedRowsForBaseline) {
@@ -2119,8 +2373,6 @@ function showEditDialog() {
     return { ids, content };
   })();
 
-  /* 本次面板会话中已经补进表格的存储行。
-   * 只按"存储侧"的稳定键记录，避免补进来的行被编辑后重复追加。 */
   const appendedStoredRowKeys = new Set();
 
   const storedIndex = (() => {
@@ -2139,14 +2391,12 @@ function showEditDialog() {
   })();
 
   const EMPTY_SNAPSHOT = {
-    资源: '', 规则: '', 下集: '', 延周: '', 延日: '', BGMID: '',
+    资源: '', 规则: '', 下集: '', 延周: '', 延日: '', BGMID: '', BGMIDURL: '',
     名称: '', 中文: '', 年: '', 开播: '', 放送: '', 最大: '',
     更新: '', 初始: '', 前季: '', 已下载: '[]',
   };
 
-  /** 存储基准快照：按 BGMID、规则、中文、名称 的顺序匹配；找不到返回空快照 */
   function storedRowSnapshot(row) {
-    // BGMID 的 id 最稳定，优先
     const id = getBgmIdFromBGMID(String(row.BGMID ?? ''));
     if (id && storedIndex.has('id:' + id)) return snapshotRowValues(storedIndex.get('id:' + id));
     const rule = String(row.规则 ?? '').trim();
@@ -2163,6 +2413,7 @@ function showEditDialog() {
     measureCtx.font = font;
     return measureCtx.measureText(text || '').width;
   }
+  /* 参考历史版本 1.3.2：逗号后插入换行，实现聚焦态多行展示。 */
   function setBgmidMultiline(div, expand) {
     if (!div) return;
     if (expand) {
@@ -2183,7 +2434,52 @@ function showEditDialog() {
       delete div.dataset.multilineExpanded;
     }
   }
-  let selAnchorTr = null;    // 唯一的锚点：Shift 系列的固定端
+
+  /* 展开态浮层宽度自适应（参考 1.3.2）。
+   * - containerRight 用 clientWidth 排除滚动条
+   * - 最小宽度 = 列宽；内容宽度 + 按钮 + 缓冲超界则自动换行
+   * - textEl 用 flex: 1 1 auto 允许收缩换行
+   */
+  function autoResizeFloatingText(layer, textEl) {
+    if (!layer || !textEl) return;
+    const container = layer.closest('#unifiedTableHost') || layer.closest('#gmEditOverlay') || document.body;
+    const cRect = container.getBoundingClientRect();
+    const containerRight = cRect.left + container.clientWidth;
+    const td = layer.closest('td');
+    const tdRect = td ? td.getBoundingClientRect() : layer.getBoundingClientRect();
+    const availRight = Math.max(100, containerRight - tdRect.left - 8);
+
+    const clone = document.createElement('span');
+    clone.textContent = textEl.textContent || '';
+    const cs = getComputedStyle(textEl);
+    Object.assign(clone.style, {
+      position: 'absolute', visibility: 'hidden', pointerEvents: 'none',
+      top: '-9999px', left: '0',
+      width: 'max-content', minWidth: '0', maxWidth: 'none',
+      padding: '0', border: '0', boxSizing: 'border-box',
+      whiteSpace: 'pre-wrap', wordBreak: 'break-all', overflow: 'visible',
+      fontFamily: cs.fontFamily, fontSize: cs.fontSize, fontWeight: cs.fontWeight,
+      fontStyle: cs.fontStyle, lineHeight: cs.lineHeight || '1.4',
+    });
+    document.body.appendChild(clone);
+    void clone.offsetWidth;
+    const measuredW = clone.getBoundingClientRect().width;
+    clone.remove();
+
+    const btn = layer.querySelector('.u-res-edit-btn');
+    const btnW = btn ? Math.max(16, Math.ceil(btn.getBoundingClientRect().width)) : 20;
+    /* +4 额外留白 */
+    const extraW = btnW + 4 + 4 + 2 + 4;
+
+    const targetW = Math.min(availRight, Math.max(tdRect.width, Math.ceil(measuredW) + extraW));
+    layer.style.setProperty('width', targetW + 'px', 'important');
+    layer.style.setProperty('max-width', availRight + 'px', 'important');
+    layer.style.setProperty('box-sizing', 'border-box', 'important');
+    textEl.style.setProperty('flex', '1 1 auto', 'important');
+    textEl.style.setProperty('min-width', '0', 'important');
+  }
+
+  let selAnchorTr = null;
   let selDragging = false;
   let refreshTimer = null;
   let pendingEditMode = false;
@@ -2194,7 +2490,6 @@ function showEditDialog() {
   function scheduleDraftSave() {
     if (_suppressDraft) return;
 
-    // 同步判断状态，立即刷新按钮（不先亮后灰）
     try {
       const rows = collectUnifiedRows();
       const delay = collectDelayData();
@@ -2235,33 +2530,30 @@ function showEditDialog() {
     return out;
   }
 
-  /* 行内容签名：判断"删除行 / 新增行 / 数据被临时更改"。
-   * 面板与已保存的 bangumiData 用同一套规范化规则，且只比较已知列，避免派生字段误判。
-   * 依赖的 CMP_ROW_FIELDS / CMP_NUMERIC_FIELDS 在模块作用域（本函数会在面板构造期被调用）。 */
   function rowCompareKey(r) {
     const src = r || {};
-    const bgm = cleanBGMID(src.BGMID ?? '');
+    const bgm = String(src.BGMID ?? '').trim();
+    const bgmUrl = String(src.BGMIDURL ?? '').trim();
     const parsed = parseBGMID(bgm);
     const parts = [];
     for (const k of CMP_ROW_FIELDS) {
       let v;
       if (k === 'BGMID') v = bgm;
+      else if (k === 'BGMIDURL') v = bgmUrl;
       else if (k === '已下载') v = parseDownloadedToList(src[k]).join(',');
       else {
         v = String(src[k] ?? '').trim();
-        /* 与保存逻辑一致：等于 BGMID 派生默认值的字段按空处理 */
         const def = String(parsed[k] ?? '').trim();
         if (def && v === def) v = '';
         if (v !== '' && CMP_NUMERIC_FIELDS.has(k)) {
           const n = Number(v);
-          if (Number.isFinite(n)) v = String(n);   // '01' 与 '1' 视为同一值
+          if (Number.isFinite(n)) v = String(n);
         }
       }
       parts.push(k + '=' + v);
     }
     return parts.join('\u0001');
   }
-  /* 顺序无关（面板会 sortMainRows，顺序差异不算数据改动） */
   function rowsCompareSignature(rows) {
     return (Array.isArray(rows) ? rows : [])
     .filter(r => !rowIsEmpty(r))
@@ -2272,19 +2564,16 @@ function showEditDialog() {
 
   function hasAnyChange(panelRows, panelDelay, panelLast) {
     try {
-      // 1. 任何格子有 cell-temp-edited 即有变化
       for (const tr of tbody.children) {
         if (!tr._row) continue;
         for (const td of tr.children) {
           if (td.classList && td.classList.contains('cell-temp-edited')) return true;
         }
       }
-      // 2. last 三个输入框有 last-temp-edited 即有变化
       for (const sel of ['#inpLast', '#inpLastDownload', '#inpLastViewed']) {
         const inp = dialog.querySelector(sel);
         if (inp && inp.classList && inp.classList.contains('last-temp-edited')) return true;
       }
-      // 3. delay 与存储比对
       const bd = getValue('bangumiData') ?? {};
       const storedDelay = bd.delay || { rows: [] };
       const delayNorm = (d) => JSON.stringify({
@@ -2296,7 +2585,6 @@ function showEditDialog() {
         })),
       });
       if (delayNorm(panelDelay) !== delayNorm(storedDelay)) return true;
-      // 4. 行集合与存储比对：删除行 / 新增行 / 导入 / 任意数据改动
       const storedRows = Array.isArray(bd.rows) ? bd.rows : [];
       const curRows = (Array.isArray(panelRows) && panelRows.length) ? panelRows : collectUnifiedRows();
       if (rowsCompareSignature(curRows) !== rowsCompareSignature(storedRows)) return true;
@@ -2312,7 +2600,6 @@ function showEditDialog() {
   function flushDraftSave() {
     if (draftSaveTimer) { clearTimeout(draftSaveTimer); draftSaveTimer = null; }
     try {
-      // 先刷新格子标记（保证与 row 状态同步）
       for (const tr of tbody.children) {
         if (tr._row) refreshTempEditedMark(tr);
       }
@@ -2325,7 +2612,6 @@ function showEditDialog() {
         viewed: dialog.querySelector('#inpLastViewed').value,
       };
 
-      // 与存储对比：无变化则清草稿并置灰按钮
       if (!hasAnyChange(rows, delay, last)) {
         try { localStorage.removeItem(DRAFT_KEY); } catch {}
         setDiscardBtnEnabled(false);
@@ -2472,8 +2758,6 @@ function showEditDialog() {
     delayData.rows.push({ 名称: '', 排除: '', episodes: [], weeks: [] });
     buildDelayTable(); renderDelayTable(); scheduleRefresh();
   });
-  /* 立即更新 / 立即匹配：把存储里的最新数据刷新到面板表格。
-   * 不整体重建面板（重建会丢掉未保存的编辑），只补进新增行并重算显示。 */
   function rowIdentityKeysOf(row) {
     const keys = [];
     const id = getBgmIdFromBGMID(String((row && row.BGMID) ?? ''));
@@ -2486,15 +2770,13 @@ function showEditDialog() {
     if (nm) keys.push('nm:' + nm);
     return keys;
   }
-  /** 把 bangumiData 中"面板打开后新增"的行补进表格，返回新增条数。
-   * 只补新行，不动已有行（避免覆盖未保存的编辑 / 把用户删掉的行复活）。 */
   function appendMissingRowsFromStorage() {
     const bd = getValue('bangumiData');
     const rows = (bd && Array.isArray(bd.rows)) ? bd.rows : [];
     if (!rows.length) return 0;
 
-    const presentIds = new Set();       // 面板已有行的身份键
-    const presentContent = new Set();   // 面板已有行的内容签名
+    const presentIds = new Set();
+    const presentContent = new Set();
     for (const tr of tbody.children) {
       if (!tr._row) continue;
       for (const k of rowIdentityKeysOf(tr._row)) presentIds.add(k);
@@ -2506,16 +2788,12 @@ function showEditDialog() {
       if (rowIsEmpty(r)) continue;
       const keys = rowIdentityKeysOf(r);
       const contentKey = rowCompareKey(r);
-      /* 存储侧的稳定键：行身份键，没有身份键时用内容签名 */
       const storedKey = keys.length ? keys.join('\u0004') : contentKey;
-      /* ③ 本次会话已经补过这一行，跳过（防止补进来后被编辑导致重复） */
       if (appendedStoredRowKeys.has(storedKey)) continue;
-      /* ① 基线里就有：面板里没有只能是用户删的，不补回 */
       const inBaseline = keys.length
         ? keys.some(k => baselineRowKeys.ids.has(k))
         : baselineRowKeys.content.has(contentKey);
       if (inBaseline) continue;
-      /* ② 面板里已经在显示，跳过（没有身份键的行按内容比对，避免重复追加） */
       const already = keys.length
         ? keys.some(k => presentIds.has(k))
         : presentContent.has(contentKey);
@@ -2530,12 +2808,11 @@ function showEditDialog() {
     if (added) sortMainRows();
     return added;
   }
-  /** 立即更新 / 立即匹配 之后刷新表格显示 */
   function refreshDialogTableDisplay() {
     try {
       appendMissingRowsFromStorage();
       for (const tr of tbody.querySelectorAll('tr')) if (tr._row) updateDerived(tr);
-      scheduleRefresh();   // 内部还会做 ensureTrailingEmpty / 列宽 / 高亮 / 草稿同步
+      scheduleRefresh();
     } catch (e) { console.error('刷新表格显示失败', e); }
   }
 
@@ -2547,7 +2824,7 @@ function showEditDialog() {
     if (btn) btn.disabled = true;
     showToast('正在从 Bangumi 更新…');
     try {
-      setUpdated({ bangumi: 0 });            // 清掉 24h 计时，使本次立即执行
+      setUpdated({ bangumi: 0 });
       await autoUpdateFromBangumi();
       refreshDialogTableDisplay();
       showToast('更新完成');
@@ -2600,7 +2877,6 @@ function showEditDialog() {
     }
     return { rows };
   }
-  /** 高亮延周表中名称在主表格里找不到对应「最终显示名」的条目 */
   function updateDelayNameHighlight() {
     const validNames = new Set();
     for (const tr of tbody.children) {
@@ -2621,9 +2897,6 @@ function showEditDialog() {
     }
   }
 
-  function getDisplayName(row, parsed) {
-    return String(effective(row, '中文', parsed) || effective(row, '名称', parsed) || '').trim();
-  }
   function lookupDelay(row, parsed) {
     const keys = [String(effective(row, '中文', parsed) || '').trim(), String(effective(row, '名称', parsed) || '').trim()].filter(Boolean);
     if (!keys.length) return { total: 0, matched: false };
@@ -2686,8 +2959,6 @@ function showEditDialog() {
       try { saveLastCellState(); } catch {}
     }
   }
-  /* ===== 选择逻辑统一抽象 ===== */
-
   function getMainTrs() {
     return [...tbody.children].filter(tr => tr._row);
   }
@@ -2696,7 +2967,6 @@ function showEditDialog() {
     return getMainTrs().indexOf(tr);
   }
 
-  /** 当前焦点行（无则回退到 anchor） */
   function getFocusTr() {
     const ae = document.activeElement;
     const tr = ae?.closest?.('tr');
@@ -2705,20 +2975,17 @@ function showEditDialog() {
     return null;
   }
 
-  /** 单行选中（无修饰键点击） */
   function selectSingle(tr) {
     for (const t of tbody.children) if (t._row) t.classList.remove('row-selected');
     tr.classList.add('row-selected');
     updateSelectionBorders();
   }
 
-  /** 切换单行（Ctrl+点击） */
   function toggleSelect(tr) {
     tr.classList.toggle('row-selected');
     updateSelectionBorders();
   }
 
-  /** 区间选中：把 [baseTr, curTr] 区间内所有主行选中，其余取消 */
   function setRangeSelection(baseTr, curTr) {
     const trs = getMainTrs();
     const a = trs.indexOf(baseTr);
@@ -2729,6 +2996,24 @@ function showEditDialog() {
       trs[i].classList.toggle('row-selected', i >= lo && i <= hi);
     }
     updateSelectionBorders();
+  }
+  /** Shift+上下：从 anchor 扩展区间选择到"当前行上下移动一格"的行，焦点移到目标行的同列。 */
+  function extendRowSelection(cell, delta) {
+    const tr = cell && cell.tr;
+    if (!tr) return;
+    const trs = getMainTrs();
+    const curIdx = trs.indexOf(tr);
+    if (curIdx < 0) return;
+    const base = (selAnchorTr && selAnchorTr.isConnected) ? selAnchorTr : tr;
+    if (!selAnchorTr || !selAnchorTr.isConnected) selAnchorTr = base;
+    const newIdx = curIdx + delta;
+    if (newIdx < 0 || newIdx >= trs.length) return;
+    setRangeSelection(base, trs[newIdx]);
+    const rowCells = getRowCells(tr);
+    const colIdx = rowCells.indexOf(cell);
+    const targetCells = getRowCells(trs[newIdx]);
+    const target = targetCells[Math.min(colIdx, targetCells.length - 1)] || targetCells[0];
+    if (target) try { target.host.focus({ preventScroll: true }); } catch {}
   }
   function toggleRowSelect(tr, add) {
     if (add) tr.classList.toggle('row-selected'); else tr.classList.add('row-selected');
@@ -2765,7 +3050,6 @@ function showEditDialog() {
     for (const tr of trs) for (const c of getRowCells(tr)) out.push(c);
     return out;
   }
-  /** 保存当前选中的单元格 / 多行状态 */
   function saveLastCellState() {
     const rows = getSelectedRows();
     if (!rows.length) return;
@@ -2780,7 +3064,6 @@ function showEditDialog() {
     }
     if (!rowNames.length) return;
 
-    // 焦点所在单元格的列索引（按 td 在 tr 中的位置）
     const ae = document.activeElement;
     const cell = ae?._acgripCell ?? ae?.closest('td')?._acgripCell;
     let colIndex = 0;
@@ -2793,7 +3076,6 @@ function showEditDialog() {
       localStorage.setItem('acgrip_last_cell', JSON.stringify({ rowNames, colIndex }));
     } catch {}
   }
-  /** 恢复上次选中的单元格 / 多行；兼容旧格式 {rowName,colIndex} */
   function restoreLastCellState() {
     let saved = null;
     try {
@@ -2807,7 +3089,6 @@ function showEditDialog() {
     const wantedNames = (saved && Array.isArray(saved.rowNames)) ? saved.rowNames : [];
     const colIndex = (saved && typeof saved.colIndex === 'number') ? saved.colIndex : 0;
 
-    // 显示名到 tr 的映射
     const nameToTr = new Map();
     for (const tr of tbody.children) {
       if (!tr._row) continue;
@@ -2828,7 +3109,6 @@ function showEditDialog() {
       selectedTrs.push(first);
     }
 
-    // 按 DOM 顺序排列
     const allTrs = [...tbody.children].filter(tr => tr._row);
     selectedTrs.sort((a, b) => allTrs.indexOf(a) - allTrs.indexOf(b));
 
@@ -2839,7 +3119,6 @@ function showEditDialog() {
     updateSelectionBorders();
     _restoringSelection = false;
 
-    // 聚焦第一行的对应列
     const focusTr = selectedTrs[0];
     let td = null;
     if (colIndex >= 0 && colIndex < focusTr.children.length) td = focusTr.children[colIndex];
@@ -2865,11 +3144,6 @@ function showEditDialog() {
     return !String(editor.textContent ?? '').trim();
   }
 
-  /**
-   * Ctrl+方向键跳格：
-   * - 下一格为空（或当前为空）：跳过多空，落到方向第一个非空；找不到则到方向尽头
-   * - 当前非空且下一格非空：连续非空块末尾
-   */
   function ctrlArrowTarget(cell, key) {
     const allTrs = [...tbody.children].filter(t => t._row);
     const rowIdx = allTrs.indexOf(cell.tr);
@@ -2901,7 +3175,6 @@ function showEditDialog() {
       return rowCells[last];
     }
 
-    // 垂直
     const dir = key === 'ArrowUp' ? -1 : 1;
     const nextRowIdx = rowIdx + dir;
     if (nextRowIdx < 0 || nextRowIdx >= allTrs.length) return null;
@@ -2954,7 +3227,6 @@ function showEditDialog() {
         this._original = isInput ? (input.value ?? '') : (input.innerHTML ?? '');
         this._editing = true;
         setReadOnly(input, false);
-        // 延日列：进入编辑态显式换为公式原文
         if (input.classList && input.classList.contains('u-extd')) {
           if (input.dataset.exprRaw != null) {
             input.value = input.dataset.exprRaw;
@@ -2962,7 +3234,6 @@ function showEditDialog() {
           } else {
             input.value = String(tr._row?.延日 ?? '');
           }
-          // 编辑态保持公式加粗样式（若本身是公式）
           const s = String(input.value || '').trim();
           const isFormula = s !== '' && !/^-?\d+(\.\d+)?$/.test(s);
           input.classList.toggle('extd-formula', isFormula);
@@ -2972,7 +3243,6 @@ function showEditDialog() {
           input.style.setProperty('direction', 'ltr', 'important');
         }
 
-        // contenteditable 光标设置工具
         const applyCursor = () => {
           if (!input.isContentEditable) return;
           try {
@@ -2993,7 +3263,6 @@ function showEditDialog() {
         } else {
           try { input.focus({ preventScroll: true }); } catch {}
           if (input.isContentEditable) {
-            // contenteditable 由 false 变为 true 后需要等一次布局再设置光标
             requestAnimationFrame(() => {
               if (!this._editing) return;
               if (document.activeElement !== input) {
@@ -3029,24 +3298,8 @@ function showEditDialog() {
         input.style.width = '';
         input.style.maxWidth = '';
 
-        const isBgmid = input.classList && input.classList.contains('u-bgmid');
         const stillFocused = document.activeElement === input || td.contains(document.activeElement);
-
-        if (isBgmid) {
-          if (stillFocused) {
-            // 退出编辑但仍聚焦：保持多行显示，仅切换 class 与恢复只读
-            td.classList.add('u-focus-expand');
-            setBgmidMultiline(input, true);
-            requestAnimationFrame(() => autoResizeInput(input));
-          } else {
-            td.classList.remove('u-focus-expand');
-            setBgmidMultiline(input, false);
-            input.style.width = '';
-            input.style.maxWidth = '';
-          }
-        } else {
-          td.classList.remove('u-focus-expand');
-        }
+        td.classList.remove('u-focus-expand');
 
         if (commit) {
           updateDerived(tr);
@@ -3069,17 +3322,10 @@ function showEditDialog() {
     const applyStyle = () => {
       if (cell.isCombined || isDisplayOnly) return;
       const isRecord = editor.classList && editor.classList.contains('u-downloaded');
-      const isBgmid = editor.classList && editor.classList.contains('u-bgmid');
       if (isRecord) {
         if (cell._editing) td.classList.add('editing-expand');
         else td.classList.add('u-focus-expand');
         requestAnimationFrame(() => autoResizeTextarea(editor));
-        return;
-      }
-      if (isBgmid) {
-        td.classList.add('editing-expand');
-        setBgmidMultiline(editor, true);
-        requestAnimationFrame(() => autoResizeInput(editor));
         return;
       }
       td.classList.add('editing-expand');
@@ -3122,7 +3368,6 @@ function showEditDialog() {
       if (!cell.skipHostKeydown) host.addEventListener('paste', paste);
       if (editor !== host) editor.addEventListener('paste', paste);
     }
-    // 编辑态下内容变化时自动调整宽度
     const onInputResize = () => {
       if (!cell._editing) return;
       if (cell._applyStyle) cell._applyStyle();
@@ -3132,7 +3377,6 @@ function showEditDialog() {
     if (editor !== host) editor.addEventListener('input', onInputResize);
     const onFocus = () => {
       const tr = cell.tr;
-      // 选中状态由 mousedown / 键盘导航逻辑管理，onFocus 不重置
       updateSelectionBorders();
 
       if (editor.classList && (editor.classList.contains('u-name') || editor.classList.contains('u-cn') || editor.classList.contains('u-update'))) {
@@ -3144,30 +3388,130 @@ function showEditDialog() {
       if (!cell._editing && (editor.tagName === 'INPUT' || editor.tagName === 'TEXTAREA')) {
         try { editor.setSelectionRange(0, 0); } catch {}
         try { editor.scrollLeft = 0; } catch {}
+        /* 收集浮动层，触发 #unifiedTableHost 动态撑高，避免多行浮层被裁剪 */
         requestAnimationFrame(() => {
-          if (cell._editing) return;
-          if (document.activeElement !== editor) return;
-          try { editor.setSelectionRange(0, 0); } catch {}
-          try { editor.scrollLeft = 0; } catch {}
-          if (editor.classList && (editor.classList.contains('u-name') || editor.classList.contains('u-cn') || editor.classList.contains('u-update'))) {
-            editor.style.setProperty('text-align', 'left', 'important');
+          const _isAbs = (el) => {
+            if (!el || !el.isConnected) return false;
+            try { return getComputedStyle(el).position === 'absolute'; } catch { return false; }
+          };
+          /* 同一时刻只有一个 td 处于展开/编辑态：先把不属于当前 td 的旧浮层清掉，
+   * 防止切换格子时旧浮层残留导致 padding 计算偏差。 */
+          for (const el of [..._activeFloats]) {
+            if (!el || !el.isConnected || !td.contains(el)) _activeFloats.delete(el);
           }
+          if (cell._editing) {
+            if (editor && _isAbs(editor)) _activeFloats.add(editor);
+            const resEdit = td.querySelector('.u-res-edit-layer');
+            if (resEdit && _isAbs(resEdit)) _activeFloats.add(resEdit);
+            const bgmEdit = td.querySelector('.u-bgmid-edit-layer');
+            if (bgmEdit && _isAbs(bgmEdit)) _activeFloats.add(bgmEdit);
+          } else if (td.classList.contains('u-focus-expand')) {
+            const dispFloat = td.querySelector('.u-disp-float');
+            if (dispFloat) _activeFloats.add(dispFloat);
+            if (cell.isCombined) {
+              const layer = td.querySelector('.u-res-display-layer');
+              if (layer && _isAbs(layer)) _activeFloats.add(layer);
+            }
+            if (!cell.isDisplayOnly && editor && _isAbs(editor)) _activeFloats.add(editor);
+          }
+          _recomputeFloatPad();
         });
       }
 
       const isRecord = editor.classList && editor.classList.contains('u-downloaded');
-      const isBgmid = editor.classList && editor.classList.contains('u-bgmid');
+      const isDisplayName = cell.isDisplayOnly && td.classList.contains('c-disp');
+      const isBgmidCombined = cell.isCombined && td.classList.contains('c-bgmid');
+      const isResCombined = cell.isCombined && !td.classList.contains('c-bgmid');
+      const isWideInput = editor.classList && (
+        editor.classList.contains('u-name') ||
+        editor.classList.contains('u-cn') ||
+        editor.classList.contains('u-update')
+      );
+
       if (cell._editing) {
         applyStyle();
+      } else if (isDisplayName) {
+        td.classList.add('u-focus-expand');
+        let fl = td.querySelector('.u-disp-float');
+        if (!fl) {
+          fl = cE('div');
+          fl.className = 'u-disp-float';
+          fl.textContent = String(td.textContent || '').trim();
+          td.appendChild(fl);
+        }
+        requestAnimationFrame(() => {
+          const container = td.closest('#unifiedTableHost') || td.closest('#gmEditOverlay') || document.body;
+          const cRect = container.getBoundingClientRect();
+          const containerRight = cRect.left + container.clientWidth;
+          const tdRect = td.getBoundingClientRect();
+          const avail = Math.max(100, containerRight - tdRect.left - 8);
+          const clone = document.createElement('span');
+          clone.textContent = fl.textContent || '';
+          const cs = getComputedStyle(fl);
+          Object.assign(clone.style, {
+            position: 'absolute', visibility: 'hidden', pointerEvents: 'none',
+            top: '-9999px', left: '0',
+            width: 'max-content', padding: '0', border: '0', boxSizing: 'border-box',
+            whiteSpace: 'pre-wrap', wordBreak: 'break-all',
+            fontFamily: cs.fontFamily, fontSize: cs.fontSize, fontWeight: cs.fontWeight,
+            lineHeight: cs.lineHeight || '1.4',
+          });
+          document.body.appendChild(clone);
+          void clone.offsetWidth;
+          const measuredW = clone.getBoundingClientRect().width;
+          clone.remove();
+          const targetW = Math.min(avail, Math.max(tdRect.width, Math.ceil(measuredW) + 16));
+          fl.style.setProperty('width', targetW + 'px', 'important');
+          fl.style.setProperty('max-width', avail + 'px', 'important');
+        });
+      } else if (isBgmidCombined) {
+        const bgmDisplayA = td.querySelector('.u-bgmid-display');
+        const layer = td.querySelector('.u-res-display-layer');
+        if (bgmDisplayA && layer) {
+          td.classList.add('u-focus-expand');
+          setBgmidMultiline(bgmDisplayA, true);
+          /* 等 DOM 换行布局完再测 */
+          requestAnimationFrame(() => autoResizeFloatingText(layer, bgmDisplayA));
+        }
+      } else if (isResCombined) {
+        const layer = td.querySelector('.u-res-display-layer');
+        td.classList.add('u-focus-expand');
+        try { updateDerived(tr); } catch (e) {}
+        requestAnimationFrame(() => {
+          const resDisplay = td.querySelector('.u-res-display');
+          if (resDisplay && layer) autoResizeFloatingText(layer, resDisplay);
+        });
+      } else if (isWideInput) {
+        td.classList.add('u-focus-expand');
+        requestAnimationFrame(() => autoResizeInput(editor));
       } else if (isRecord) {
         td.classList.add('u-focus-expand');
+        try { applyRowBackground(tr); } catch (e) {}
         requestAnimationFrame(() => autoResizeTextarea(editor));
-      } else if (isBgmid) {
-        // 非编辑聚焦态：多行展开
-        td.classList.add('u-focus-expand');
-        setBgmidMultiline(editor, true);
-        requestAnimationFrame(() => autoResizeInput(editor));
       }
+      /* 收集浮动层，触发 #unifiedTableHost 动态撑高，避免多行浮层被裁剪 */
+      requestAnimationFrame(() => {
+        const _isAbs = (el) => {
+          if (!el || !el.isConnected) return false;
+          try { return getComputedStyle(el).position === 'absolute'; } catch { return false; }
+        };
+        if (cell._editing) {
+          if (editor && _isAbs(editor)) _activeFloats.add(editor);
+          const resEdit = td.querySelector('.u-res-edit-layer');
+          if (resEdit && _isAbs(resEdit)) _activeFloats.add(resEdit);
+          const bgmEdit = td.querySelector('.u-bgmid-edit-layer');
+          if (bgmEdit && _isAbs(bgmEdit)) _activeFloats.add(bgmEdit);
+        } else if (td.classList.contains('u-focus-expand')) {
+          const dispFloat = td.querySelector('.u-disp-float');
+          if (dispFloat) _activeFloats.add(dispFloat);
+          if (cell.isCombined) {
+            const layer = td.querySelector('.u-res-display-layer');
+            if (layer && _isAbs(layer)) _activeFloats.add(layer);
+          }
+          if (!cell.isDisplayOnly && editor && _isAbs(editor)) _activeFloats.add(editor);
+        }
+        _recomputeFloatPad();
+      });
     };
     if (!cell.skipHostKeydown) host.addEventListener('focus', onFocus);
     if (editor !== host) editor.addEventListener('focus', onFocus);
@@ -3180,18 +3524,64 @@ function showEditDialog() {
             cell._exitEdit(true);
             return;
           }
-          // 非编辑态：处理 BGMID 聚焦态退出
-          const isBgmid = editor.classList && editor.classList.contains('u-bgmid');
-          if (isBgmid && !cell.td.contains(document.activeElement)) {
-            cell.td.classList.remove('u-focus-expand');
-            setBgmidMultiline(editor, false);
-            editor.style.width = '';
-            editor.style.maxWidth = '';
+          if (cell.td.contains(document.activeElement)) return;
+
+          if (cell.isCombined) {
+            const td = cell.td;
+            td.classList.remove('u-focus-expand');
+            const layer = td.querySelector('.u-res-display-layer');
+            if (layer) {
+              layer.style.width = '';
+              layer.style.maxWidth = '';
+            }
+            if (td.classList.contains('c-bgmid')) {
+              const bgmDisplayA = td.querySelector('.u-bgmid-display');
+              if (bgmDisplayA) {
+                setBgmidMultiline(bgmDisplayA, false);
+                bgmDisplayA.style.flex = '';
+                bgmDisplayA.style.minWidth = '';
+              }
+            } else {
+              /* 资源列：还原单行（清掉展开态追加的规则行） */
+              try { updateDerived(cell.tr); } catch (e) {}
+              const resDisplay = td.querySelector('.u-res-display');
+              if (resDisplay) {
+                resDisplay.style.flex = '';
+                resDisplay.style.minWidth = '';
+              }
+            }
+          } else {
+            const editor = cell.editor;
+            const isWideInput = editor && editor.classList && (
+              editor.classList.contains('u-name') ||
+              editor.classList.contains('u-cn') ||
+              editor.classList.contains('u-update')
+            );
+            if (isWideInput) {
+              cell.td.classList.remove('u-focus-expand');
+              editor.style.width = '';
+              editor.style.maxWidth = '';
+            }
           }
+          /* 清理当前 td 相关的浮动层，触发 padding 回落 */
+          requestAnimationFrame(() => {
+            /* 若焦点只是从本 cell 移到同表格的其它 cell，浮层仍应保留；
+   * 只有焦点真正离开 #unifiedTableHost 时才清理。 */
+            const ae = document.activeElement;
+            const hostEl = document.getElementById('unifiedTableHost');
+            const focusStillInTable = !!(ae && hostEl && hostEl.contains(ae));
+            if (!focusStillInTable) {
+              for (const el of _activeFloats) {
+                if (!el || !el.isConnected || cell.td.contains(el)) _activeFloats.delete(el);
+              }
+            }
+            _recomputeFloatPad();
+            scheduleRefresh();
+          });
         }, 0);
       };
-      if (editor !== host) editor.addEventListener('blur', onBlur);
-      else if (!cell.skipHostKeydown) host.addEventListener('blur', onBlur);
+      if (!cell.skipHostKeydown) host.addEventListener('focusout', onBlur);
+      if (editor !== host) editor.addEventListener('focusout', onBlur);
     }
 
     const linkClickCapture = (e) => {
@@ -3199,14 +3589,11 @@ function showEditDialog() {
       if (!a) return;
       if (e.altKey) {
         e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
-        // 1) 若在编辑态：先退出（提交）
         if (cell._editing) cell._exitEdit(true);
-        // 2) 单选当前行
         clearRowSelection();
         cell.tr.classList.add('row-selected');
         selAnchorTr = cell.tr;
         updateSelectionBorders();
-        // 3) 聚焦点击的格子自身（非编辑态）
         const target = cell.host;
         if (target && typeof target.focus === 'function') {
           if (target.tabIndex < 0) target.tabIndex = 0;
@@ -3219,13 +3606,13 @@ function showEditDialog() {
     if (editor !== host) editor.addEventListener('click', linkClickCapture, true);
 
     const ctxCopy = (e) => {
-      const el = e.target.closest('input, textarea, .u-bgmid, [contenteditable]');
+      const el = e.target.closest('input, textarea, [contenteditable]');
       if (!el) return;
       let text = '', isDefault = false;
       if (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA') {
         if (el.value !== '') text = el.value;
         else if (el.placeholder) { text = el.placeholder; isDefault = true; }
-      } else if (el.isContentEditable || el.classList.contains('u-bgmid')) {
+      } else if (el.isContentEditable) {
         const content = (el.textContent || '').trim();
         if (content !== '') text = content;
         else if (el.placeholder) { text = el.placeholder; isDefault = true; }
@@ -3238,20 +3625,29 @@ function showEditDialog() {
     };
     host.addEventListener('contextmenu', ctxCopy);
     if (editor !== host) editor.addEventListener('contextmenu', ctxCopy);
+
+    /* 首列 display cell 失焦时移除浮层 */
+    if (isDisplayOnly && cell.td.classList.contains('c-disp')) {
+      host.addEventListener('focusout', () => {
+        setTimeout(() => {
+          if (cell.td.contains(document.activeElement)) return;
+          cell.td.classList.remove('u-focus-expand');
+          const fl = cell.td.querySelector('.u-disp-float');
+          if (fl) fl.remove();
+        }, 0);
+      });
+    }
   }
-  /** 非编辑态清空单元格内容 */
   function clearCellContent(cell) {
     const tr = cell.tr;
     const row = tr._row;
     if (!row) return;
 
-    // 资源列（复合格）：清空 资源 + 规则
     if (cell.isCombined) {
       row.资源 = '';
       row.规则 = '';
       if (cell.editor) cell.editor.value = '';
       if (cell._ruleCell && cell._ruleCell.editor) cell._ruleCell.editor.value = '';
-      // updateDerived 末尾已包含 refreshTempEditedMark + applyRowBackground
       updateDerived(tr);
       scheduleDraftSave();
       return;
@@ -3260,7 +3656,6 @@ function showEditDialog() {
     const editor = cell.editor;
     if (!editor) return;
 
-    // 记录列 textarea
     if (editor.classList && editor.classList.contains('u-downloaded')) {
       row.已下载 = [];
       editor.value = '';
@@ -3272,25 +3667,12 @@ function showEditDialog() {
       return;
     }
 
-    // BGMID（含非编辑态，contenteditable="false" 也走此分支）
-    const isBgmid = editor.classList && editor.classList.contains('u-bgmid');
-    if (isBgmid) {
-      editor.innerHTML = '';
-      row.BGMID = '';
-      refreshTempEditedMark(tr);
-      applyRowBackground(tr);
-      scheduleDraftSave();
-      return;
-    }
-
-    // 普通 input / textarea
     if (editor.tagName === 'INPUT' || editor.tagName === 'TEXTAREA') {
       editor.value = '';
     } else {
       return;
     }
 
-    // 派发 input 事件，让各列的 handler 更新 row 对应字段
     editor.dispatchEvent(new Event('input', { bubbles: true }));
     refreshTempEditedMark(tr);
     applyRowBackground(tr);
@@ -3302,19 +3684,16 @@ function showEditDialog() {
     const editing = cell._editing;
     const tr = cell.tr;
     const isDisplayOnly = !!cell.isDisplayOnly;
-    // Ctrl+A / Cmd+A（非编辑态）：选中表格内全部行
     if ((e.ctrlKey || e.metaKey) && !e.altKey && !e.shiftKey && (key === 'a' || key === 'A') && !editing) {
       e.preventDefault(); e.stopPropagation();
       const allTrs = getMainTrs();
       if (allTrs.length) {
         for (const t of allTrs) t.classList.add('row-selected');
-        // 当前行作为锚点，方便之后 Shift+方向键继续扩展
         selAnchorTr = tr;
         updateSelectionBorders();
       }
       return;
     }
-    // Ctrl+Shift+方向键：按内容跳格到目标行，区间选中（anchor 到目标）
     if (e.ctrlKey && e.shiftKey && !e.altKey && !editing && ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(key)) {
       e.preventDefault(); e.stopPropagation();
       const target = ctrlArrowTarget(cell, key);
@@ -3327,7 +3706,6 @@ function showEditDialog() {
       }
       return;
     }
-    // Ctrl+方向键：按内容跳格，单选目标行
     if (e.ctrlKey && !e.shiftKey && !e.altKey && !editing && ['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(key)) {
       e.preventDefault(); e.stopPropagation();
       const target = ctrlArrowTarget(cell, key);
@@ -3358,7 +3736,6 @@ function showEditDialog() {
           const newIdx = curIdx + (key === 'ArrowUp' ? -1 : 1);
           if (newIdx < 0 || newIdx >= trs.length) return;
           setRangeSelection(base, trs[newIdx]);
-          // 焦点移到目标行的同列
           const rowCells = getRowCells(tr);
           const colIdx = rowCells.indexOf(cell);
           const targetCells = getRowCells(trs[newIdx]);
@@ -3547,7 +3924,7 @@ function showEditDialog() {
     if (!editing && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(key)) {
       e.preventDefault(); e.stopPropagation();
       if (e.shiftKey && (key === 'ArrowUp' || key === 'ArrowDown')) {
-        extendRowSelection(tr, key === 'ArrowUp' ? -1 : 1);
+        extendRowSelection(cell, key === 'ArrowUp' ? -1 : 1);
       } else if (!e.shiftKey) {
         pendingEditMode = false;
         navigateDirection(cell, key);
@@ -3644,25 +4021,44 @@ function showEditDialog() {
     const rowCells = getRowCells(cell.tr);
     const colIdx = rowCells.indexOf(cell);
     if (colIdx < 0) return;
+    let target = null;
     if (key === 'ArrowUp' || key === 'ArrowDown') {
       const nRow = rowIdx + (key === 'ArrowUp' ? -1 : 1);
       if (nRow < 0 || nRow >= allTrs.length) return;
       const targetTr = allTrs[nRow];
       const targetCells = getRowCells(targetTr);
-      const target = targetCells[Math.min(colIdx, targetCells.length - 1)];
+      target = targetCells[Math.min(colIdx, targetCells.length - 1)];
       if (!target) return;
       selectSingle(targetTr);
       selAnchorTr = targetTr;
-      try { target.host.focus({ preventScroll: true }); } catch {}
     } else {
       const nCol = colIdx + (key === 'ArrowLeft' ? -1 : 1);
       if (nCol < 0 || nCol >= rowCells.length) return;
-      const target = rowCells[nCol];
-      if (target) try { target.host.focus(); } catch {}
+      target = rowCells[nCol];
+      if (!target) return;
     }
+    const focusTarget = () => {
+      if (!target.host) return;
+      if (target.host.tabIndex < 0) target.host.tabIndex = 0;
+      try { target.host.focus({ preventScroll: true }); } catch {}
+    };
+    focusTarget();
+    requestAnimationFrame(() => {
+      if (document.activeElement === target.host ||
+          (target.host && target.host.contains(document.activeElement))) return;
+      focusTarget();
+    });
   }
 
   /* ===== updateDerived ===== */
+  function tdBgmidOf(tr) {
+    if (!tr) return null;
+    for (const td of tr.children) {
+      if (td.classList && td.classList.contains('c-bgmid')) return td._acgripCell || null;
+    }
+    return null;
+  }
+
   function updateDerived(tr) {
     const row = tr._row, parsed = parseBGMID(row.BGMID);
     const ph = (cls, v) => { const el = tr.querySelector('.' + cls); if (el) el.placeholder = v || ''; };
@@ -3702,10 +4098,35 @@ function showEditDialog() {
     if (resDisplay) {
       resDisplay.innerHTML = '';
       const info = getResourceDisplayInfo(row);
-      if (info.href) {
-        const a = cE('a');
-        a.href = info.href; a.target = '_blank'; a.rel = 'noopener noreferrer';
-        a.textContent = info.text;
+      const tdCombinedRes = resDisplay.closest('.u-cell.u-combined');
+      const isExpanded = !!(tdCombinedRes && tdCombinedRes.classList.contains('u-focus-expand'));
+
+      const buildHighlightedNodes = (text, highlight) => {
+        const frag = document.createDocumentFragment();
+        const s = String(text ?? '');
+        if (!s) return frag;
+        if (highlight === 'last') {
+          const head = s.slice(0, -1);
+          const tail = s.slice(-1);
+          if (head) frag.appendChild(document.createTextNode(head));
+          if (tail) {
+            const sp = cE('span');
+            sp.className = 'hl-warn';
+            sp.textContent = tail;
+            frag.appendChild(sp);
+          }
+        } else if (highlight === 'full') {
+          const sp = cE('span');
+          sp.className = 'hl-warn';
+          sp.textContent = s;
+          frag.appendChild(sp);
+        } else {
+          frag.appendChild(document.createTextNode(s));
+        }
+        return frag;
+      };
+
+      const attachLinkClick = (a) => {
         a.addEventListener('click', (e) => {
           if (e.altKey) {
             e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
@@ -3717,19 +4138,63 @@ function showEditDialog() {
             if (firstCell && firstCell.host && firstCell.host.focus) try { firstCell.host.focus(); } catch {}
           } else e.stopPropagation();
         }, true);
-        resDisplay.appendChild(a);
-      } else resDisplay.textContent = info.text;
+      };
+
       const resVal = String(row.资源 ?? '').trim();
       const ruleVal = String(row.规则 ?? '').trim();
+      const hasTime = isDHHMM(resVal);
+
+      if (isExpanded) {
+        /* 展开态（悬浮多行）：
+         * - 有时间值：第一行显示基础 DHHMM（不带链接首字母）
+         * - 无时间值：不显示域名等，只显示规则/链接 */
+        const lines = [];
+        if (hasTime) {
+          lines.push({ text: formatDHHMM(resVal), href: '', highlight: '' });
+        }
+        if (ruleVal) {
+          const exp = expandResourceUrl(ruleVal, row);
+          lines.push({ text: ruleVal, href: isHttpUrl(exp) ? exp : '', highlight: '' });
+        } else if (resVal && !hasTime) {
+          const exp = expandResourceUrl(resVal, row);
+          lines.push({ text: resVal, href: isHttpUrl(exp) ? exp : '', highlight: '' });
+        }
+        lines.forEach((item, idx) => {
+          if (idx > 0) resDisplay.appendChild(document.createTextNode('\n'));
+          if (item.href) {
+            const a = cE('a');
+            a.href = item.href; a.target = '_blank'; a.rel = 'noopener noreferrer';
+            a.textContent = item.text;
+            attachLinkClick(a);
+            resDisplay.appendChild(a);
+          } else {
+            resDisplay.appendChild(document.createTextNode(item.text));
+          }
+        });
+      } else {
+        /* 紧凑文本（时间+首字母 或 域名） */
+        if (info.href) {
+          const a = cE('a');
+          a.href = info.href; a.target = '_blank'; a.rel = 'noopener noreferrer';
+          a.appendChild(buildHighlightedNodes(info.text, info.highlight));
+          attachLinkClick(a);
+          resDisplay.appendChild(a);
+        } else {
+          resDisplay.appendChild(buildHighlightedNodes(info.text, info.highlight));
+        }
+      }
+
       const tipParts = [];
-      if (isDHHMM(resVal)) tipParts.push(formatDHHMM(resVal));
+      if (hasTime) tipParts.push(formatDHHMM(resVal));
       if (ruleVal) tipParts.push(ruleVal);
-      else if (resVal && !isDHHMM(resVal)) tipParts.push(resVal);
+      else if (resVal && !hasTime) tipParts.push(resVal);
       resDisplay.title = tipParts.join('\n');
     }
 
     const dispCell = tr.querySelector('.u-display-name');
     if (dispCell) {
+      const existingFloat = dispCell.querySelector('.u-disp-float');
+      const isExpanded = dispCell.classList.contains('u-focus-expand');
       dispCell.innerHTML = '';
       const text = getDisplayName(row, parsed);
       const bgmId = getBgmIdFromBGMID(row.BGMID);
@@ -3755,6 +4220,13 @@ function showEditDialog() {
       const userNAME = String(row.名称 ?? '').trim();
       dispCell.classList.toggle('from-default', !userCN && !userNAME && !!text);
       setupContextCopy(dispCell, () => text);
+      /* 保留浮层：避免展开态被重建清掉，导致高度回落、下方内容被截断 */
+      if (existingFloat && isExpanded) {
+        existingFloat.textContent = text;
+        dispCell.appendChild(existingFloat);
+        _activeFloats.add(existingFloat);
+        _recomputeFloatPad();
+      }
     }
 
     const totalCell = tr.querySelector('.u-total');
@@ -3779,7 +4251,6 @@ function showEditDialog() {
     }
     const extD = tr.querySelector('.u-extd');
     const extDCell = extD ? extD._acgripCell : null;
-    // 只要不在编辑态就刷新（非编辑选中/未选中都显示计算值）
     if (extD && !(extDCell && extDCell._editing)) {
       const manualD = String(row.延日 ?? '').trim();
       const isFormula = manualD !== '' && !/^-?\d+(\.\d+)?$/.test(manualD);
@@ -3802,19 +4273,42 @@ function showEditDialog() {
     tr.querySelectorAll('input').forEach(input => {
       if (!input.title) input.title = input.value || input.placeholder || '';
     });
-    const bgmid = tr.querySelector('.u-bgmid');
-    if (bgmid) {
-      bgmid.title = bgmid.textContent || '';
-      bgmid.querySelectorAll('a').forEach(a => {
-        a.target = '_blank';
-        a.rel = 'noopener noreferrer';
-      });
+
+    /* BGMID 显示层：整个格子就是一个超链接（或纯文本）
+     * 展开态下跳过 textContent 更新（否则会把 `setBgmidMultiline` 插入的换行清掉），
+     * href / title 仍更新（保证点击和提示信息正确）。 */
+    const bgmDisplayA = tr.querySelector('.u-bgmid-display');
+    if (bgmDisplayA) {
+      const text = String(row.BGMID ?? '').trim();
+      const url = String(row.BGMIDURL ?? '').trim();
+      const displayText = text || url;
+      /* 展开态下跳过 textContent 更新（否则会清掉 setBgmidMultiline 插入的换行）；
+       * href / title 仍更新以保证点击和提示正确 */
+      if (bgmDisplayA.dataset.multilineExpanded !== '1') {
+        if (bgmDisplayA.textContent !== displayText) bgmDisplayA.textContent = displayText;
+      }
+      bgmDisplayA.title = [text, url].filter(Boolean).join('\n') || '';
+      if (url) {
+        if (bgmDisplayA.getAttribute('href') !== url) bgmDisplayA.setAttribute('href', url);
+      } else {
+        if (bgmDisplayA.hasAttribute('href')) bgmDisplayA.removeAttribute('href');
+      }
     }
+    /* 编辑态下同步 input（提交/回滚后 UI 立刻正确） */
+    const bgmTextInputEl = tr.querySelector('.u-bgmid-text-input');
+    const bgmUrlInputEl = tr.querySelector('.u-bgmid-url-input');
+    const bgmCellObj = tdBgmidOf(tr);
+    if (bgmTextInputEl && !(bgmCellObj && bgmCellObj._editing)) {
+      if (bgmTextInputEl.value !== String(row.BGMID ?? '')) bgmTextInputEl.value = String(row.BGMID ?? '');
+    }
+    if (bgmUrlInputEl && !(bgmCellObj && bgmCellObj._editing)) {
+      if (bgmUrlInputEl.value !== String(row.BGMIDURL ?? '')) bgmUrlInputEl.value = String(row.BGMIDURL ?? '');
+    }
+
     tr.querySelectorAll('.u-cell.c-disp, .u-cell.c-total, .u-cell.c-air').forEach(td => {
       td.title = td.textContent || '';
     });
     applyRowHighlight(tr);
-    // name/cn/update 强制左对齐（防任何路径下的对齐漂移）
     ['.u-name', '.u-cn', '.u-update'].forEach(sel => {
       const el = tr.querySelector(sel);
       if (el) {
@@ -3823,7 +4317,6 @@ function showEditDialog() {
         el.style.setProperty('unicode-bidi', 'plaintext', 'important');
       }
     });
-    // 当前聚焦的非编辑 name/cn/update 光标归零
     if (document.activeElement && document.activeElement.tagName === 'INPUT') {
       const ae = document.activeElement;
       if (ae.classList.contains('u-name') || ae.classList.contains('u-cn') || ae.classList.contains('u-update')) {
@@ -3878,6 +4371,7 @@ function showEditDialog() {
       displayLayer.style.display = 'none';
       editLayer.style.display = 'flex';
       tdCombined.classList.add('editing');
+      tdCombined.classList.remove('u-focus-expand');
       tdCombined.style.outline = 'none';
       requestAnimationFrame(() => {
         if (document.activeElement !== resInput && document.activeElement !== ruleInput) {
@@ -3890,6 +4384,7 @@ function showEditDialog() {
       editLayer.style.display = 'none';
       displayLayer.style.display = 'flex';
       tdCombined.classList.remove('editing');
+      tdCombined.classList.remove('u-focus-expand');
       tdCombined.style.outline = '';
       updateDerived(tr);
     };
@@ -4031,32 +4526,190 @@ function showEditDialog() {
     tdExtD.appendChild(extDInput);
     makeCell(tdExtD, extDInput, tr); initCell(tdExtD._acgripCell);
 
-    /* 8. BGMID */
-    const tdBgmid = cE('td'); tdBgmid.className = 'u-cell c-bgmid';
-    row.BGMID = cleanBGMID(row.BGMID);
-    const bgmidDiv = cE('div');
-    bgmidDiv.contentEditable = 'false'; bgmidDiv.className = 'u-bgmid'; bgmidDiv.innerHTML = row.BGMID || '';
-    bgmidDiv.tabIndex = 0;
-    bgmidDiv.addEventListener('input', () => {
-      if (bgmidDiv.dataset.multilineExpanded === '1') {
-        const clone = bgmidDiv.cloneNode(true);
-        const walker = document.createTreeWalker(clone, NodeFilter.SHOW_TEXT);
-        let node;
-        while ((node = walker.nextNode())) {
-          node.nodeValue = node.nodeValue.replace(/,?\n/g, ',');
+    /* 8. BGMID（复合：文本 + URL，显示合并、编辑分开） */
+    migrateBGMIDFields(row);
+    const tdBgmid = cE('td'); tdBgmid.className = 'u-cell u-combined c-bgmid';
+
+    const bgmDisplayLayer = cE('div'); bgmDisplayLayer.className = 'u-res-display-layer';
+    const bgmDisplayA = cE('a');
+    bgmDisplayA.className = 'u-res-display u-bgmid-display';
+    bgmDisplayA.target = '_blank';
+    bgmDisplayA.rel = 'noopener noreferrer';
+    /* 不参与 Tab 顺序：Tab 直接聚焦到 td 上，触发多行展开。
+     * 点击 <a> 时仍按浏览器默认打开链接（此时不需要展开）。 */
+    bgmDisplayA.tabIndex = -1;
+    const bgmEditBtn = cE('button');
+    bgmEditBtn.type = 'button'; bgmEditBtn.className = 'u-res-edit-btn'; bgmEditBtn.textContent = '✎';
+    bgmEditBtn.title = '编辑 BGMID 文本与链接';
+    bgmDisplayLayer.append(bgmDisplayA, bgmEditBtn);
+
+    const bgmEditLayer = cE('div');
+    bgmEditLayer.className = 'u-bgmid-edit-layer';
+    bgmEditLayer.style.display = 'none';
+    const bgmTextInput = cE('input');
+    bgmTextInput.type = 'text'; bgmTextInput.autocomplete = 'off'; bgmTextInput.className = 'u-bgmid-text-input';
+    bgmTextInput.value = row.BGMID || ''; bgmTextInput.placeholder = '文本';
+    const bgmUrlInput = cE('input');
+    bgmUrlInput.type = 'text'; bgmUrlInput.autocomplete = 'off'; bgmUrlInput.className = 'u-bgmid-url-input';
+    bgmUrlInput.value = row.BGMIDURL || ''; bgmUrlInput.placeholder = 'URL（可选）';
+    const bgmDoneBtn = cE('button');
+    bgmDoneBtn.type = 'button'; bgmDoneBtn.className = 'u-res-edit-btn'; bgmDoneBtn.textContent = '✓';
+    bgmDoneBtn.style.cssText = 'color:#8c8;align-self:flex-end;';
+    bgmEditLayer.append(bgmTextInput, bgmUrlInput, bgmDoneBtn);
+    tdBgmid.append(bgmDisplayLayer, bgmEditLayer);
+
+    const bgmCombinedEdit = { _editing: false, _original: null };
+    const bgmCell = {
+      td: tdBgmid, host: tdBgmid, editor: bgmTextInput, isCombined: true, tr,
+      _parent: null, _ruleCell: null, _applyStyle: null, _isRuleCell: false,
+      get _editing() { return bgmCombinedEdit._editing; },
+      set _editing(v) { bgmCombinedEdit._editing = v; },
+      get _original() { return bgmCombinedEdit._original; },
+      set _original(v) { bgmCombinedEdit._original = v; },
+      _enterEdit(clearFirst) {
+        if (bgmCombinedEdit._editing) return;
+        bgmCombinedEdit._original = { BGMID: String(row.BGMID ?? ''), BGMIDURL: String(row.BGMIDURL ?? '') };
+        bgmCombinedEdit._editing = true;
+        /* 清掉多行展开态（含浮层宽度、textEl flex） */
+        tdBgmid.classList.remove('u-focus-expand');
+        const layer_ = tdBgmid.querySelector('.u-res-display-layer');
+        if (layer_) {
+          layer_.style.width = '';
+          layer_.style.maxWidth = '';
         }
-        row.BGMID = clone.innerHTML;
-      } else {
-        row.BGMID = bgmidDiv.innerHTML;
-      }
-      // 不用 updateDerived / scheduleRefresh —— 它们会触发 rebuild，导致焦点丢失
-      bgmidDiv.title = bgmidDiv.textContent || '';
+        const bgmDisplayA_ = tdBgmid.querySelector('.u-bgmid-display');
+        if (bgmDisplayA_) {
+          setBgmidMultiline(bgmDisplayA_, false);
+          bgmDisplayA_.style.flex = '';
+          bgmDisplayA_.style.minWidth = '';
+        }
+        setReadOnly(bgmTextInput, false);
+        setReadOnly(bgmUrlInput, false);
+        bgmDisplayLayer.style.display = 'none';
+        bgmEditLayer.style.display = 'flex';
+        tdBgmid.classList.add('editing');
+        tdBgmid.style.outline = 'none';
+        if (clearFirst) {
+          bgmTextInput.value = ''; bgmUrlInput.value = '';
+          row.BGMID = ''; row.BGMIDURL = '';
+        }
+        requestAnimationFrame(() => { try { bgmTextInput.focus(); } catch {} });
+      },
+      _exitEdit(commit) {
+        if (!bgmCombinedEdit._editing) return;
+        if (!commit) {
+          row.BGMID = bgmCombinedEdit._original.BGMID;
+          row.BGMIDURL = bgmCombinedEdit._original.BGMIDURL;
+        } else {
+          row.BGMID = bgmTextInput.value.trim();
+          row.BGMIDURL = bgmUrlInput.value.trim();
+        }
+        bgmCombinedEdit._editing = false;
+        bgmCombinedEdit._original = null;
+        setReadOnly(bgmTextInput, true);
+        setReadOnly(bgmUrlInput, true);
+        bgmEditLayer.style.display = 'none';
+        bgmDisplayLayer.style.display = 'flex';
+        tdBgmid.classList.remove('editing');
+        tdBgmid.classList.remove('u-focus-expand');
+        tdBgmid.style.outline = '';
+
+        /* 先清掉 multiline / 浮层宽度，让 updateDerived 能更新 textContent 为新值 */
+        const layer_ = tdBgmid.querySelector('.u-res-display-layer');
+        if (layer_) {
+          layer_.style.width = '';
+          layer_.style.maxWidth = '';
+        }
+        const bgmDisplayA_ = tdBgmid.querySelector('.u-bgmid-display');
+        if (bgmDisplayA_) {
+          setBgmidMultiline(bgmDisplayA_, false);
+          bgmDisplayA_.style.flex = '';
+          bgmDisplayA_.style.minWidth = '';
+        }
+
+        updateDerived(tr);
+        scheduleDraftSave();
+
+        /* 焦点仍在本格 → 依据最新值重新展开 */
+        if (tdBgmid.contains(document.activeElement) && bgmDisplayA_ && layer_) {
+          tdBgmid.classList.add('u-focus-expand');
+          setBgmidMultiline(bgmDisplayA_, true);
+          requestAnimationFrame(() => autoResizeFloatingText(layer_, bgmDisplayA_));
+        }
+      },
+    };
+    const bgmUrlCell = {
+      td: tdBgmid, host: tdBgmid, editor: bgmUrlInput, isCombined: true, tr,
+      _parent: null, _applyStyle: null, _isRuleCell: true,
+      skipHostKeydown: true,
+      get _editing() { return bgmCombinedEdit._editing; },
+      set _editing(v) { bgmCombinedEdit._editing = v; },
+      get _original() { return bgmCombinedEdit._original; },
+      set _original(v) { bgmCombinedEdit._original = v; },
+      _enterEdit(clearFirst) {
+        bgmCell._enterEdit(clearFirst);
+        setTimeout(() => { try { bgmUrlInput.focus(); } catch {} }, 0);
+      },
+      _exitEdit(commit) { bgmCell._exitEdit(commit); },
+    };
+    bgmCell._parent = bgmCell;
+    bgmCell._ruleCell = bgmUrlCell;
+    bgmUrlCell._parent = bgmCell;
+    Object.defineProperty(bgmCell, '_list', {
+      configurable: true, enumerable: false,
+      get() { return bgmCombinedEdit._editing ? [bgmCell, bgmUrlCell] : [bgmCell]; },
+    });
+    Object.defineProperty(bgmUrlCell, '_list', {
+      configurable: true, enumerable: false,
+      get() { return [bgmUrlCell]; },
+    });
+
+    tdBgmid._acgripCell = bgmCell;
+    bgmTextInput._acgripCell = bgmCell;
+    bgmUrlInput._acgripCell = bgmUrlCell;
+    tdBgmid.tabIndex = 0;
+
+    bgmEditBtn.addEventListener('click', (e) => { e.stopPropagation(); bgmCell._enterEdit(false); });
+    bgmDoneBtn.addEventListener('click', () => { bgmCell._exitEdit(true); try { tdBgmid.focus(); } catch {} });
+
+    bgmTextInput.addEventListener('input', () => {
+      row.BGMID = bgmTextInput.value;
       refreshTempEditedMark(tr);
       applyRowBackground(tr);
       scheduleDraftSave();
     });
-    tdBgmid.appendChild(bgmidDiv);
-    makeCell(tdBgmid, bgmidDiv, tr); initCell(tdBgmid._acgripCell);
+    bgmUrlInput.addEventListener('input', () => {
+      row.BGMIDURL = bgmUrlInput.value;
+      refreshTempEditedMark(tr);
+      applyRowBackground(tr);
+      scheduleDraftSave();
+    });
+
+    /* 粘贴拦截：含链接的富文本拆分到两个 input */
+    bgmTextInput.addEventListener('paste', (e) => {
+      if (!bgmCombinedEdit._editing) bgmCell._enterEdit(false);
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const html = e.clipboardData.getData('text/html');
+      const text = e.clipboardData.getData('text/plain');
+      let t = '', url = '';
+      if (html) {
+        const parsed = splitBGMIDHtml(html);
+        t = parsed.text; url = parsed.url;
+      } else {
+        t = String(text || '').replace(/\s+/g, ' ').trim();
+      }
+      bgmTextInput.value = t; row.BGMID = t;
+      if (url && !bgmUrlInput.value.trim()) {
+        bgmUrlInput.value = url; row.BGMIDURL = url;
+      }
+      refreshTempEditedMark(tr);
+      applyRowBackground(tr);
+      scheduleDraftSave();
+    }, true);
+
+    initCell(bgmCell);
+    initCell(bgmUrlCell);
 
     /* 9. 名称 */
     const tdName = cE('td'); tdName.className = 'u-cell';
@@ -4159,6 +4812,8 @@ function showEditDialog() {
         if (dlInput._acgripCell && dlInput._acgripCell._editing) return;
         if (tdDownloaded.contains(document.activeElement)) return;
         tdDownloaded.classList.remove('u-focus-expand');
+        /* 失焦后要把 textarea 背景从 #1e1e1e 换回透明（走 applyRowBackground 里的 else 分支） */
+        try { applyRowBackground(tr); } catch (e) {}
         dlInput.style.height = '';
         dlInput.style.width = '';
         dlInput.style.maxWidth = '';
@@ -4167,7 +4822,6 @@ function showEditDialog() {
           ? ''
           : (items.length === 1 ? String(items[0]) : `${items[items.length - 1]}+${items.length - 1}`);
         dlInput.style.height = '20px';
-        console.log('[记录列] blur 后显示摘要', { value: dlInput.value });
       }, 0);
     });
     tdDownloaded.appendChild(dlInput);
@@ -4199,7 +4853,6 @@ function showEditDialog() {
         adjustAdaptiveColumns();
       }
 
-      // 兜底：Tab / 点击切换时焦点稍后才移走
       setTimeout(() => {
         const nowFocused = document.activeElement === dlInput;
         const items = parseDownloadedToList(row.已下载);
@@ -4220,15 +4873,15 @@ function showEditDialog() {
 
       if (wasEditing && commit) {
         adjustAdaptiveColumns();
-        console.log('[记录列] 编辑退出', { wasEditing, commit, value: dlInput.value });
       }
     };
     initCell(dlCell);
+
     tdCombined._editedKeys = ['资源', '规则'];
     tdNext._editedKeys = ['下集'];
     tdExtW._editedKeys = ['延周'];
     tdExtD._editedKeys = ['延日'];
-    tdBgmid._editedKeys = ['BGMID'];
+    tdBgmid._editedKeys = ['BGMID', 'BGMIDURL'];
     tdName._editedKeys = ['名称'];
     tdCn._editedKeys = ['中文'];
     tdYear._editedKeys = ['年'];
@@ -4257,8 +4910,8 @@ function showEditDialog() {
       下集: String(row.下集 ?? ''),
       延周: String(row.延周 ?? ''),
       延日: String(row.延日 ?? ''),
-      // 快照基准也要做 cleanBGMID（与 buildRow 一致），否则 <span> 包装会让 BGMID 列永远算"已修改"
-      BGMID: cleanBGMID(String(row.BGMID ?? '')),
+      BGMID: String(row.BGMID ?? '').trim(),
+      BGMIDURL: String(row.BGMIDURL ?? '').trim(),
       名称: String(row.名称 ?? ''),
       中文: String(row.中文 ?? ''),
       年: String(row.年 ?? ''),
@@ -4274,7 +4927,8 @@ function showEditDialog() {
 
   function computeRowFieldValue(row, key) {
     if (key === '已下载') return JSON.stringify(parseDownloadedToList(row.已下载));
-    if (key === 'BGMID') return cleanBGMID(String(row.BGMID ?? ''));
+    if (key === 'BGMID') return String(row.BGMID ?? '').trim();
+    if (key === 'BGMIDURL') return String(row.BGMIDURL ?? '').trim();
     return String(row[key] ?? '');
   }
 
@@ -4293,9 +4947,9 @@ function showEditDialog() {
   /* ===== 表格骨架 ===== */
   const header = cE('thead'); const hr = cE('tr');
   const headerCols = [
-    ['名称', '220px'], ['资源', '73px'],
+    ['名称', '210px'], ['资源', '73px'],
     ['下集', '36px'], ['总集', '36px'], ['播出', '135px'],
-    ['延周', '36px'], ['延日', '36px'], ['BGMID', '90px'],
+    ['延周', '36px'], ['延日', '36px'], ['BGMID', '100px'],
     ['名称', '64px'], ['中文', '64px'],
     ['年', '36px'], ['开播', '46px'], ['放送', '46px'], ['最大', '36px'],
     ['更新', '36px'], ['初始', '36px'], ['前季', '36px'], ['记录', '38px'],
@@ -4321,14 +4975,12 @@ function showEditDialog() {
     mainRows.sort((a, b) => {
       const ra = a._row, rb = b._row;
       const pa = parseBGMID(ra.BGMID), pb = parseBGMID(rb.BGMID);
-      // 用 effective 取值，与 applyRowHighlight 的高亮判定一致
       const maxA = Number(effective(ra, '最大', pa)) || 0;
       const maxB = Number(effective(rb, '最大', pb)) || 0;
       const nextA = Number(ra.下集) || 0, nextB = Number(rb.下集) || 0;
-      // END 判定与 applyRowHighlight 同一条件：下一集严格超过最大集即已完结
       const endA = maxA > 1 && nextA > maxA;
       const endB = maxB > 1 && nextB > maxB;
-      if (endA !== endB) return endA ? 1 : -1;    // END 行排末尾
+      if (endA !== endB) return endA ? 1 : -1;
       const da = getAirDate(ra, null, lookupDelay), db = getAirDate(rb, null, lookupDelay);
       const ta = da ? da.getTime() : Infinity, tb = db ? db.getTime() : Infinity;
       if (ta !== tb) return ta - tb;
@@ -4346,15 +4998,14 @@ function showEditDialog() {
     td.style.cssText = `padding:0;border:1px solid #444;background:${bgColor};color:#cfcfcf;font-weight:bold;font-size:12pt;line-height:22px;`;
     const inner = cE('div');
     inner.className = 'divider-inner';
-    // 背景同色覆盖在 td 上，保证 sticky 内容在滚动时不被行底干扰
     inner.style.cssText = `background:${bgColor};color:#cfcfcf;`;
     inner.textContent = label;
     td.appendChild(inner);
     tr.appendChild(td);
     return tr;
   }
+
   function makeDayDivider(d) {
-    // d 是当天 0 点；getBgByDate 的边界是当天 4 点，需要加 4 小时才能命中正确的段
     const d4 = new Date(d.getTime() + 4 * 3600 * 1000);
     return makeDividerRow(
       `[${pad(d4.getMonth() + 1)}${pad(d4.getDate())} ${WEEKDAY_LABEL[d4.getDay()]}]`,
@@ -4372,11 +5023,9 @@ function showEditDialog() {
     const mainRows = [...tbody.children].filter(tr => tr._row);
     if (!mainRows.length) return;
 
-    const rowsByDate = new Map(), noDateRows = [], endRows = [];
+    const rowsByDate = new Map(), noDateRows = [], endRows = [], emptyRows = [];
     for (const tr of mainRows) {
       const row = tr._row;
-
-      // END 判定优先使用"原始快照"（保存时的值），避免临时编辑触发重排
       const orig = tr._originalValues;
       const parsed = parseBGMID(row.BGMID);
       const maxRaw = (orig && String(orig.最大 ?? '').trim())
@@ -4391,13 +5040,18 @@ function showEditDialog() {
       if (max > 1 && next > max) { endRows.push(tr); continue; }
 
       const adj = getAirDateAdjusted(row, lookupDelay);
-      if (!adj) { noDateRows.push(tr); continue; }
+      if (!adj) {
+        /* 空行（ensureTrailingEmpty 产生的）单独放，不触发「未定」分隔行 */
+        if (rowIsEmpty(row)) emptyRows.push(tr);
+        else noDateRows.push(tr);
+        continue;
+      }
       const k = dateKey(adj);
       if (!rowsByDate.has(k)) rowsByDate.set(k, []);
       rowsByDate.get(k).push(tr);
     }
 
-    const today = new Date(); today.setHours(0, 0, 0, 0);
+    const today = align4(new Date());
     const todayKey = dateKey(today);
     const endKey = dateKey(new Date(today.getTime() + 7 * 86400000));
     const curM = today.getMonth() + 1;
@@ -4443,11 +5097,12 @@ function showEditDialog() {
       frag.appendChild(makeDividerRow('[未定]', '#7e7e7e'));
       for (const tr of noDateRows) frag.appendChild(tr);
     }
-    // END 行统一放末尾
     if (endRows.length) {
       frag.appendChild(makeDividerRow('[已完结]', '#7e7e7e'));
       for (const tr of endRows) frag.appendChild(tr);
     }
+    /* 空行放到最后（保持可输入） */
+    for (const tr of emptyRows) frag.appendChild(tr);
     tbody.innerHTML = ''; tbody.appendChild(frag); applyRowBackgrounds();
     if (selectedRows.size) for (const tr of tbody.children) if (tr._row && selectedRows.has(tr._row)) tr.classList.add('row-selected');
     updateSelectionBorders();
@@ -4475,11 +5130,14 @@ function showEditDialog() {
       else bgToUse = bg;
       td.style.setProperty('background', bgToUse, 'important');
       const ta = td.querySelector('textarea.u-downloaded');
-      if (ta && !ta.closest('.editing-expand') && !ta.closest('.u-focus-expand')) {
-        ta.style.setProperty('background', 'transparent', 'important');
+      if (ta) {
+        if (td.classList.contains('editing-expand') || td.classList.contains('u-focus-expand')) {
+          ta.style.setProperty('background', '#1e1e1e', 'important');
+        } else {
+          ta.style.setProperty('background', 'transparent', 'important');
+        }
       }
     }
-    // 空值列覆盖：仅在未选中且非临时编辑时套用"上一时段色"
     if (!isSelected) {
       const checkEmpty = [
         [1, () => !String(row.资源 ?? '').trim() && !String(row.规则 ?? '').trim()],
@@ -4537,7 +5195,11 @@ function showEditDialog() {
       updateDelayNameHighlight();
       const active = document.activeElement;
       const editing = active && (active.tagName === 'INPUT' || active.tagName === 'TEXTAREA' || active.isContentEditable);
-      if (!editing) rebuildDividerRows();
+      /* 焦点在表格内任意 cell（含总集/播出这类 display cell）时都不重建 tbody，
+     * 否则 display cell 被销毁 → 焦点掉到 body → 失焦 + 浮层消失 + padding 回落。 */
+      const focusInTable = !!(active && tbody.contains(active));
+      if (!editing && !focusInTable) rebuildDividerRows();
+      _recomputeFloatPad();
       scheduleDraftSave();
     }, 150);
   }
@@ -4581,7 +5243,6 @@ function showEditDialog() {
         if (w > maxW) maxW = w;
       }
 
-      // 列宽上限：不超过滚动容器可见宽度
       const scroll = host.closest('#gmEditScroll');
       if (scroll) {
         maxW = Math.min(maxW, Math.max(60, scroll.clientWidth - 40));
@@ -4589,14 +5250,9 @@ function showEditDialog() {
       th.style.setProperty('width', maxW + 'px', 'important');
       th.style.setProperty('min-width', maxW + 'px', 'important');
       th.style.setProperty('max-width', maxW + 'px', 'important');
-      th.style.setProperty('width', maxW + 'px', 'important');
-      th.style.setProperty('min-width', maxW + 'px', 'important');
-      th.style.setProperty('max-width', maxW + 'px', 'important');
     }
 
-    // 列宽变化可能影响 dialog 需要的宽度，需重新布局
     if (_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none') {
-      // 防止频繁调用
       if (!adjustAdaptiveColumns._layoutTimer) {
         adjustAdaptiveColumns._layoutTimer = setTimeout(() => {
           adjustAdaptiveColumns._layoutTimer = null;
@@ -4625,7 +5281,6 @@ function showEditDialog() {
       const left = Math.max(0, Math.min(rect.left, vw - 60));
       return Math.max(60, vw - left - 40);
     }
-    // 优先以滚动容器可见宽度为上限，避免展开的输入框撑出横向滚动
     const scroll = el.closest('#gmEditScroll');
     if (scroll) {
       return Math.max(60, scroll.clientWidth - 24);
@@ -4640,78 +5295,66 @@ function showEditDialog() {
 
   function autoResizeInput(input) {
     const cls = input.classList;
-    const isWide = cls && (cls.contains('u-name') || cls.contains('u-cn') || cls.contains('u-update'));
-    const avail = computeAvailableWidth(input, isWide);
 
-    // BGMID（含非编辑聚焦态 / 编辑态）：右对齐，通过离屏 clone 按 pre-wrap 计算最长行宽度
     if (input.classList && input.classList.contains('u-bgmid')) {
+      /* 保持原逻辑（历史遗留，可能已不触发，因为 BGMID 已改复合单元格） */
       const container = input.closest('#unifiedTableHost') || input.closest('#gmEditOverlay') || document.body;
       const cRect = container.getBoundingClientRect();
       const td = input.closest('td');
       const tdRect = td ? td.getBoundingClientRect() : input.getBoundingClientRect();
       const availRight = Math.max(60, tdRect.right - cRect.left - 12);
-
-      // 归一文本为"多行"形式（逗号后插入换行）
       const raw = String(input.textContent ?? '');
       let normalized;
-      if (raw.includes('\n')) {
-        normalized = raw;
-      } else {
+      if (raw.includes('\n')) normalized = raw;
+      else {
         const parts = raw.split(',');
         normalized = parts.map((p, i) => i < parts.length - 1 ? p + ',\n' : p).join('');
       }
-
-      // 离屏 clone 测量
       const clone = document.createElement('div');
       clone.textContent = normalized;
       const cs = getComputedStyle(input);
       Object.assign(clone.style, {
-        position: 'absolute',
-        visibility: 'hidden',
-        pointerEvents: 'none',
-        top: '-9999px',
-        left: '0',
-        width: 'max-content',
-        minWidth: '0',
-        maxWidth: availRight + 'px',
-        height: 'auto',
-        maxHeight: 'none',
-        padding: '2px 4px',
-        border: '0',
-        boxSizing: 'border-box',
-        whiteSpace: 'pre-wrap',
-        wordBreak: 'break-all',
-        overflow: 'visible',
-        fontFamily: cs.fontFamily,
-        fontSize: cs.fontSize,
-        fontWeight: cs.fontWeight,
-        fontStyle: cs.fontStyle,
-        lineHeight: '1.4',
+        position: 'absolute', visibility: 'hidden', pointerEvents: 'none',
+        top: '-9999px', left: '0',
+        width: 'max-content', minWidth: '0', maxWidth: availRight + 'px',
+        height: 'auto', maxHeight: 'none',
+        padding: '2px 4px', border: '0', boxSizing: 'border-box',
+        whiteSpace: 'pre-wrap', wordBreak: 'break-all', overflow: 'visible',
+        fontFamily: cs.fontFamily, fontSize: cs.fontSize, fontWeight: cs.fontWeight,
+        fontStyle: cs.fontStyle, lineHeight: '1.4',
       });
       document.body.appendChild(clone);
       void clone.offsetWidth;
       const measuredW = clone.getBoundingClientRect().width;
       clone.remove();
-
-      // 冗余：padding 左右 8 + 边框 2 + 亚像素/字距缓冲 12
       const targetW = Math.min(availRight, Math.max(tdRect.width, Math.ceil(measuredW) + 12));
       input.style.setProperty('width', targetW + 'px', 'important');
       input.style.setProperty('max-width', availRight + 'px', 'important');
       input.style.setProperty('box-sizing', 'border-box', 'important');
       return;
     }
-    // input / textarea
+
+    /* 普通 input / textarea：最小值跟随列宽 */
+    const td = input.closest('td');
+    const tdW = td ? td.getBoundingClientRect().width : 38;
+    const container = td ? (td.closest('#unifiedTableHost') || td.closest('#gmEditOverlay') || document.body) : document.body;
+    const cRect = container.getBoundingClientRect();
+    const containerRight = cRect.left + container.clientWidth;
+    const tdRect = td ? td.getBoundingClientRect() : input.getBoundingClientRect();
+    const avail = Math.max(60, containerRight - tdRect.left - 8);
+
     const rawValue = (input.value ?? input.textContent ?? '') || '';
     const placeholder = input.placeholder || '';
     const text = rawValue || placeholder;
     const textW = measureTextWidth(text, '16px sans-serif');
-    const baseMin = isWide ? 240 : 38;
-    const minW = Math.max(baseMin, input.parentElement?.clientWidth || 0);
-    const w = Math.max(minW, Math.min(avail, textW + 24));
+
+    const minW = Math.max(tdW, textW + 24);
+    const w = Math.min(avail, minW);
     input.style.setProperty('width', w + 'px', 'important');
     input.style.setProperty('max-width', avail + 'px', 'important');
     input.style.setProperty('box-sizing', 'border-box', 'important');
   }
+
   function autoResizeEditLayer(editLayer, ruleInput) {
     const textW = measureTextWidth(ruleInput.value || '', '16px monospace');
     const avail = computeAvailableWidth(editLayer);
@@ -4725,11 +5368,17 @@ function showEditDialog() {
     if (!inExpand) return;
     ta.style.height = 'auto';
     ta.style.height = ta.scrollHeight + 'px';
-    const avail = computeAvailableWidth(ta);
+
+    const container = ta.closest('#unifiedTableHost') || ta.closest('#gmEditOverlay') || document.body;
+    const cRect = container.getBoundingClientRect();
+    const containerRight = cRect.left + container.clientWidth;
+    const tdRect = parent ? parent.getBoundingClientRect() : ta.getBoundingClientRect();
+    const availRight = Math.max(80, containerRight - tdRect.left - 8);
+
     const maxLineW = String(ta.value || '').split('\n').reduce((m, l) => Math.max(m, measureTextWidth(l, '16px sans-serif')), 0);
-    const w = Math.min(avail, Math.max(80, maxLineW + 20));
+    const w = Math.min(availRight, Math.max(80, maxLineW + 20));
     ta.style.setProperty('width', w + 'px', 'important');
-    ta.style.setProperty('max-width', avail + 'px', 'important');
+    ta.style.setProperty('max-width', availRight + 'px', 'important');
   }
   /* ===== 行选择事件 ===== */
   tbody.addEventListener('mousedown', (e) => {
@@ -4739,7 +5388,6 @@ function showEditDialog() {
 
     if (isShift) {
       e.preventDefault(); e.stopPropagation();
-      // Shift+点击：从 anchor（或当前行）扩展到目标行
       const base = (selAnchorTr && selAnchorTr.isConnected) ? selAnchorTr : tr;
       if (!selAnchorTr || !selAnchorTr.isConnected) selAnchorTr = base;
       setRangeSelection(base, tr);
@@ -4747,13 +5395,11 @@ function showEditDialog() {
     }
     if (isControl) {
       e.preventDefault(); e.stopPropagation();
-      // Ctrl+点击：独立切换；anchor 更新为当前行
       toggleSelect(tr);
       selAnchorTr = tr;
       return;
     }
 
-    // 无修饰键
     if (e.target.closest('input, textarea, button, a, [contenteditable], .u-combined')) {
       const sel = getSelectedRows();
       if (sel.length > 1 || !tr.classList.contains('row-selected')) {
@@ -4851,10 +5497,12 @@ function showEditDialog() {
     const rows = getSelectedRows(); if (!rows.length) { showToast('请先选择行'); return; }
     let opened = 0;
     for (const tr of rows) {
-      const url = expandResourceUrl(extractFirstUrl(tr._row.BGMID), tr._row);
+      const row = tr._row;
+      let url = String(row.BGMIDURL ?? '').trim();
+      if (!url) url = expandResourceUrl(extractFirstUrl(row.BGMID), row);
       if (url) { window.open(url, '_blank', 'noopener'); opened++; }
     }
-    if (!opened) showToast('无BGMID内嵌链接');
+    if (!opened) showToast('无BGMID链接');
   });
   dialog.querySelector('#deleteSelectedBtn').addEventListener('click', () => {
     const rows = getSelectedRows(); if (!rows.length) { showToast('请先选择行'); return; }
@@ -4878,7 +5526,7 @@ function showEditDialog() {
     const title = cE('h3'); title.textContent = '从表格导入'; title.style.margin = '0';
     const hint = cE('div');
     hint.style.cssText = 'color:#909090;line-height:1.4;font-size:11pt;';
-    hint.innerHTML = '在 Excel 中选中数据区域（含表头）复制，粘贴到下方虚线框。<br>支持的列名：下集、中文、名称、年、开播、放送、最大、初始、前季、更新、BGMID、资源、规则、延周、延日、已下载/记录。';
+    hint.innerHTML = '在 Excel 中选中数据区域（含表头）复制，粘贴到下方虚线框。<br>支持的列名：下集、中文、名称、年、开播、放送、最大、初始、前季、更新、BGMID、BGMIDURL、资源、规则、延周、延日、已下载/记录。';
     const area = cE('div'); area.contentEditable = 'true';
     area.style.cssText = 'border:2px dashed #555;border-radius:6px;padding:8px;min-height:130px;max-height:50vh;overflow:auto;background:#252525;color:#d4d4d4;font-size:12pt;';
     const btnRow = cE('div'); btnRow.style.cssText = 'display:flex;gap:6px;justify-content:flex-end;';
@@ -4890,11 +5538,10 @@ function showEditDialog() {
       const importedRows = importTableHtml(area.innerHTML);
       if (!importedRows.length) { alert('未识别到表格数据'); return; }
 
-      // 1. 从 UI 读当前快照（副本）+ 每行的原值元数据
       const metas = [];
       {
         let idx = 0;
-        const allRowObjects = collectUnifiedRows(); // [{...row}]
+        const allRowObjects = collectUnifiedRows();
         for (const tr of tbody.querySelectorAll('tr')) {
           if (!tr._row || rowIsEmpty(tr._row)) continue;
           const copy = allRowObjects[idx] || { ...tr._row };
@@ -4903,7 +5550,6 @@ function showEditDialog() {
         }
       }
 
-      // 2. 名称匹配工具
       function namesOfRow(row) {
         const p = parseBGMID(row.BGMID || '');
         return new Set([
@@ -4939,28 +5585,25 @@ function showEditDialog() {
         }
 
         if (matchedMeta && updateExisting) {
-          // 修改的是副本 meta.row，后续重建时生效
           for (const [k, v] of Object.entries(ir)) {
             if (v === '' || v == null) continue;
             matchedMeta.row[k] = v;
           }
           updated++;
-          console.log('[导入] 更新已有行', { name: [...importNames][0], fields: Object.keys(ir) });
         } else if (!matchedMeta) {
           const newRow = {
             下集: ir['下集'] || '', 中文: ir['中文'] || '', 名称: ir['名称'] || '', 年: ir['年'] || '',
             开播: ir['开播'] || '', 放送: ir['放送'] || '', 最大: ir['最大'] || '', 初始: ir['初始'] || '',
-            前季: ir['前季'] || '', 更新: ir['更新'] || '', BGMID: ir['BGMID'] || '',
+            前季: ir['前季'] || '', 更新: ir['更新'] || '',
+            BGMID: ir['BGMID'] || '', BGMIDURL: ir['BGMIDURL'] || '',
             资源: ir['资源'] || '', 规则: ir['规则'] || '', 延周: ir['延周'] || '', 延日: ir['延日'] || '',
             已下载: ir['已下载'] || '',
           };
           newRows.push(newRow);
           added++;
-          console.log('[导入] 新增行', { name: [...importNames][0] });
         }
       }
 
-      // 3. 只重建 UI（不写 bangumiData）；buildRow 用 storedRowSnapshot 作基准，已有行对比存储、新增行对比空
       tbody.innerHTML = '';
       for (const meta of metas) buildRow(meta.row);
       for (const row of newRows) buildRow(row);
@@ -4970,7 +5613,6 @@ function showEditDialog() {
       adjustAdaptiveColumns();
       updateDelayNameHighlight();
 
-      // 4. 立即写草稿
       flushDraftSave();
 
       ov.remove();
@@ -5009,7 +5651,9 @@ function showEditDialog() {
       const newRows = collectUnifiedRows().map(r => {
         const out = { ...r };
         out.已下载 = parseDownloadedToList(out.已下载);
-        out.BGMID = cleanBGMID(out.BGMID);
+        out.BGMID = String(out.BGMID ?? '').trim();
+        out.BGMIDURL = String(out.BGMIDURL ?? '').trim();
+        if (!out.BGMIDURL) delete out.BGMIDURL;
         const parsed = parseBGMID(out.BGMID);
         for (const f of ['名称', '中文', '年', '开播', '最大']) {
           const def = String(parsed[f] ?? '').trim();
@@ -5031,7 +5675,6 @@ function showEditDialog() {
         match: dialog.querySelector('#inpLastDownload').value,
         viewed: dialog.querySelector('#inpLastViewed').value,
       });
-      // 保存后，三个输入框的临时修改标记清除
       lastModified.viewed = false;
       lastModified.id = false;
       lastModified.match = false;
@@ -5041,7 +5684,6 @@ function showEditDialog() {
       try { window.dispatchEvent(new CustomEvent('acgrip-bangumi-saved')); } catch {}
       const newRuleKeys = new Set(Object.keys(collectTrackingFromRows(newRows)).filter(k => !oldTrackingKeys.has(k)));
 
-      // 删除 UI 上所有空行（保留最后一个作为输入位，由 ensureTrailingEmpty 补）
       const emptyTrs = [];
       for (const tr of tbody.children) {
         if (tr._row && rowIsEmpty(tr._row)) emptyTrs.push(tr);
@@ -5049,7 +5691,6 @@ function showEditDialog() {
       for (const tr of emptyTrs) tr.remove();
       ensureTrailingEmpty();
 
-      // 关键：先重置快照再 sortMainRows，让 END 判定用新值，已完结变未完结的行能回到原位
       for (const tr of tbody.querySelectorAll('tr')) {
         if (!tr._row) continue;
         tr._originalValues = snapshotRowValues(tr._row);
@@ -5059,7 +5700,6 @@ function showEditDialog() {
       sortMainRows();
       showToast('已保存');
 
-      // 保存后重置快照，清除临时编辑标记
       for (const tr of tbody.querySelectorAll('tr')) {
         if (!tr._row) continue;
         tr._originalValues = snapshotRowValues(tr._row);
@@ -5082,7 +5722,7 @@ function showEditDialog() {
     _gmEditHide = null;
     _gmEditRelayout = null;
     if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
-    try { localStorage.setItem(PANEL_OPEN_KEY, '1'); } catch {}  // 重建后保持打开
+    try { localStorage.setItem(PANEL_OPEN_KEY, '1'); } catch {}
     showEditDialog();
   });
   /* ===== 全局 Esc / Ctrl+S ===== */
@@ -5115,8 +5755,6 @@ function showEditDialog() {
       form.requestSubmit();
     }
   };
-  // 首次挂载由 _gmEditShow 统一处理
-  /** 根据视口宽度决定是"并排显示"还是"居中覆盖" */
   function layoutOverlay() {
     const vw = window.innerWidth || document.documentElement.clientWidth;
     const vh = window.innerHeight || document.documentElement.clientHeight;
@@ -5153,19 +5791,17 @@ function showEditDialog() {
       overlay.style.left = '0';
       overlay.style.right = '0';
       overlay.style.justifyContent = 'center';
-      overlay.style.alignItems = 'flex-start';   // 顶部对齐，便于设置 margin-top
+      overlay.style.alignItems = 'flex-start';
       overlay.style.background = 'transparent';
       overlay.style.pointerEvents = 'auto';
       overlay.style.padding = '';
       dialog.style.pointerEvents = 'auto';
       dialog.style.maxWidth = `${Math.min(naturalW, vw - 40)}px`;
-      // 非并排模式：给对话框留顶部间距，底部保持在窗口内
-      const topMargin = Math.min(50, vh - 20);  // 窗口过矮时降级，保证底部可见
+      const topMargin = Math.min(50, vh - 20);
       dialog.style.marginTop = topMargin + 'px';
       dialog.style.maxHeight = `calc(${vh}px - ${topMargin}px - 20px)`;
     }
 
-    // 先让布局生效（split 后 session-bar 会移位），再计算浮标位置以拿到最新 rect
     void document.body.offsetWidth;
     requestAnimationFrame(() => positionDisplay());
   }
@@ -5184,16 +5820,13 @@ function showEditDialog() {
   };
   let _layoutResizeTimer = null;
   const layoutResizeHandler = () => {
-    // 无论 UI 是否打开，都跟随调整悬浮位置
     if (_layoutResizeTimer) clearTimeout(_layoutResizeTimer);
     _layoutResizeTimer = setTimeout(() => {
       _layoutResizeTimer = null;
-      // 1) 决定是否并排（仅当 UI 显示时切换）
       const uiVisible = overlay.isConnected && overlay.style.display !== 'none';
       if (uiVisible) {
         layoutOverlay();
       } else {
-        // UI 未显示：若之前处于 split，需要根据新宽度决定去留
         const vw = window.innerWidth || document.documentElement.clientWidth;
         const shouldSplit = vw >= 1400;
         if (document.body.classList.contains('acgrip-split') !== shouldSplit) {
@@ -5201,7 +5834,6 @@ function showEditDialog() {
           else document.body.classList.remove('acgrip-split');
         }
       }
-      // 2) 无论何时都重算浮标位置
       void document.body.offsetWidth;
       requestAnimationFrame(() => positionDisplay());
     }, 150);
@@ -5215,7 +5847,6 @@ function showEditDialog() {
     document.removeEventListener('keydown', saveKeyHandler, true);
     document.addEventListener('keydown', saveKeyHandler, true);
     selfAdaptiveTextarea();
-    // 打开时按当前草稿状态刷新按钮
     setDiscardBtnEnabled(!!localStorage.getItem(DRAFT_KEY));
     requestAnimationFrame(() => {
       layoutOverlay();
@@ -5233,7 +5864,6 @@ function showEditDialog() {
       if ((row.规则 || '').trim() !== rule) continue;
 
       const oldVal = String(row.下集 ?? '');
-      // 无条件写入新值
       row.下集 = String(newNext);
 
       const nextInput = tr.querySelector('.u-next');
@@ -5242,20 +5872,16 @@ function showEditDialog() {
 
       if (nextInput) {
         if (isEditing) {
-          // 编辑态：更新 _original（避免 Esc 后回退到旧值），保留用户输入
           if (cell) cell._original = nextInput.value;
         } else {
-          // 非编辑态：立即更新显示为新的 pad2 值
           nextInput.value = pad2Display(newNext);
         }
       }
 
-      // 强制刷新派生字段（播出时间、高亮、总集等）
       if (typeof tr._updateDerived === 'function') tr._updateDerived();
 
       scheduleDraftSave();
       if (oldVal !== String(newNext)) changed = true;
-      console.log('[面板同步]', { rule, old: oldVal, new: newNext, editing: isEditing, changed });
       break;
     }
     return changed;
@@ -5400,22 +6026,18 @@ function initAjax() {
 
 /* =====================================================================
  *  供 其他脚本在acg.rip调用
- *  暴露面保持最小：只读 bangumiData、刷新 _airDate、通用 GM 存取
  * ===================================================================== */
 if (/^acg\.rip$/i.test(location.hostname)) {
   unsafeWindow.acgripApi = {
-    version: '1.4.0',
+    version: '1.4.1',
 
-    /** 读取 bangumiData（含原脚本已写入的 _airDate 字段） */
     getBangumiData: () => getValue('bangumiData'),
 
-    /** 刷新 _airDate 后返回最新 bangumiData（幂等） */
     refreshAirDates: () => {
       try { precomputeAirDatesGlobal(); } catch (e) { console.error('[acgripApi] refreshAirDates:', e); }
       return getValue('bangumiData');
     },
 
-    /** 最终名称（与面板显示、排序同一口径：中文 > 名称 > BGMID 内嵌），供桥接改名使用 */
     getDisplayName: (row) => {
       try {
         return getDisplayName(row || {}, parseBGMID((row || {}).BGMID));
@@ -5425,18 +6047,14 @@ if (/^acg\.rip$/i.test(location.hostname)) {
       }
     },
 
-    /** 通用存取：桥接可读写自己的 GM 键，无需引入 GM_* 权限 */
     getValue,
     setValue,
   };
-  console.log('[acgripApi] 已暴露 v1.4.0');
+  console.log('[acgripApi] 已暴露 v1.4.1');
 }
 
 /* =====================================================================
  *  Bangumi 首页自动「看到」标记（bgm.tv / bangumi.tv 含 #cloumnSubjectInfo 的页面）
- *  面板约定：下集 = 本季相对集数，前季 = 前季集数，总集 = 下集 + 前季
- *  由此：目标相对集数 = 下集 - 1（prgText 提交 watchedeps）
- *        目标绝对集数 = 下集 - 1 + 前季 = 总集 - 1（prg_list 匹配 li 文本）
  * ===================================================================== */
 const BG_LOG_TAG = '[acgrip·bgHome]';
 function bgLog(...args) { console.log(BG_LOG_TAG, ...args); }
@@ -5446,7 +6064,6 @@ function bgErr(...args) { console.error(BG_LOG_TAG, ...args); }
 const BG_HOME_HOST_RE = /^(?:www\.)?(?:bangumi\.tv|bgm\.tv)$/i;
 function isBangumiHomeHost() { return BG_HOME_HOST_RE.test(location.hostname); }
 
-/** 轮询等待元素出现（带超时），getter 需返回元素或 null */
 async function bgHomeWaitForEl(getter, timeout = 8000, interval = 200) {
   const start = Date.now();
   for (;;) {
@@ -5458,7 +6075,6 @@ async function bgHomeWaitForEl(getter, timeout = 8000, interval = 200) {
   }
 }
 
-/** 在 bangumiData 中按 BGMID 的 id 部分匹配行 */
 function bgHomeFindRow(subjectId) {
   const bd = getValue('bangumiData');
   if (!bd || !Array.isArray(bd.rows)) return null;
@@ -5469,10 +6085,6 @@ function bgHomeFindRow(subjectId) {
   return null;
 }
 
-/**
- * 计算目标集数：rel = 下集 - 1（本季相对，prgText 用）；abs = rel + 前季（绝对，prg_list 用，即 总集 - 1）
- * 前季缺省时 abs === rel。
- */
 function bgHomeWatchedCandidates(row) {
   const next = Number(row && row.下集) || 0;
   const prev = Number(row && row.前季) || 0;
@@ -5486,7 +6098,6 @@ function bgHomeWatchedCandidates(row) {
   };
 }
 
-/** 触发原生 hover（供 jQuery cluetip 捕获） */
 function bgHomeHover(el) {
   const r = el.getBoundingClientRect();
   const cx = r.left + r.width / 2;
@@ -5503,7 +6114,6 @@ function bgHomeHover(el) {
     try { el.dispatchEvent(new ctor(type, makeOpts(bubbles))); } catch (e) {}
   };
 
-  // 依序触发（模拟真实鼠标进入）
   fire('pointerover',  PointerEvent, true);
   fire('pointerenter', PointerEvent, false);
   fire('pointermove',  PointerEvent, true);
@@ -5511,7 +6121,6 @@ function bgHomeHover(el) {
   fire('mouseenter',   MouseEvent,   false);
   fire('mousemove',    MouseEvent,   true);
 
-  // 尝试用 jQuery 触发（cluetip 很可能基于 jQuery）
   try {
     const jq = unsafeWindow.jQuery || unsafeWindow.$;
     if (jq) {
@@ -5520,22 +6129,17 @@ function bgHomeHover(el) {
   } catch (e) {}
 }
 
-/** 隐藏 cluetip 悬浮框 */
 function bgHomeHideClueTip() {
   const tip = document.getElementById('cluetip');
   if (tip) tip.style.display = 'none';
 }
 
-/**
- * 在 ul.prg_list 里按集数文本匹配对应 <a>；targets 为数值数组，如 [2, 15]。
- * 用 Number() 匹配以兼容 "02" 这类补零写法；遇到 <li class="subtitle"> 即截断。
- */
 function bgHomeFindEpisodeLink(listEl, targets) {
   if (!listEl || !targets || !targets.length) return null;
   const set = new Set(targets.map(Number));
   for (const li of listEl.children) {
     if (!(li instanceof Element)) continue;
-    if (li.classList.contains('subtitle')) break;   // 截断：subtitle 之后是 SP/OP/ED，不算
+    if (li.classList.contains('subtitle')) break;
     const a = li.querySelector('a');
     if (!a) continue;
     const raw = (a.textContent || '').trim();
@@ -5546,10 +6150,6 @@ function bgHomeFindEpisodeLink(listEl, targets) {
   return null;
 }
 
-/**
- * 并发等待 prg_list 与 prgText（都可能是其他脚本异步添加的）。
- * 任一已出现则再等 graceMs，给"稍慢的那个"机会；已等待超过 graceMs 就提前返回，不空等到 timeout。
- */
 async function bgHomeWaitListAndPrgText(listGetter, prgGetter, timeout = 5000, interval = 150, graceMs = 800) {
   const start = Date.now();
   let listEl = null, prgInput = null, firstFoundAt = 0;
@@ -5570,10 +6170,6 @@ async function bgHomeWaitListAndPrgText(listGetter, prgGetter, timeout = 5000, i
   if (!prgInput) { try { prgInput = prgGetter(); } catch {} }
   return { listEl, prgInput };
 }
-/**
- * hover 指定 a，等 cluetip 出现后点「看到」
- * 若 cluetip 未出现，则从 #subject_prg_content 的隐藏 prginfo_<epId> 兜底
- */
 async function bgHomeHoverAndClickWatchedTill(a, subjectId = '', subjName = '') {
   const epId = (a.id || '').startsWith('prg_')
     ? a.id.slice(4)
@@ -5589,7 +6185,6 @@ async function bgHomeHoverAndClickWatchedTill(a, subjectId = '', subjName = '') 
   bgLog(`hover: id=${subjectId} 名称="${subjName}" 集数文本=${(a.textContent || '').trim()} epid=${epId} "${titleText}" → 派发 mouseover/mouseenter`);
   bgHomeHover(a);
 
-  // 等待 cluetip 出现，且 #prginfo_<epId> 可见
   let inner = await bgHomeWaitForEl(() => {
     const tip = document.getElementById('cluetip');
     if (!tip) return null;
@@ -5600,7 +6195,6 @@ async function bgHomeHoverAndClickWatchedTill(a, subjectId = '', subjName = '') 
     return box;
   }, 4000, 100);
 
-  // 兜底：cluetip 没出现时，从 #subject_prg_content 中取 WatchedTill
   if (!inner) {
     bgWarn(`hover: id=${subjectId} 集数=${(a.textContent || '').trim()} epid=${epId} → cluetip 未出现，尝试从隐藏 prginfo 中取 WatchedTill`);
     const hidden = document.getElementById('prginfo_' + epId);
@@ -5645,7 +6239,6 @@ async function bgHomeHoverAndClickWatchedTill(a, subjectId = '', subjName = '') 
 async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
   const tag = `[grid ${idx + 1}/${total}]`;
 
-  /* ===== 1. 找 subject 链接 ===== */
   const subjLink =
         grid.querySelector('a[data-subject-id][href^="/subject/"]') ||
         grid.querySelector('.tinyHeader a[href^="/subject/"]') ||
@@ -5661,7 +6254,6 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
         (subjLink.dataset && (subjLink.dataset.subjectNameCn || subjLink.dataset.subjectName)) ||
         (subjLink.textContent || '').trim() || '';
 
-  /* ===== 2. 查表 ===== */
   const row = bgHomeFindRow(subjectId);
   if (!row) { bgLog(tag, `id=${subjectId} 名称="${subjName}" → 表格中无匹配，跳过`); return { status: 'skip', reason: 'not-in-table', subjectId, subjName }; }
 
@@ -5674,21 +6266,6 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
   }
   const baseInfo = `id=${subjectId} 名称="${subjName}" 下集=${nextEp} 前季=${prevEp} 目标(相对)=${rel.join('/') || '-'} 目标(绝对)=${abs.join('/') || '-'}`;
 
-  /* ===== 3. 已同步到 / 超过目标进度则跳过 ===== */
-  const wrapper = grid.closest('.infoWrapper') || grid.parentElement;
-  const progressInput = wrapper
-    ? (wrapper.querySelector('#watched_eps_' + subjectId) || wrapper.querySelector('.progressBar input[name="watchedeps"]'))
-    : null;
-  if (progressInput) {
-    const cur = Number(progressInput.value);
-    const target = rel[0] ?? 0;
-    if (Number.isFinite(cur) && cur >= target) {
-      bgLog(tag, baseInfo, `→ Bangumi 已为 ${cur}，无需更新，跳过`);
-      return { status: 'skip', reason: 'already-synced', subjectId, cur, target };
-    }
-  }
-
-  /* ===== 4. 并发等待 prg_list / prgText ===== */
   bgLog(tag, baseInfo, `→ 并发等待 prg_list / prgText…`);
   const { listEl, prgInput: prgInputInitial } = await bgHomeWaitListAndPrgText(
     () => grid.querySelector('ul.prg_list'),
@@ -5697,10 +6274,35 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
     5000, 150, 800
   );
   let prgInput = prgInputInitial;
+
+  let hit = null;
+  if (listEl && abs.length) {
+    hit = bgHomeFindEpisodeLink(listEl, abs);
+    if (hit) {
+      if (hit.el.classList.contains('epBtnWatched')) {
+        bgLog(tag, baseInfo, `→ prg_list 中目标集数 ${hit.ep} 已是 epBtnWatched 状态，跳过`);
+        return { status: 'skip', reason: 'already-watched', subjectId, ep: hit.ep };
+      }
+    }
+  }
+  if (!hit) {
+    const wrapper = grid.closest('.infoWrapper') || grid.parentElement;
+    const progressInput = wrapper
+      ? (wrapper.querySelector('#watched_eps_' + subjectId) || wrapper.querySelector('.progressBar input[name="watchedeps"]'))
+      : null;
+    if (progressInput) {
+      const cur = Number(progressInput.value);
+      const target = rel[0] ?? 0;
+      if (Number.isFinite(cur) && cur >= target) {
+        bgLog(tag, baseInfo, `→ prg_list 未命中，回退 prgText 判定：已为 ${cur}，跳过`);
+        return { status: 'skip', reason: 'already-synced', subjectId, cur, target };
+      }
+    }
+  }
+
   bgLog(tag, baseInfo,
         `→ 等待完成：prg_list=${listEl ? `有（${listEl.querySelectorAll('li > a').length} 项）` : '无'}，prgText=${prgInput ? '有' : '无'}`);
 
-  /* ===== 5. prg_list 命中则 hover 并点「看到」 ===== */
   if (listEl && abs.length) {
     const hit = bgHomeFindEpisodeLink(listEl, abs);
     if (hit) {
@@ -5720,7 +6322,6 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
     bgLog(tag, baseInfo, `→ prg_list 不存在，直接使用 prgText 兜底`);
   }
 
-  /* ===== 6. 兜底：prgText 输入框（用相对集数） ===== */
   if (!rel.length) { bgWarn(tag, baseInfo, `→ ❌ 兜底失败：无可用的相对集数`); return { status: 'fail', reason: 'no-relative-target', subjectId }; }
 
   if (!prgInput) {
@@ -5744,18 +6345,12 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
   bgLog(tag, baseInfo, `→ ✅ 成功（方式=prgText，相对集数=${target}）`);
   return { status: 'ok', method: 'prgText', subjectId, ep: target };
 }
-/**
- * 处理 subject 页面（/subject/NNN）。
- * 关键节点：h1.nameSingle a 取 subjectId 与名称；.subject_prg ul.prg_list 是集数列表（subtitle 之后截断）；
- * .panelProgress form[name=merge] 提供 prgText（提交 watchedeps）；prginfo_<epid> 是 hover 不出现时的兜底。
- */
 async function bgSubjectProcess() {
   const m = location.pathname.match(/^\/subject\/(\d+)/);
   if (!m) return;
   const subjectId = m[1];
   const tag = `[subject ${subjectId}]`;
 
-  // 等待页面关键区块出现
   await bgHomeWaitForEl(() => document.querySelector('.subject_prg ul.prg_list') ||
                         document.querySelector('.panelProgress'), 8000, 200);
 
@@ -5775,21 +6370,6 @@ async function bgSubjectProcess() {
   }
   const baseInfo = `${tag} 名称="${subjName}" 下集=${nextEp} 前季=${prevEp} 目标(相对)=${rel.join('/') || '-'} 目标(绝对)=${abs.join('/') || '-'}`;
 
-  // 已同步到 / 超过则跳过
-  const prgInputEarly =
-        document.querySelector('.panelProgress .prgText input[name="watchedeps"]') ||
-        document.querySelector('.panelProgress input[name="watchedeps"]') ||
-        document.querySelector('form[name="merge"] input[name="watchedeps"]');
-  if (prgInputEarly) {
-    const cur = Number(prgInputEarly.value);
-    const target = rel[0] ?? 0;
-    if (Number.isFinite(cur) && cur >= target) {
-      bgLog(baseInfo, `→ Bangumi 已为 ${cur}，无需更新，跳过`);
-      return;
-    }
-  }
-
-  // 并发等待 prg_list / prgText
   bgLog(baseInfo, `→ 并发等待 prg_list / prgText…`);
   const { listEl, prgInput: prgInputInitial } = await bgHomeWaitListAndPrgText(
     () => document.querySelector('.subject_prg ul.prg_list'),
@@ -5799,30 +6379,50 @@ async function bgSubjectProcess() {
     5000, 150, 800
   );
   let prgInput = prgInputInitial;
+
+  let hit = null;
+  if (listEl && abs.length) {
+    hit = bgHomeFindEpisodeLink(listEl, abs);
+    if (hit) {
+      if (hit.el.classList.contains('epBtnWatched')) {
+        bgLog(baseInfo, `→ prg_list 中目标集数 ${hit.ep} 已是 epBtnWatched 状态，跳过`);
+        return;
+      }
+    }
+  }
+  if (!hit) {
+    const progressInput =
+          document.querySelector('.panelProgress .prgText input[name="watchedeps"]') ||
+          document.querySelector('.panelProgress input[name="watchedeps"]') ||
+          document.querySelector('form[name="merge"] input[name="watchedeps"]');
+    if (progressInput) {
+      const cur = Number(progressInput.value);
+      const target = rel[0] ?? 0;
+      if (Number.isFinite(cur) && cur >= target) {
+        bgLog(baseInfo, `→ prg_list 未命中，回退 prgText 判定：已为 ${cur}，跳过`);
+        return;
+      }
+    }
+  }
   bgLog(baseInfo,
         `→ 等待完成：prg_list=${listEl ? `有（${listEl.querySelectorAll('li > a').length} 项）` : '无'}，prgText=${prgInput ? '有' : '无'}`);
 
-  // prg_list 命中则 hover 并点「看到」
-  if (listEl && abs.length) {
-    const hit = bgHomeFindEpisodeLink(listEl, abs);
-    if (hit) {
-      bgLog(baseInfo, `→ prg_list 命中绝对集数 ${hit.ep}，尝试 hover 并点击「看到」`);
-      const res = await bgHomeHoverAndClickWatchedTill(hit.el, subjectId, subjName);
-      if (res.ok) {
-        bgLog(baseInfo, `→ ✅ 成功（方式=hover，绝对集数=${hit.ep}，epid=${res.epId}）`);
-        return;
-      }
-      bgWarn(baseInfo, `→ ❌ hover 方式失败（绝对集数=${hit.ep}，原因=${res.reason}），转 prgText 兜底`);
-    } else {
-      bgLog(baseInfo, `→ prg_list 中未找到目标绝对集数（${abs.join('/')}），转 prgText 兜底`);
+  if (hit) {
+    bgLog(tag, baseInfo, `→ prg_list 命中绝对集数 ${hit.ep}，尝试 hover 并点击「看到」`);
+    const res = await bgHomeHoverAndClickWatchedTill(hit.el, subjectId, subjName);
+    if (res.ok) {
+      bgLog(tag, baseInfo, `→ ✅ 成功（方式=hover，绝对集数=${hit.ep}，epid=${res.epId}）`);
+      return { status: 'ok', method: 'hover', subjectId, ep: hit.ep, epId: res.epId };
     }
+    bgWarn(tag, baseInfo, `→ ❌ hover 方式失败（绝对集数=${hit.ep}，原因=${res.reason}），转 prgText 兜底`);
+  } else if (listEl && abs.length) {
+    bgLog(tag, baseInfo, `→ prg_list 中未找到目标绝对集数（${abs.join('/')}），转 prgText 兜底`);
   } else if (listEl) {
-    bgLog(baseInfo, `→ prg_list 存在但无目标绝对集数，转 prgText 兜底`);
+    bgLog(tag, baseInfo, `→ prg_list 存在但无目标绝对集数，转 prgText 兜底`);
   } else {
-    bgLog(baseInfo, `→ prg_list 不存在，直接使用 prgText 兜底`);
+    bgLog(tag, baseInfo, `→ prg_list 不存在，直接使用 prgText 兜底`);
   }
 
-  // prgText 兜底
   if (!rel.length) { bgWarn(baseInfo, `→ ❌ 兜底失败：无可用的相对集数`); return; }
 
   if (!prgInput) {
@@ -5850,7 +6450,6 @@ async function bgSubjectProcess() {
   submitBtn.click();
   bgLog(baseInfo, `→ ✅ 成功（方式=prgText，相对集数=${target}）`);
 }
-/** 主入口 */
 async function runBangumiHomeAutoMark() {
   if (!isBangumiHomeHost()) return;
 
@@ -5866,7 +6465,6 @@ async function runBangumiHomeAutoMark() {
   }
   bgLog('已找到 #cloumnSubjectInfo，等待侧栏内容渲染…');
 
-  // 等待 Bangumi 自身 / 其他脚本把侧栏内容渲染出来
   await sleep(800);
 
   loadDatas();
@@ -5923,10 +6521,8 @@ if (isBangumiHomeHost()) {
   const kickoff = () => {
     const path = location.pathname;
     if (/^\/subject\/\d+/.test(path)) {
-      // subject 页面
       bgSubjectProcess().catch(e => bgErr('bgSubjectProcess:', e));
     } else {
-      // 首页（其他路径会因为找不到 #cloumnSubjectInfo 而自行退出）
       runBangumiHomeAutoMark().catch(e => bgErr('runBangumiHomeAutoMark:', e));
     }
   };

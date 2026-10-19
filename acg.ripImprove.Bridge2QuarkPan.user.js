@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.6.2
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 [bgm]名称[bgm]原始文件名）
+// @version 3.10.5
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；自动子任务前强制等待夸克侧预清理完成；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描时自愈旧记录空字段）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -33,26 +33,27 @@
   const GM_TASKS = 'acgrip_bridge_tasks';
   const GM_RESULTS = 'acgrip_bridge_results';
   const BUSY_KEY = 'acgrip_bridge_busy';
-  /* 夸克助手的历史键：改名后同步记录用（失败不影响主流程） */
   const GM_DL_RECORDS = 'quark_auto_dl_records';
   const GM_QRECORDS = 'quark_download_records';
+  const GM_FULL_RESAVE_DEBUG = 'acgrip_quark_full_resave_debug';
 
   const TASK_TTL = 3 * 60 * 1000;
   const TAB_RESULT_TIMEOUT = 90 * 1000;
 
-  /* 转存记录不按时间过期，是否过期只依据 acg.ripImprove 清单（sweepObsoleteRecords）。 */
   const BASE_CD = 30 * 60 * 1000;
   const MAX_CD = 7 * 24 * 60 * 60 * 1000;
   const AUTO_TTL = 5 * 60 * 1000;
+
+  const FULL_RESAVE_DEBUG_MAX = 10;
+  const AUTO_CLOSE_DELAY_MS = 5000; // 自动任务下载完成后，延迟关页，避免下载未唤起
+  const OBSOLETE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 孤立记录宽限期 7 天
+  const MIN_QA_VERSION = [5, 7, 6];
 
   const log = (...a) => console.log('[桥接]', ...a);
   const warn = (...a) => console.warn('[桥接]', ...a);
 
   const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-  /* 桥接忙碌标志：夸克助手的 boot 自动下载据此跳过。
-   * 必须一直持有到"转存 → 刷新 → 改名"全部结束（改名完成前放开会让下载抢跑，
-   * 落盘文件名就还是原始名），所以只在流程 finally 里释放。*/
   function acquireBusy() { try { sessionStorage.setItem(BUSY_KEY, '1'); } catch {} }
   function releaseBusy() { try { sessionStorage.removeItem(BUSY_KEY); } catch {} }
 
@@ -66,7 +67,6 @@
     return null;
   }
 
-  /* 直接存原生类型；读取时兼容旧的 JSON 字符串 */
   function gmGet(key, def) {
     try {
       const v = GM_getValue(key);
@@ -152,33 +152,24 @@
     return String(v);
   }
 
-  /* 规范化文件大小：去空白、统一单位大小写，占位符视为未知 */
   function normalizeSizeStr(s) {
     const t = String(s ?? '').trim();
     if (!t) return '';
-    // 表格未加载完的占位符
     if (t === '--' || t === '-' || t === '—' || /^未知|loading/i.test(t)) return '';
-    // 去掉内部空白："1.5 GB" 变 "1.5GB"
     return t.replace(/\s+/g, '').toUpperCase();
   }
 
-  /* ===== 文件名标识符（改名标记）=====
-   * 改名后的文件名形如：[bgm]acg最终名称[bgm]原始文件名
-   * 桥接脚本与夸克脚本比对文件名时，一律排除两个标识符及其之间的文本
-   * （即只拿"原始文件名"部分比对）。*/
+  /* ===== 文件名标识符 [bgm]…[bgm] ===== */
   const FILE_NAME_MARKER = '[bgm]';
 
   function escapeRegExp(s) {
     return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   }
 
-  /* 标识符块（非贪婪、忽略大小写；不配对则不动）。
-   * 大小写不敏感：文件系统本身不区分，`[BGM]` 视为同一标识符。*/
   function getFileNameMarkerRe() {
     return new RegExp(`${escapeRegExp(FILE_NAME_MARKER)}[\\s\\S]*?${escapeRegExp(FILE_NAME_MARKER)}`, 'gi');
   }
 
-  /* 去掉零宽字符 + 排除所有标识符块 */
   function sanitizeFileName(s) {
     return String(s ?? '')
     .replace(/[\u200B-\u200D\uFEFF]/g, '')
@@ -186,24 +177,9 @@
     .trim();
   }
 
-  /* 规范化文件名：去零宽字符 + 排除两个标识符及其之间的文本 + trim */
-  function normalizeFileName(s) {
-    return sanitizeFileName(s);
-  }
+  function normalizeFileName(s) { return sanitizeFileName(s); }
+  function getComparableFileName(s) { return normalizeFileName(s); }
 
-  /* 去掉标识符块后是否已为空（仅剩标识符时视为空名） */
-  function isBlankFileName(s) {
-    return !sanitizeFileName(s);
-  }
-
-  /* 比对用文件名（唯一入口）：排除两个标识符及其之间的文本 */
-  function getComparableFileName(s) {
-    return normalizeFileName(s);
-  }
-
-  /* 只剥"开头连续出现的标识符块"，保留其余空白与字符（零宽字符顺带清掉）。
-   * 循环剥离：`[bgm]a[bgm][bgm]b[bgm]01.mp4` 这类叠加残留能一次还原成 `01.mp4`，
-   * 否则每次运行都会再判"需要改名"，把标识符越叠越多。*/
   function stripMarkerBlock(s) {
     let cur = String(s ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '');
     const re = new RegExp(`^(?:${escapeRegExp(FILE_NAME_MARKER)}[\\s\\S]*?${escapeRegExp(FILE_NAME_MARKER)})+`, 'i');
@@ -215,12 +191,11 @@
     return cur;
   }
 
-  /* 目标改名后应有的完整文件名。
-   * 夸克行内输入框 maxlength=250，超长会**静默不改**，所以这里主动把 acg 名称截短到能放下
-   * （原始文件名一字不动），并在截短时返回 truncated 让调用方告警。*/
+  /* 新目标格式：acg名称 + 原始文件名，直接拼接（不再用 [bgm] 包裹） */
   function fitAcgName(acgName, originalName, maxBytes = 250) {
     const base = String(originalName ?? '')
     .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(new RegExp(escapeRegExp(FILE_NAME_MARKER), 'g'), '')
     .trim();
     const nm = String(acgName ?? '')
     .replace(/[\u200B-\u200D\uFEFF]/g, '')
@@ -229,13 +204,12 @@
     .trim();
     if (!base || !nm) return { name: '', truncated: false };
 
-    const build = s => `${FILE_NAME_MARKER}${s}${FILE_NAME_MARKER}${base}`;
+    const build = s => `${s} ${base}`;
     const bytes = s => { try { return new TextEncoder().encode(s).length; } catch { return s.length * 3; } };
 
     const full = build(nm);
     if (bytes(full) <= maxBytes) return { name: full, truncated: false };
 
-    /* 二分找最长的可放前缀（按码点推进，避免切坏代理对） */
     const cps = Array.from(nm);
     const take = n => cps.slice(0, n).join('');
     let lo = 1, hi = cps.length, best = '';
@@ -252,16 +226,32 @@
     return fitAcgName(acgName, originalName).name;
   }
 
-  /* 是否需要改名。
-   * 入参约定：currentName = 列表页当前名（可能已带标识符块）；acgName = 纯 acg 名称（不含标识符块）。
-   * 不能拿"当前名"与"acg 名称"各自归一化后比较 —— 当前名带块时的归一化结果与裸 acg 名称无关；
-   * 正确做法：把当前名开头已有的标识符块剥掉还原出原始文件名，按目标格式重建后再与原样当前名比较。
-   * 返回 true 表示"当前名（原样）与目标名不同"，调用方应把 currentName 原样作为 old 传给列表页定位。*/
+  /* 判断是否需要改名：
+   * 1) [bgm] 格式（历史遗留）  → 需要改
+   * 2) 已经是 acg名称+ +文件名 格式（以 acg 名开头且有后续）→ 不需要改
+   * 3) 原始文件名 → 需要改 */
   function needRename(currentName, acgName) {
-    const raw = String(currentName ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
-    const target = buildRenamedFileName(acgName, stripMarkerBlock(raw).trim());
-    if (!raw || !target) return false;
-    return raw !== target;
+    const raw = String(currentName || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    if (!raw) return false;
+    const acg = String(acgName || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    if (!acg) return false;
+
+    /* [bgm] 历史格式 → 需改 */
+    if (stripMarkerBlock(raw) !== raw) return true;
+
+    /* 新格式：`${acg} ${base}`（带空格） */
+    if (raw.startsWith(acg + ' ')) {
+      const suffix = raw.slice(acg.length + 1);
+      if (suffix && suffix.trim()) return false;
+    }
+
+    /* 兼容旧格式：`${acg}${base}`（无空格直接拼） */
+    if (raw.startsWith(acg)) {
+      const suffix = raw.slice(acg.length);
+      if (suffix && suffix.trim() && !suffix.startsWith(' ')) return false;
+    }
+
+    return true;
   }
 
   function isSameFile(a, b) {
@@ -270,15 +260,9 @@
 
     const sa = normalizeSizeStr(a.sizeStr);
     const sb = normalizeSizeStr(b.sizeStr);
-
-    // 任一方大小未知（未加载 / 占位符）：仅凭文件名视为相同
     if (!sa || !sb) return true;
-
     if (sa === sb) return true;
-
-    // 兜底：iconSig 一致（fid 相同 = 同一份文件）时也算相同
     if (sameIconSig(a.iconSig, b.iconSig)) return true;
-
     return false;
   }
 
@@ -318,7 +302,48 @@
     return String(url).replace(/@@|@/g, m => m === '@@' ? pad2(ep) : ep);
   }
 
+  /* DHHMM 编码校验：10000 ~ 79959（周一 0 点 ~ 周日 27:59） */
+  function isDHHMMValue(v) {
+    const n = Number(v);
+    return Number.isInteger(n) && n >= 10000 && n <= 79959;
+  }
+
+  /* 把 DHHMM（周几+时分）折算为"本周期内最近一次该时间点"并与当前比较。
+ * 返回 true=已过 / false=未到 / null=无法判断。
+ * 4 点对齐：0:00~3:59 视为前一日 24:00~27:59。 */
+  function dhhmmIsPassed(v, nowMs) {
+    const n = Number(v);
+    if (!isDHHMMValue(n)) return null;
+    const now = nowMs != null ? new Date(nowMs) : new Date();
+    let day = Math.floor(n / 10000);
+    let hh = Math.floor(n / 100) % 100;
+    const mm = n % 100;
+    if (hh >= 24) {
+      hh -= 24;
+      day = day === 7 ? 1 : day + 1;
+    }
+    const today = new Date(now);
+    today.setHours(0, 0, 0, 0);
+    if (now.getHours() < 4) today.setDate(today.getDate() - 1);
+    const dow = today.getDay() || 7;
+    const monday = new Date(today);
+    monday.setDate(monday.getDate() - (dow - 1));
+    const target = new Date(monday);
+    target.setDate(target.getDate() + (day - 1));
+    target.setHours(hh, mm, 0, 0);
+    return target.getTime() <= now.getTime();
+  }
+
+  /* 是否应处理该行（用于 CD 判断、待转存队列）：
+ * 1) row.资源 是 DHHMM 时间 → 按该时间是否已到判断
+ * 2) row.资源 是链接型（URL）/空 / 其它 → 跳过"资源时间"判断，回退到 _airDate */
   function shouldIncludeRow(row) {
+    if (!row) return true;
+    const resVal = String(row.资源 ?? '').trim();
+    if (resVal && isDHHMMValue(resVal)) {
+      const passed = dhhmmIsPassed(resVal);
+      if (passed != null) return passed;
+    }
     if (typeof row._airDate === 'number' && row._airDate > 0) return row._airDate <= Date.now();
     return true;
   }
@@ -341,11 +366,11 @@
     return [...urls];
   }
 
-  /* ===== 转存记录：读取路径永不删数据，删除只发生在显式 sweep / 用户清空 ===== */
-  function loadRecords() {
-    /* 用户显式清空请求（acg.rip 菜单命令） */
+  /* ===== 转存记录 ===== */
+  function loadRecords(opts = {}) {
+    const consumeClear = opts.consumeClear !== false;
     const clearTs = Number(GM_getValue(GM_CLEAR_FLAG, 0) || 0);
-    if (clearTs > 0) {
+    if (consumeClear && clearTs > 0) {
       gmSet(GM_RECORDS, {});
       GM_setValue(GM_CLEAR_FLAG, 0);
       log(`★ 响应清空请求，转存记录已清空（ts=${clearTs}）`);
@@ -355,14 +380,89 @@
   }
   function saveRecords(recs) { gmSet(GM_RECORDS, recs); }
 
-  /* 未被显式清空的记录一律算"已转存"；是否过期只依据 acg.ripImprove 清单。 */
   function collectSavedInfos(records) {
     return Object.values(records || {})
     .flatMap(r => Array.isArray(r.fileInfos) ? r.fileInfos : []);
   }
 
-  /* 从 bangumiData 收集"清单里仍存在"的分享 key。
-   * 故意不做播出日期过滤，否则未播出条目的记录会被误判为已从清单移除。 */
+  function getShareFileInfos(shareKey) {
+    const recs = loadRecords();
+    const r = shareKey ? recs[shareKey] : null;
+    return (r && Array.isArray(r.fileInfos)) ? r.fileInfos : [];
+  }
+
+  function healShareRecords(shareKey, files) {
+    const recs = loadRecords();
+    const rec = shareKey ? recs[shareKey] : null;
+    if (!rec || !Array.isArray(rec.fileInfos)) return [];
+    const list = rec.fileInfos;
+    if (!Array.isArray(files) || !files.length) return list;
+
+    const byName = new Map();
+    for (const f of files) {
+      const nk = normalizeFileName(f.name);
+      if (nk && !byName.has(nk)) byName.set(nk, f);
+    }
+
+    let healed = 0;
+    for (const si of list) {
+      const nk = normalizeFileName(si && si.name);
+      if (!nk) continue;
+      const f = byName.get(nk);
+      if (!f) continue;
+      if (String(si.sizeStr ?? '').trim() !== String(f.sizeStr ?? '').trim()) continue;
+      let dirty = false;
+      if (!si.fid && f.fid) { si.fid = f.fid; dirty = true; }
+      if (!si.mtime && f.mtime) { si.mtime = f.mtime; dirty = true; }
+      if (!isIdentifiableIconSig(si.iconSig) && isIdentifiableIconSig(f.iconSig)) {
+        si.iconSig = f.iconSig; dirty = true;
+      }
+      if (dirty) healed++;
+    }
+
+    if (healed) {
+      rec.ts = Date.now();
+      recs[shareKey] = rec;
+      saveRecords(recs);
+      log(`★ 记录自愈：${shareKey} 补全 ${healed} 条记录的 fid/mtime/iconSig`);
+    }
+    return list;
+  }
+
+  /* 曾用名写入：把 oldName 追加到对应 fid 的记录 formerNames（去重）。
+   * 遍历所有分享，找到第一个匹配 fid 的记录条目即写入。 */
+  function recordFormerNameByFid(fid, oldName) {
+    if (!fid || !oldName) return false;
+    const oldKey = String(oldName).replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+    if (!oldKey) return false;
+    const recs = loadRecords();
+    let changed = false;
+    let hitShare = '';
+    for (const key of Object.keys(recs)) {
+      const rec = recs[key];
+      if (!rec || !Array.isArray(rec.fileInfos)) continue;
+      const item = rec.fileInfos.find(fi => fi && String(fi.fid || '') === String(fid));
+      if (!item) continue;
+      const arr = Array.isArray(item.formerNames) ? item.formerNames.slice() : [];
+      const exists = arr.some(x => {
+        const k = String(x || '').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+        return k === oldKey;
+      });
+      if (exists) return false;
+      arr.push(String(oldName));
+      item.formerNames = arr;
+      rec.ts = Date.now();
+      changed = true;
+      hitShare = key;
+      break;
+    }
+    if (changed) {
+      saveRecords(recs);
+      log(`★ 记录曾用名：${fid} ← ${oldName}（share=${hitShare}）`);
+    }
+    return changed;
+  }
+
   function collectAllShareKeys(bd) {
     const keys = new Set();
     if (!bd || !Array.isArray(bd.rows)) return keys;
@@ -375,9 +475,19 @@
     return keys;
   }
 
-  /* ===== acg 名称数据（最终名称：中文 > 原始名称）=====
-   * 桥接不读 acg.ripImprove 的内部函数，只按同一优先级自行解析：
-   * 「中文」列非空取中文，否则取「名称」列（两列为空时回退 BGMID 内嵌的 名称,中文）。*/
+  function upsertFileInfo(merged, item) {
+    if (!item || !item.name) return false;
+    const nameKey = normalizeFileName(item.name);
+    if (!nameKey) return false;
+    const idx = merged.findIndex(mi => normalizeFileName(mi && mi.name) === nameKey);
+    if (idx >= 0) {
+      merged[idx] = { ...merged[idx], ...item };
+      return false;
+    }
+    merged.push(item);
+    return true;
+  }
+
   function getAcgDisplayName(row) {
     if (!row) return '';
     const pick = v => {
@@ -396,7 +506,6 @@
     return pick(parsed['中文']) || pick(parsed['名称']) || '';
   }
 
-  /* 从 BGMID 文本里取兜底名称（id,名称,中文,…） */
   function parseBgmIdRef(text) {
     if (!text) return {};
     const plain = String(text)
@@ -413,8 +522,6 @@
     };
   }
 
-  /* 每行可能带多个夸克链接（资源 + 规则，且 @ / @@ 会展开成集数）。
-   * 一行内所有展开结果都指向同一个作品 → 一律取该行的最终名称。*/
   function collectShareNamesFromRow(row) {
     if (!row) return [];
     const finalName = getAcgDisplayName(row);
@@ -431,8 +538,6 @@
     return out;
   }
 
-  /* shareKey → acg 最终名称。
-   * 同一 key 出现多个不同名称（同名作品 / 复用链接，无法判定）→ 该 key 不改名。*/
   function collectShareNameMap(bd) {
     const map = new Map();
     const conflict = new Map();
@@ -451,40 +556,393 @@
     return { map, conflict };
   }
 
-  /* 从当前页地址推 key（与记录 key 同源：https://pan.quark.cn/s/<shareId>） */
-  function shareKeyFromUrl(url) {
-    const m = String(url || '').match(/\/s\/([a-zA-Z0-9]+)/);
-    return m ? `https://pan.quark.cn/s/${m[1]}` : '';
-  }
-
-  /* 清理过期记录：只依据 acg.ripImprove 清单，清单里已不存在的分享即过期。
-   * 清单不可用或解析不到链接时一律不动（宁可不清，也不误删）。 */
+  /* 过期清理（acg 清单已不含该分享的记录）：
+   * 1) 清单不可用 / 无任何夸克链接 / 检测到清空请求 → 跳过，不动记录
+   * 2) 记录数远多于清单数（> live + max(5, live*0.5)）→ 疑似清单严重不完整，跳过
+   * 3) 在清单中 → 清除 obsoleteAt（曾标记过但清单又加回来了）
+   * 4) 不在清单中：
+   *    - 无 obsoleteAt → 打标记，等 7 天
+   *    - 有 obsoleteAt 且已满 7 天 → 删除记录
+   *    - 有 obsoleteAt 未满 7 天 → 保留 */
   function sweepObsoleteRecords() {
+    const clearTs = Number(GM_getValue(GM_CLEAR_FLAG, 0) || 0);
+    if (clearTs > 0) {
+      log('★ 过期清理：检测到清空请求（clearFlag > 0），跳过本次（等夸克端处理）');
+      return { removed: 0, marked: 0, unmarked: 0 };
+    }
+
     const bd = loadBangumiData();
     if (!bd || !Array.isArray(bd.rows) || !bd.rows.length) {
       log('★ 过期清理：acg.ripImprove 数据不可用，跳过（不删除任何记录）');
-      return 0;
+      return { removed: 0, marked: 0, unmarked: 0 };
     }
     const live = collectAllShareKeys(bd);
     if (!live.size) {
       log('★ 过期清理：清单中未解析到任何夸克链接，跳过（不删除任何记录）');
-      return 0;
+      return { removed: 0, marked: 0, unmarked: 0 };
     }
+
     const recs = gmGet(GM_RECORDS, {}) || {};
-    const dead = Object.keys(recs).filter(k => !live.has(normalizeShareKey(k)));
-    if (!dead.length) {
-      log(`★ 过期清理：${Object.keys(recs).length} 条记录均在清单中，无需清理`);
-      return 0;
+    const now = Date.now();
+    const allKeys = Object.keys(recs);
+    const recCount = allKeys.length;
+
+    const tooMany = recCount > live.size + Math.max(5, Math.floor(live.size * 0.5));
+    if (tooMany) {
+      log(`★ 过期清理：记录 ${recCount} 远多于清单 ${live.size}，疑似清单严重不完整，本次跳过（不删除、不标记）`);
+      return { removed: 0, marked: 0, unmarked: 0 };
     }
-    for (const k of dead) delete recs[k];
-    gmSet(GM_RECORDS, recs);
-    log(`★ 过期清理：移除 ${dead.length} 条已不在 acg.ripImprove 清单中的转存记录`
-      + `（保留 ${Object.keys(recs).length} 条）`);
-    return dead.length;
+
+    let removed = 0, marked = 0, unmarked = 0;
+    const removedKeys = [];
+    const markedKeys = [];
+    const unmarkedKeys = [];
+    const ttlDays = Math.round(OBSOLETE_TTL_MS / 86400000);
+
+    for (const key of allKeys) {
+      const rec = recs[key];
+      if (!rec || typeof rec !== 'object') continue;
+      const norm = normalizeShareKey(key);
+      const inLive = live.has(norm);
+
+      if (inLive) {
+        if (rec.obsoleteAt) {
+          delete rec.obsoleteAt;
+          unmarked++;
+          unmarkedKeys.push(key);
+        }
+      } else {
+        if (!rec.obsoleteAt || typeof rec.obsoleteAt !== 'number') {
+          rec.obsoleteAt = now;
+          marked++;
+          markedKeys.push(key);
+        } else if (now - rec.obsoleteAt >= OBSOLETE_TTL_MS) {
+          delete recs[key];
+          removed++;
+          removedKeys.push(key);
+        }
+      }
+    }
+
+    if (marked || unmarked || removed) {
+      gmSet(GM_RECORDS, recs);
+    }
+
+    if (markedKeys.length) {
+      log(`★ 过期清理：${markedKeys.length} 条记录已不在清单中，开始 ${ttlDays} 天宽限期（到期后自动删除）：${markedKeys.join(', ')}`);
+    }
+    if (unmarkedKeys.length) {
+      log(`★ 过期清理：${unmarkedKeys.length} 条记录重新出现在清单中，已清除过期标记：${unmarkedKeys.join(', ')}`);
+    }
+    if (removedKeys.length) {
+      log(`★ 过期清理：${removedKeys.length} 条记录宽限期已过，已删除：${removedKeys.join(', ')}`);
+    }
+    if (!marked && !unmarked && !removed) {
+      log(`★ 过期清理：${recCount} 条记录均在清单中，无需处理`);
+    }
+
+    return { removed, marked, unmarked };
   }
+
+  /* ===== 分享页「是否已转存」判定 =====
+   * 优先级：
+   *   L1: fid（完全一致）
+   *   L2: icon（同 fid 或同名+同 icon）
+   *   L3: 当前最新名（页面 normalize 名 == 记录 name normalize 名）
+   *   L4: 曾用名（页面 normalize 名 ∈ 记录 formerNames 的 normalize 名）
+   *   L5: [bgm] 兜底：
+   *       5a) 页面是 [bgm] 格式 → strip 后与记录 name/formerNames 的 strip 结果比较
+   *       5b) 记录是 [bgm] 格式、页面是新格式 → 页面名以"记录 strip 后的原名"结尾
+   *   L5 严格 sizeStr 双方都非空且相等，避免 endsWith 误判。 */
+  function normalizeMtimeStr(s) {
+    return String(s ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+  }
+
+  function explainIsFileSaved(file, savedInfos, wantReason = false) {
+    const out = { saved: false, level: 0, reason: '' };
+    if (!file) { if (wantReason) out.reason = '无文件对象'; return out; }
+    if (!Array.isArray(savedInfos) || !savedInfos.length) {
+      if (wantReason) out.reason = '记录为空';
+      return out;
+    }
+
+    const rawName = String(file.name || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+    const name = normalizeFileName(file.name);
+    const fid = String(file.fid || '');
+    const iconSig = file.iconSig || '';
+    const sizeStr = String(file.sizeStr ?? '').trim();
+
+    const sizeCompat = (a, b) => {
+      const sa = String(a ?? '').trim();
+      const sb = String(b ?? '').trim();
+      if (!sa || !sb) return true;
+      return sa === sb;
+    };
+    const sizeStrict = (a, b) => {
+      const sa = String(a ?? '').trim();
+      const sb = String(b ?? '').trim();
+      return !!sa && !!sb && sa === sb;
+    };
+
+    /* L1：fid */
+    if (fid) {
+      const hit = savedInfos.find(si => si && si.fid && String(si.fid) === fid);
+      if (hit) {
+        out.saved = true; out.level = 1;
+        if (wantReason) out.reason = `L1 fid=${fid} 命中「${hit.name}」`;
+        return out;
+      }
+    }
+
+    /* L2：icon */
+    if (isIdentifiableIconSig(iconSig)) {
+      const curFid = iconFid(iconSig);
+      for (const si of savedInfos) {
+        if (!si) continue;
+        const savedIcon = si.iconSig || '';
+        if (!isIdentifiableIconSig(savedIcon)) continue;
+        if (curFid) {
+          if (iconFid(savedIcon) && iconFid(savedIcon) === curFid) {
+            out.saved = true; out.level = 2;
+            if (wantReason) out.reason = `L2 icon fid=${curFid} 命中「${si.name}」`;
+            return out;
+          }
+        } else {
+          if (!name) continue;
+          if (normalizeFileName(si.name) !== name) continue;
+          if (sameIconSig(savedIcon, iconSig)) {
+            out.saved = true; out.level = 2;
+            if (wantReason) out.reason = `L2 同名+同 icon 命中「${si.name}」`;
+            return out;
+          }
+        }
+      }
+    }
+
+    /* L3：当前最新名匹配（页面 normalize 名 == 记录 name normalize 名） */
+    if (name) {
+      for (const si of savedInfos) {
+        if (!si) continue;
+        const savedName = normalizeFileName(si.name);
+        if (!savedName || savedName !== name) continue;
+        if (!sizeCompat(sizeStr, si.sizeStr)) continue;
+        out.saved = true; out.level = 3;
+        if (wantReason) out.reason = `L3 最新名命中「${si.name}」`;
+        return out;
+      }
+    }
+
+    /* L4：曾用名匹配 */
+    if (name) {
+      for (const si of savedInfos) {
+        if (!si) continue;
+        const arr = Array.isArray(si.formerNames) ? si.formerNames : [];
+        for (const fn of arr) {
+          const fnNorm = normalizeFileName(fn);
+          if (!fnNorm || fnNorm !== name) continue;
+          if (!sizeCompat(sizeStr, si.sizeStr)) continue;
+          out.saved = true; out.level = 4;
+          if (wantReason) out.reason = `L4 曾用名命中「${si.name}」曾用「${fn}」`;
+          return out;
+        }
+      }
+    }
+
+    /* 5a：页面是 [bgm] 格式，剥离后与记录 name/formerNames 剥离后比较
+     * 新增：记录是新格式 `${acg} ${base}` 时，通过 `endsWith(' ' + pageStripped)` 兜底匹配
+     *       （覆盖"页面旧格式 [bgm]、记录新格式"的方向） */
+    const pageStripped = stripMarkerBlock(rawName);
+    if (pageStripped && pageStripped !== rawName) {
+      for (const si of savedInfos) {
+        if (!si) continue;
+        if (!sizeStrict(sizeStr, si.sizeStr)) continue;
+
+        const tryHitA = (rawCandidate) => {
+          const cRaw = String(rawCandidate || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+          const cStripped = stripMarkerBlock(cRaw);
+          if (!cStripped) return '';
+          if (cStripped === pageStripped) return cStripped;
+          if (cStripped.endsWith(' ' + pageStripped)) return cStripped;
+          return '';
+        };
+
+        const hitA = tryHitA(si.name);
+        if (hitA) {
+          out.saved = true; out.level = 5;
+          if (wantReason) out.reason = `L5a 页面剥离「${pageStripped}」命中记录「${si.name}」`;
+          return out;
+        }
+
+        const arr = Array.isArray(si.formerNames) ? si.formerNames : [];
+        for (const fn of arr) {
+          const hitFnA = tryHitA(fn);
+          if (hitFnA) {
+            out.saved = true; out.level = 5;
+            if (wantReason) out.reason = `L5a 页面剥离「${pageStripped}」命中曾用名「${fn}」`;
+            return out;
+          }
+        }
+      }
+    }
+    /* 5b：页面是新格式 `${acg} ${base}`（或原始名），记录是原始名 / [bgm] 历史格式 / 新格式
+     * 命中条件（依次）：
+     *   1. pageName === 记录剥离（base 完全相同）
+     *   2. pageName 以 ' ' + 记录剥离 结尾（新格式 `acg base`）
+     *   3. 记录有 [bgm]，pageName 以记录剥离结尾（旧格式无空格兼容，仅当 cStripped !== cRaw）
+     * sizeStrict 保证 sizeStr 双方非空且相等，避免 endsWith 误判。 */
+    if (name) {
+      for (const si of savedInfos) {
+        if (!si) continue;
+        if (!sizeStrict(sizeStr, si.sizeStr)) continue;
+
+        const tryHitB = (rawCandidate) => {
+          const cRaw = String(rawCandidate || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
+          const cStripped = stripMarkerBlock(cRaw);
+          if (!cStripped) return '';
+          if (name === cStripped) return cStripped;
+          if (name.endsWith(' ' + cStripped)) return cStripped;
+          if (cStripped !== cRaw && name.endsWith(cStripped)) return cStripped;
+          return '';
+        };
+
+        const hitB = tryHitB(si.name);
+        if (hitB) {
+          out.saved = true; out.level = 5;
+          if (wantReason) out.reason = `L5b 页面「${name}」匹配记录剥离「${hitB}」`;
+          return out;
+        }
+
+        const arr = Array.isArray(si.formerNames) ? si.formerNames : [];
+        for (const fn of arr) {
+          const hitFnB = tryHitB(fn);
+          if (hitFnB) {
+            out.saved = true; out.level = 5;
+            if (wantReason) out.reason = `L5b 页面「${name}」匹配曾用名剥离「${hitFnB}」`;
+            return out;
+          }
+        }
+      }
+    }
+
+    if (wantReason) {
+      const parts = [];
+      parts.push(fid ? `L1 无同 fid` : `L1 无 fid`);
+      parts.push(`L3 最新名未匹配`);
+      parts.push(`L4 曾用名未匹配`);
+      parts.push(`L5 [bgm]兜底未匹配`);
+      out.reason = parts.join('；');
+    }
+    return out;
+  }
+
   function isFileSaved(file, savedInfos) {
-    if (!Array.isArray(savedInfos)) return false;
-    return savedInfos.some(si => isSameFile(si, file));
+    return explainIsFileSaved(file, savedInfos, false).saved;
+  }
+
+  /* ===== 全量重转 Debug ===== */
+  function truncateStr(s, n) {
+    const t = String(s ?? '');
+    if (t.length <= n) return t;
+    return t.slice(0, n) + `…(+${t.length - n})`;
+  }
+
+  function loadFullResaveDebug() { return gmGet(GM_FULL_RESAVE_DEBUG, []) || []; }
+  function clearFullResaveDebug() { gmSet(GM_FULL_RESAVE_DEBUG, []); }
+
+  function appendFullResaveDebug(entry) {
+    const arr = loadFullResaveDebug();
+    arr.unshift(entry);
+    if (arr.length > FULL_RESAVE_DEBUG_MAX) arr.length = FULL_RESAVE_DEBUG_MAX;
+    gmSet(GM_FULL_RESAVE_DEBUG, arr);
+  }
+
+  function maybeSaveFullResaveDebug(qa, files, savedInfos, opts = {}) {
+    try {
+      if (!Array.isArray(files) || !files.length) return null;
+
+      const incomplete = opts.incomplete === true;
+      const expected = Number(opts.expected) > 0 ? Number(opts.expected) : null;
+
+      const results = files.map(f => {
+        const ex = explainIsFileSaved(f, savedInfos, true);
+        const hasSameName = Array.isArray(savedInfos) && savedInfos.some(si =>
+                                                                         si && normalizeFileName(si.name) === normalizeFileName(f.name)
+                                                                        );
+        return { file: f, ex, hasSameName };
+      });
+      const savedCount = results.filter(r => r.ex.saved).length;
+      if (savedCount !== 0) return null;
+
+      const matchedButFailed = results.filter(r => r.hasSameName);
+      const noRecordEntry = results.filter(r => !r.hasSameName);
+
+      const shareKey = normalizeShareKey(location.href);
+      const recsAll = loadRecords({ consumeClear: false });
+      const recordKeys = Object.keys(recsAll);
+      const clearFlag = (opts.clearFlagAtStart != null)
+        ? Number(opts.clearFlagAtStart) || 0
+        : Number(GM_getValue(GM_CLEAR_FLAG, 0) || 0);
+      const savedInfosCount = Array.isArray(savedInfos) ? savedInfos.length : 0;
+
+      let note;
+      if (incomplete) {
+        note = `扫描不完整（${files.length}/${expected || '?'}），本轮告警可能是扫描问题，而非记录失效`;
+      } else if (savedInfosCount === 0) {
+        note = clearFlag > 0
+          ? `该分享无任何转存记录，且检测到清空请求（clearFlag=${clearFlag}）`
+          : '该分享无任何转存记录（首次转存或记录被清空）';
+      } else if (noRecordEntry.length === files.length) {
+        note = `页面 ${files.length} 个文件在记录中均无同名条目（可能是新文件，不是记录失效）`;
+      } else if (matchedButFailed.length === files.length) {
+        note = `页面 ${files.length} 个文件在记录里有同名条目但匹配失败（请查看每条失败原因）`;
+      } else {
+        note = `页面 ${files.length} 个文件：${matchedButFailed.length} 个有同名但匹配失败，${noRecordEntry.length} 个在记录中不存在`;
+      }
+
+      const entry = {
+        ts: Date.now(),
+        time: new Date().toLocaleString(),
+        source: opts.source || 'unknown',
+        href: location.href,
+        shareKey,
+        shareId: extractShareId(location.href),
+        totalFiles: files.length,
+        expectedFiles: expected,
+        incomplete,
+        savedCount,
+        savedInfosCount,
+        recordKeys,
+        recordKeysCount: recordKeys.length,
+        clearFlag,
+        note,
+        files: results.map(r => ({
+          name: r.file.name,
+          sizeStr: r.file.sizeStr,
+          mtime: r.file.mtime || '',
+          fid: r.file.fid || '',
+          iconSig: truncateStr(r.file.iconSig, 300),
+          iconSigLen: String(r.file.iconSig || '').length,
+          hasSameName: r.hasSameName,
+          level: r.ex.level,
+          result: r.ex.reason,
+        })),
+        savedInfos: (Array.isArray(savedInfos) ? savedInfos : []).map(si => ({
+          name: si && si.name,
+          sizeStr: si && si.sizeStr,
+          mtime: (si && si.mtime) || '',
+          fid: (si && si.fid) || '',
+          formerNames: Array.isArray(si && si.formerNames) ? si.formerNames : [],
+          iconSig: truncateStr(si && si.iconSig, 300),
+          iconSigLen: String((si && si.iconSig) || '').length,
+        })),
+      };
+      appendFullResaveDebug(entry);
+      warn(`★ 全量重转 Debug 已记录：${note}`);
+      return entry;
+    } catch (e) {
+      warn('写入全量重转 Debug 失败', e);
+      return null;
+    }
   }
 
   function isFolderFile(f) {
@@ -501,26 +959,21 @@
     );
   }
 
-  /* ===== 全表缓存（避免反复滚动） ===== */
+  /* ===== 全表缓存 ===== */
   let _allFilesCache = null;
   const ALL_FILES_CACHE_TTL = 60 * 1000;
 
-  function setAllFilesCache(key, files) {
-    _allFilesCache = { key, files, ts: Date.now() };
-  }
+  function setAllFilesCache(key, files) { _allFilesCache = { key, files, ts: Date.now() }; }
   function getAllFilesCache(key) {
     if (!_allFilesCache) return null;
     if (key && _allFilesCache.key !== key) return null;
     if (Date.now() - _allFilesCache.ts > ALL_FILES_CACHE_TTL) return null;
     return _allFilesCache.files;
   }
-  function clearAllFilesCache() { _allFilesCache = null; }
 
   /* ===== 虚拟滚动支持 ===== */
-  function getTableBody(doc = document) {
-    return doc.querySelector('.ant-table-body');
-  }
-  /* 分享页表格是否仍在初始化加载（首屏 spin / 内容模糊） */
+  function getTableBody(doc = document) { return doc.querySelector('.ant-table-body'); }
+
   function isShareTableLoading(doc = document) {
     if (doc.querySelector('.ant-table-wrapper .ant-table-spin-holder.ant-spin-spinning')) return true;
     if (doc.querySelector('.ant-table-wrapper .table-loading-wrap')) return true;
@@ -550,7 +1003,6 @@
     return null;
   }
 
-  /* 滚动遍历：有 loading tr 才多等，否则不空耗；harvest 总是覆盖最新状态 */
   async function scanAllRowsByScroll(qa, doc = document, opts = {}) {
     const useCache = opts.useCache === true;
     const key = opts.key || null;
@@ -558,8 +1010,13 @@
     if (useCache && key) {
       const cached = getAllFilesCache(key);
       if (cached) {
-        log(` ★ 复用缓存：${cached.length} 行`);
-        return cached;
+        const expected0 = getShareFileCount(doc);
+        if (expected0 && cached.length < expected0) {
+          warn(` ⚠️ 缓存不完整（${cached.length}/${expected0}），忽略缓存并强制重扫`);
+        } else {
+          log(` ★ 复用缓存：${cached.length} 行`);
+          return cached;
+        }
       }
     }
 
@@ -572,11 +1029,22 @@
     }
 
     const body = getTableBody(doc);
-    if (!body || !isVirtualScrolling(body)) {
-      const rows = qa.scanFileRows(doc);
-      if (useCache && key) setAllFilesCache(key, rows);
-      return rows;
+    const visibleRows = qa.scanFileRows(doc);
+    const needFullScan = !!(expected && visibleRows.length < expected);
+
+    /* 非虚拟滚动 且 不需要全表扫描 → 只扫可见区 */
+    if (!body || (!isVirtualScrolling(body) && !needFullScan)) {
+      if (useCache && key) setAllFilesCache(key, visibleRows);
+      return visibleRows;
     }
+
+    if (!body) {
+      warn(` ⚠️ 无 .ant-table-body 但需要全扫（可见 ${visibleRows.length}/${expected}），只能返回可见区`);
+      if (useCache && key) setAllFilesCache(key, visibleRows);
+      return visibleRows;
+    }
+
+    log(` ★ 全表扫描（可见 ${visibleRows.length} / 期望 ${expected || '?'}${isVirtualScrolling(body) ? ' / 虚拟滚动' : ''}）`);
 
     const hasLoadingMore = () => !!doc.querySelector(
       '.recent-loading-tr .ant-spin-spinning, ' +
@@ -593,12 +1061,11 @@
       let added = 0;
       for (const r of rows) {
         if (!seenNames.has(r.name)) { added++; seenNames.add(r.name); }
-        visited.set(r.name, r); // 总是覆盖最新状态（含 checked）
+        visited.set(r.name, r);
       }
       return added;
     };
 
-    /* 滚到顶部 */
     body.scrollTop = 0;
     await qa.sleep(150);
     harvest();
@@ -606,8 +1073,8 @@
     let lastScrollH = body.scrollHeight;
     let lastSize = visited.size;
     let stallCount = 0;
-    const MAX_STALL_BOTTOM = 3; // 到底：连续 3 次"无 loading + 无新增 + 高度不变"
-    const MAX_STALL_MID = 4; // 中途：连续 4 次"无新增"
+    const MAX_STALL_BOTTOM = 5;
+    const MAX_STALL_MID = 5;
 
     while (Date.now() - t0 < maxMs) {
       if (expected && visited.size >= expected) break;
@@ -618,12 +1085,9 @@
       const atBottom = curTop + bodyH >= scrollH - 8;
 
       if (atBottom) {
-        /* 到底：按 loading 状态决定等待时长 */
         if (hasLoadingMore()) {
-          // 有加载中：等它消失（最多 1500ms）
           await qa.until(() => !hasLoadingMore(), 60, 1500);
         } else {
-          // 无加载中：只等 100ms，没有新内容就认到底
           await qa.sleep(100);
         }
 
@@ -647,7 +1111,6 @@
         continue;
       }
 
-      /* 未到底：向下滚一屏（0.8 倍视口，保证约 20% 重叠） */
       const step = Math.max(200, Math.floor(bodyH * 0.8));
       body.scrollTop = Math.min(curTop + step, scrollH);
       await qa.sleep(100);
@@ -669,14 +1132,20 @@
     body.scrollTop = startTop;
     await qa.sleep(120);
 
-    log(` ★ 滚动扫描：收集 ${visited.size} 行（期望 ${expected || '?'} / 视口 ${body.clientHeight}px / 总高 ${body.scrollHeight}px）`);
-
     const result = [...visited.values()];
-    if (useCache && key) setAllFilesCache(key, result);
+    log(` ★ 滚动扫描：收集 ${result.length} 行（期望 ${expected || '?'}）`);
+
+    /* 只在扫到行数 >= expected 或 expected 未知时才写缓存，避免缓存不完整数据 */
+    if (useCache && key) {
+      if (!expected || result.length >= expected) {
+        setAllFilesCache(key, result);
+      } else {
+        warn(` ⚠️ 扫描不完整（${result.length}/${expected}），不写缓存`);
+      }
+    }
     return result;
   }
 
-  /* 滚动收集所有被勾选的行（partial 场景用） */
   async function scanCheckedRowsByScroll(qa, doc = document, opts = {}) {
     const cacheKey = opts.cacheKey || null;
     const body = getTableBody(doc);
@@ -687,15 +1156,12 @@
     return all.filter(f => f.checked);
   }
 
-  /* 滚动定位单行：可见区优先，其次按缓存 index 估计位置就近扫，最后上下顺序扫 */
   async function scrollToRowByName(qa, doc, name, opts = {}) {
     const body = getTableBody(doc);
     if (!body) return null;
 
-    /* ① 可见区优先 */
     let hit = qa.scanFileRows(doc).find(f => f.name === name);
     if (hit) return hit;
-
     if (!isVirtualScrolling(body)) return null;
 
     const startTop = body.scrollTop;
@@ -705,7 +1171,6 @@
     const maxMs = opts.maxMs || 6000;
     const t0 = Date.now();
 
-    /* ② 估计位置 */
     const key = opts.cacheKey || null;
     let estTop = null;
     if (key) {
@@ -736,7 +1201,6 @@
       }
     }
 
-    /* ③ 回退 */
     for (const dir of [-1, +1]) {
       let pos = startTop;
       while (Date.now() - t0 < maxMs) {
@@ -754,15 +1218,13 @@
     return null;
   }
 
-  /* ===== 分享页置灰 + 进度（由桥接自主维护） ===== */
+  /* ===== 分享页置灰 + 进度 ===== */
   const SHARE_GRAY_CLASS = 'qap-grayed';
-  let _shareFullCounts = null; // { num, total } | null
+  let _shareFullCounts = null;
 
-  /* 对当前可见区行应用"已转存"灰置 */
   function applyShareGray(qa, doc = document) {
     const files = qa.scanFileRows(doc);
-    const recs = loadRecords();
-    const savedInfos = collectSavedInfos(recs);
+    const savedInfos = getShareFileInfos(normalizeShareKey(location.href));
     let grayed = 0;
     for (const f of files) {
       if (isFileSaved(f, savedInfos)) { f.row.classList.add(SHARE_GRAY_CLASS); grayed++; }
@@ -771,7 +1233,6 @@
     return { grayed, total: files.length };
   }
 
-  /* 设置 / 清除分享页进度数字 */
   function setShareFullCounts(qa, num, total) {
     if (typeof num === 'number' && typeof total === 'number' && total > 0) {
       _shareFullCounts = { num, total };
@@ -784,11 +1245,8 @@
     }
   }
 
-  /* 一次 UI 刷新：置灰 + 进度（进度未设置时保持 '-'） */
   function refreshShareUI(qa, doc = document) {
-    /* 加载中不刷：避免虚表空行被误判未转存 */
     if (isShareTableLoading(doc)) return;
-
     applyShareGray(qa, doc);
     if (_shareFullCounts) {
       qa.showProgress(_shareFullCounts.num, _shareFullCounts.total, '已转存');
@@ -796,7 +1254,6 @@
     }
   }
 
-  /* 分享页轮询：可见区置灰 + 进度（不滚动、不全表扫描） */
   function startSharePolling(qa) {
     const tick = () => { try { refreshShareUI(qa); } catch {} };
     setInterval(tick, 800);
@@ -809,30 +1266,15 @@
     tick();
   }
 
-  /* 全量进度：仅在用户点击按钮后或子任务中主动调用 */
   async function refreshShareFullCounts(qa, doc = document) {
     try {
       const key = currentCacheKey();
       const allFiles = (await scanAllRowsByScroll(qa, doc, { key, useCache: true }) || [])
       .filter(f => !isFolderFile(f));
       if (!allFiles.length) return;
-      const recs = loadRecords();
-      const savedInfos = collectSavedInfos(recs);
+      const savedInfos = healShareRecords(normalizeShareKey(location.href), allFiles);
       const savedCount = allFiles.filter(f => isFileSaved(f, savedInfos)).length;
       setShareFullCounts(qa, savedCount, allFiles.length);
-      log(`★ 全量进度：${savedCount} / ${allFiles.length}`);
-    } catch (e) { warn('全量进度统计失败', e); }
-  }
-  async function refreshFullCounts(qa, doc = document) {
-    try {
-      const key = currentCacheKey();
-      const allFiles = (await scanAllRowsByScroll(qa, doc, { key, useCache: true }) || [])
-      .filter(f => !isFolderFile(f));
-      if (!allFiles.length) return;
-      const recs = loadRecords();
-      const savedInfos = collectSavedInfos(recs);
-      const savedCount = allFiles.filter(f => isFileSaved(f, savedInfos)).length;
-      if (qa.setFullCounts) qa.setFullCounts(savedCount, allFiles.length);
       log(`★ 全量进度：${savedCount} / ${allFiles.length}`);
     } catch (e) { warn('全量进度统计失败', e); }
   }
@@ -846,7 +1288,6 @@
     }
     return null;
   }
-
   function getThSortState(th) {
     const el = th && th.querySelector('.table-order');
     if (!el) return 'none';
@@ -863,7 +1304,7 @@
 
     const th0 = await until(() => findTimeSortHeader(doc), interval, headerTimeout);
     if (!th0) {
-      warn(` 排序：${headerTimeout}ms 内未找到"修改日期"表头，按无目标处理，跳过`);
+      warn(` 排序：${headerTimeout}ms 内未找到"修改日期"表头，跳过`);
       return { ok: false, reason: 'no-th' };
     }
     if (getThSortState(th0) === 'desc') {
@@ -873,10 +1314,7 @@
 
     for (let i = 0; i < maxTries; i++) {
       const th = findTimeSortHeader(doc);
-      if (!th) {
-        warn(' 排序：点击过程中表头消失，按无目标处理');
-        return { ok: false, reason: 'no-th-midway' };
-      }
+      if (!th) { warn(' 排序：点击过程中表头消失，跳过'); return { ok: false, reason: 'no-th-midway' }; }
       if (getThSortState(th) === 'desc') {
         log(` 排序：已切到降序（第 ${i} 次点击后）`);
         return { ok: true, method: i === 0 ? 'already' : 'clicked', tries: i };
@@ -888,9 +1326,7 @@
       try {
         if (qa && typeof qa.realClick === 'function') qa.realClick(target);
         else target.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true, view: window }));
-      } catch {
-        try { target.click(); } catch {}
-      }
+      } catch { try { target.click(); } catch {} }
 
       const got = await until(() => {
         const cur = findTimeSortHeader(doc);
@@ -906,8 +1342,7 @@
         return { ok: true, method: 'clicked', tries: i + 1 };
       }
     }
-
-    warn(` 排序：${maxTries} 次点击后仍未切到降序，放弃（继续原流程）`);
+    warn(` 排序：${maxTries} 次点击后仍未切到降序，放弃`);
     return { ok: false, reason: 'cannot-desc' };
   }
 
@@ -978,7 +1413,7 @@
         const isOnTop = !isNaN(z) && z >= 0;
         if (isFullScreen && isOnTop) {
           text += ' 空间不足 扩容';
-          log(`[桥接] 跨域 iframe #${f.id || ''} 全屏展示（w=${Math.round(w)} h=${Math.round(h)} z=${z}）→ 视为空间不足`);
+          log(`[桥接] 跨域 iframe 全屏展示 → 视为空间不足`);
         }
       } catch {}
     }
@@ -1021,6 +1456,19 @@
     if (!btn) throw new Error('未找到"保存到网盘"按钮');
     qa.realClick(btn);
     return true;
+  }
+
+  function ensurePackDirUnchecked(qa, doc = document) {
+    const cb = doc.querySelector('.pack-check input.ant-checkbox-input')
+    || doc.querySelector('.share-pack-dir-tips input.ant-checkbox-input');
+    if (!cb) return true;
+    if (!cb.checked) return true;
+    const label = cb.closest('label') || cb;
+    try {
+      if (qa && typeof qa.realClick === 'function') qa.realClick(label);
+      else label.click();
+    } catch { try { cb.click(); } catch {} }
+    return !cb.checked;
   }
 
   function findVisibleModal(doc = document) {
@@ -1144,11 +1592,9 @@
 
       const k = classify(text);
       if (k === 'space' || k === 'over_limit' || k === 'fail') return k;
-
       if (isSuccessModalPresent(doc)) return 'success';
       return null;
     };
-
     const r = await qa.until(check, 50, timeout);
     log('[桥接] waitResult 判定:', r || 'unknown');
     return r || 'unknown';
@@ -1185,10 +1631,7 @@
 
     log(' → 等保存按钮就绪');
     const ready = await waitSaveButtonReady(qa, doc, 8000);
-    if (!ready) {
-      warn(' ⚠️ 保存按钮未就绪（loading/disabled）');
-      return 'fail';
-    }
+    if (!ready) { warn(' ⚠️ 保存按钮未就绪'); return 'fail'; }
 
     log(' → 点击保存按钮');
     try { clickSaveButton(qa, doc); } catch (e) {
@@ -1205,13 +1648,10 @@
       return null;
     }, 100, 12000);
 
-    if (!outcome) {
-      warn(' ⚠️ 12s 内无任何结果信号');
-      return 'unknown';
-    }
+    if (!outcome) { warn(' ⚠️ 12s 内无任何结果信号'); return 'unknown'; }
 
     if (outcome.type === 'success') {
-      log(' → 保存成功（成功模态框已出现）');
+      log(' → 保存成功');
       try { closeDialog(qa, doc); } catch {}
       return 'success';
     }
@@ -1319,24 +1759,18 @@
 
   async function clearAllViaHeader(qa, doc = document) {
     if (getHeaderCheckState(doc) === 'none') return { ok: true, tries: 0 };
-
     for (let i = 0; i < 3; i++) {
       const st = getHeaderCheckState(doc);
       if (st === 'none-cb') return { ok: false, reason: 'no-header-cb' };
-
       const r = await setHeaderCheckbox(qa, doc, false);
       if (!r.ok) return { ok: false, reason: r.reason || 'header-click-failed' };
-
       await sleep(80);
       if (getHeaderCheckState(doc) === 'none') return { ok: true, tries: i + 1 };
     }
     return { ok: getHeaderCheckState(doc) === 'none', reason: 'not-cleared' };
   }
 
-  /* ===== 列表页改名（按 acg 最终名称）=====
-   * 时序：转存完成 → 页面内刷新 → ★ 改名 → 触发下载。
-   * 已下载记录按 fid 记录，改名不换 fid，因此改名后仍不会重复下载。*/
-
+  /* ===== 列表页改名 ===== */
   const RENAME_CONFIRM_TEXTS = ['确定', '确认', '保存', '完成', '确 定'];
 
   function isRenamePanel(el) {
@@ -1345,7 +1779,6 @@
     } catch { return false; }
   }
 
-  /* 行名按"排除标识符后"比对：既能找到 [bgm]名[bgm]原始名，也能找到原始名 */
   function findListRowByName(qa, name, doc = document) {
     const want = getComparableFileName(name);
     if (!want) return null;
@@ -1353,9 +1786,6 @@
     return files.find(f => getComparableFileName(f.name) === want) || null;
   }
 
-  /* 原样名精确比对（**不能**用 findListRowByName 做改名确认）：
-   * 它的比较键会把 [bgm]…[bgm] 剥掉，导致"改名后的新名"与"改名前的旧名"键相等，
-   * 于是"看见新名"永远为真 —— 那是同义反复，会把没改成的也判成功。*/
   function findRowByExactName(qa, name, doc = document) {
     const want = String(name ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
     if (!want) return null;
@@ -1363,19 +1793,16 @@
     return files.find(f => String(f.name ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim() === want) || null;
   }
 
-  /* 行内用来触发重命名/右键的元素（scanFileRows 只给 row，没有 nameEl） */
   function getNameElInRow(row) {
     if (!row || typeof row.querySelector !== 'function') return null;
     return row.querySelector('.filename-text, [class*="filename-text"], .file-name, [class*="file-name"]') || row;
   }
 
-  /* 只点真正的文件名单元格（返回 null 表示拿不到，调用方不要退回整行） */
   function getNameCellOnly(row) {
     if (!row || typeof row.querySelector !== 'function') return null;
     return row.querySelector('.filename-text, [class*="filename-text"], .file-name, [class*="file-name"]');
   }
 
-  /* 当前渲染出来的选中行 fid */
   function getSelectedFids(doc = document) {
     return [...doc.querySelectorAll('tr.ant-table-row-selected')]
     .map(r => r.getAttribute('data-row-key') || '')
@@ -1387,62 +1814,82 @@
     return doc.querySelector(`tr.ant-table-row[data-row-key="${fid}"]`);
   }
 
-  /* 把勾选收敛到目标一行。
-   * 夸克助手没有导出 selectRow，这里直接点该行的 checkbox label；
-   * 最后用表头三态复核：只有确定"当前只剩这一行被勾选"时才允许走顶栏按钮路径
-   * （虚拟滚动下看不到的行也可能被勾选，看不见就一律不点按钮，避免批量重命名）。*/
   async function resetSelectionToRow(qa, file, doc = document) {
     if (!file || !file.fid) return { ok: false, reason: 'no-fid' };
 
-    /* 先清空勾选，且**必须证明清干净了**：qa.clearAllSelection() 只遍历渲染出来的行，
-     * 虚拟滚动外的勾选行清不掉 —— 若残留隐藏勾选，顶栏「重命名」会对它们一起生效（批量改名，不可逆）。
-     * 表头三态反映的是整个数据模型，所以以"表头回到 none"作为清空成功的唯一判据。*/
-    const cleared = await clearAllViaHeader(qa, doc);
-    if (!cleared.ok || getHeaderCheckState(doc) !== 'none') {
-      try { await qa.clearAllSelection(); } catch {}
-      if (getHeaderCheckState(doc) !== 'none') {
-        return { ok: false, reason: `clear-incomplete(${getHeaderCheckState(doc)})` };
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await until(() => !isShareTableLoading(doc), 150, 5000);
+
+      const cleared = await clearAllViaHeader(qa, doc);
+      if (!cleared.ok || getHeaderCheckState(doc) !== 'none') {
+        try { await qa.clearAllSelection(); } catch {}
+        await until(() => getHeaderCheckState(doc) === 'none', 100, 2000);
+        if (getHeaderCheckState(doc) !== 'none') {
+          if (attempt < 2) { await sleep(500); continue; }
+          return { ok: false, reason: `clear-incomplete(${getHeaderCheckState(doc)})` };
+        }
       }
-    }
 
-    let row = (file.row && file.row.isConnected) ? file.row : findRowByFid(file.fid, doc);
-    if (!row) return { ok: false, reason: 'row-gone' };
+      await until(() => getSelectedFids(doc).length === 0, 100, 1500);
 
-    const isSel = () => {
-      const cur = findRowByFid(file.fid, doc) || row;
-      const input = cur && cur.querySelector('input.ant-checkbox-input');
-      return !!(cur && (cur.classList.contains('ant-table-row-selected') || (input && input.checked)));
-    };
-    if (!isSel()) {
-      const lbl = row.querySelector('label.ant-checkbox-wrapper');
-      if (lbl) { try { qa.realClick(lbl); } catch {} }
-      else { try { const cb = row.querySelector('input.ant-checkbox-input'); if (cb) cb.click(); } catch {} }
-      await until(isSel, 100, 1500);
-    }
+      let row = (file.row && file.row.isConnected) ? file.row : findRowByFid(file.fid, doc);
+      if (!row) {
+        try {
+          const found = await scrollToRowByName(qa, doc, file.name, { cacheKey: currentCacheKey(), maxMs: 3000 });
+          if (found) { row = found.row; file.row = found.row; }
+        } catch {}
+      }
+      if (!row) {
+        if (attempt < 2) { await sleep(500); continue; }
+        return { ok: false, reason: 'row-gone' };
+      }
 
-    /* 等 React 把表头三态更新成 partial 再复核 */
-    await until(() => getHeaderCheckState(doc) === 'partial', 100, 800);
-    const state = getHeaderCheckState(doc);
-    const fids = getSelectedFids(doc);
-    if (state !== 'partial' || fids.length !== 1 || fids[0] !== file.fid) {
-      return { ok: false, reason: `${state}/${fids.length}` };
+      const isSel = () => {
+        const cur = findRowByFid(file.fid, doc) || row;
+        const input = cur && cur.querySelector('input.ant-checkbox-input');
+        return !!(cur && (cur.classList.contains('ant-table-row-selected') || (input && input.checked)));
+      };
+      if (!isSel()) {
+        const lbl = row.querySelector('label.ant-checkbox-wrapper');
+        if (lbl) { try { qa.realClick(lbl); } catch {} }
+        else { try { const cb = row.querySelector('input.ant-checkbox-input'); if (cb) cb.click(); } catch {} }
+        await until(isSel, 100, 2000);
+      }
+
+      await until(() => getSelectedFids(doc).length > 0, 100, 1000);
+
+      const state = getHeaderCheckState(doc);
+      const fids = getSelectedFids(doc);
+
+      if (fids.length !== 1 || fids[0] !== file.fid) {
+        if (attempt < 2) { await sleep(500); continue; }
+        return { ok: false, reason: `${state}/${fids.length}` };
+      }
+
+      if (state === 'all') {
+        const rows = qa.scanFileRows(doc) || [];
+        const body = getTableBody(doc);
+        const virtual = body && isVirtualScrolling(body);
+        if (virtual || rows.length !== 1) {
+          if (attempt < 2) { await sleep(500); continue; }
+          return { ok: false, reason: `head-all-not-single(${rows.length}${virtual ? ',virtual' : ''})` };
+        }
+      }
+
+      return { ok: true };
     }
-    return { ok: true };
+    return { ok: false, reason: 'max-attempts' };
   }
 
-  /* 顶栏「重命名」按钮：`.btn-group` 里文本精确匹配；**显式排除 `.btn-main`**
-   * （下载助手/上传文件/新建文件夹/添加备份）。真机上「重命名」可能是 button 或 span/a，
-   * 所以放宽元素类型，但始终返回**可点击的最近祖先**。*/
   function findToolbarRenameButton(doc = document) {
     const els = [...doc.querySelectorAll(
       '.btn-group button, .btn-group [role="button"], .btn-group span, .btn-group a, .section-header button.btn-file'
     )];
     for (const el of els) {
-      if (el.closest && el.closest('.btn-main')) continue;      /* 上传/新建等区域，明确排除 */
+      if (el.closest && el.closest('.btn-main')) continue;
       if (isRenamePanel(el)) continue;
       const txt = (el.textContent || '').replace(/\s+/g, '').trim();
       if (!/^(重命名|重新命名|改名)$/.test(txt)) continue;
-      /* 优先父级可点击元素（span 在 button 内），否则自身 */
       const clickable = (el.closest && el.closest('button, [role="button"], a')) || el;
       if (clickable.closest && clickable.closest('.btn-main')) continue;
       return clickable;
@@ -1450,9 +1897,6 @@
     return null;
   }
 
-  /* 点击顶栏「重命名」后新出现、且确实像"改名"的弹窗：
-   * 必须①点击后才出现、②可见、③含文本框，且（输入框值=原文件名 或 文案明确提到"重命名/修改名称"）。
-   * 不能用"名称/文件名"这类宽泛词 —— 会把"新建文件夹/移动到"等弹窗当改名框。*/
   function findNewRenameModal(beforeSet, originalName, doc = document) {
     const want = getComparableFileName(originalName);
     const modals = [...doc.querySelectorAll('.ant-modal, [role="dialog"], .ant-drawer-content')];
@@ -1472,7 +1916,6 @@
     return null;
   }
 
-  /* 关掉"点了顶栏按钮但没被采纳"的残留弹窗/下拉，避免它挡住后续行内编辑 */
   async function dismissStrayModals(qa, beforeSet, doc = document) {
     try {
       const stray = [...doc.querySelectorAll('.ant-modal, [role="dialog"], .ant-drawer-content, .ant-dropdown')]
@@ -1483,33 +1926,28 @@
       }
       if (stray.length) {
         await until(() => !stray.some(el => _isVisible(el)), 150, 2000);
-        /* 还没关掉就按 Esc */
         if (stray.some(el => _isVisible(el))) { try { pressKeyOn(doc.body, 'Escape'); } catch {} }
         await sleep(150);
       }
     } catch {}
   }
 
-  /* 顶栏「重命名」路径（用户实测主路径）：先单选该行 → 点按钮 → 等弹窗/行内编辑。
-   * **安全闸门**：只有表头三态 + fid 列表证明"仅勾选目标行"时才点按钮
-   * （该按钮作用于所有勾选行，虚拟滚动下看不见的行也可能被勾选 → 误触发就是批量改名）。*/
   async function openRenameViaToolbar(qa, file, originalName, doc = document) {
     if (!file || !file.fid) return null;
 
     const sel = await resetSelectionToRow(qa, file, doc);
     if (!sel.ok) {
-      warn(` ⚠️ 改名：单选复核未通过（${sel.reason}）→ 不点顶栏「重命名」（防批量改名）`);
+      warn(` ⚠️ 改名：单选复核未通过（${sel.reason}）→ 不点顶栏「重命名」`);
       return null;
     }
 
     const btn = findToolbarRenameButton(doc);
-    if (!btn) { log('   ↳ 顶栏没有「重命名」按钮，改走行内编辑'); return null; }
+    if (!btn) { log('   ↳ 顶栏没有「重命名」按钮，放弃本行改名'); return null; }
     if (btn.disabled || btn.getAttribute('aria-disabled') === 'true' || btn.classList.contains('ant-btn-disabled')) {
       warn(' ⚠️ 改名：顶栏「重命名」按钮处于禁用态，跳过');
       return null;
     }
 
-    /* before 用与 dismissStrayModals 相同的选择器集合 —— 否则"点击前就打开的下拉"会被当残留关掉 */
     const STRAY_SEL = '.ant-modal, [role="dialog"], .ant-drawer-content, .ant-dropdown';
     const before = new Set([...doc.querySelectorAll(STRAY_SEL)]);
     log(` → 改名：点击顶栏「重命名」（已确认仅勾选 1 行）`);
@@ -1527,14 +1965,10 @@
       await sleep(150);
     }
     warn(' ⚠️ 改名：点了顶栏「重命名」但没等到弹窗/编辑框');
-    /* 点了按钮却什么都没等到：可能弹出了"没被采纳"的残留弹窗/遮罩，
-     * 清掉它，否则会挡住后面的行内编辑点击。*/
     await dismissStrayModals(qa, before, doc);
     return null;
   }
 
-  /* 打开改名入口：**优先顶栏「重命名」**（用户实测：单选该行 → 点按钮），
-   * 其次行内编辑（点文件名单元格），最后悬停「更多」菜单。*/
   async function openRenameDialog(qa, row, nameCell, originalName, doc = document) {
     if (!row || !row.isConnected) {
       const fresh = findListRowByName(qa, originalName, doc);
@@ -1544,87 +1978,13 @@
     if (!row || !row.isConnected) { warn(` ⚠️ 改名：列表里找不到该行 —— ${originalName}`); return null; }
 
     const file = findListRowByName(qa, originalName, doc);
-
-    /* ① 顶部栏「重命名」（主路径；内部已用单选复核把门） */
-    if (file && file.fid) {
-      const viaToolbar = await openRenameViaToolbar(qa, file, originalName, doc);
-      if (viaToolbar) return viaToolbar;
-      row = file.row;
-      nameCell = getNameCellOnly(file.row) || nameCell;
+    if (!file || !file.fid) {
+      warn(` ⚠️ 改名：找不到带 fid 的行 —— ${originalName}`);
+      return null;
     }
 
-    /* ② 行内编辑（退路）：夸克的行内编辑要求该行处于选中态，先把勾选收敛到这一行 */
-    if (file && file.fid) {
-      const sel = await resetSelectionToRow(qa, file, doc);
-      if (!sel.ok) warn(` ⚠️ 改名：勾选收敛未达预期（${sel.reason}），行内编辑可能不生效`);
-      row = file.row;
-      nameCell = getNameCellOnly(file.row) || nameCell;
-    }
-
-    const inline = await openInlineRename(qa, nameCell, originalName, doc);
-    if (inline) return inline;
-
-    /* ③ 悬停操作条的"更多"菜单里可能藏着重命名。
-     * 只在目标行**确实有** .hoitem-more 时才走这条路，且菜单项只认"点击后新出现的下拉"，
-     * 避免命中页面上其它残留的菜单把新名写到别的文件上。*/
-    try {
-      if (row && row.isConnected) {
-        const closer = row.closest('.filename') || row;
-        dispatchHover(qa, getNameElInRow(row));
-        const more = await untilVisibleMatch(1200, /.*/, '.hoitem-more, .hover-oper-item.ant-dropdown-trigger', closer);
-        if (!more) {
-          log('   ↳ 悬停条里没有「更多」入口，跳过菜单路径');
-        } else {
-          const before = new Set([...doc.querySelectorAll('.ant-dropdown, .ant-dropdown-menu, .ant-menu')]);
-          try { qa.realClick(more); } catch {}
-          const fresh = [...doc.querySelectorAll('.ant-dropdown, .ant-dropdown-menu, .ant-menu')]
-          .filter(el => !before.has(el) && _isVisible(el));
-          let item = null;
-          const t0 = Date.now();
-          while (!item && Date.now() - t0 < 1500) {
-            for (const menu of fresh) {
-              for (const el of menu.querySelectorAll('li, .ant-dropdown-menu-item, [role="menuitem"]')) {
-                const txt = (el.textContent || '').replace(/\s+/g, '').trim();
-                if (/^重命名$|^重新命名$|^改名$/.test(txt)) { item = el; break; }
-              }
-              if (item) break;
-            }
-            if (!item) await sleep(120);
-          }
-          if (item) {
-            log(' → 改名：点击菜单里的「重命名」');
-            qa.realClick(item.closest('li') || item);
-            const dlg = await waitRenameDialog(originalName, doc, 2000);
-            if (dlg) return dlg;
-          } else {
-            log('   ↳ 新出现的菜单里没有「重命名」，关闭菜单');
-            try { pressKeyOn(more, 'Escape'); } catch {}
-          }
-        }
-      }
-    } catch (e) { warn(' ⚠️ 改名：菜单路径异常', e); }
-
-    return null;
+    return await openRenameViaToolbar(qa, file, originalName, doc);
   }
-
-  /* 在 [0, timeout] 内轮询匹配可见元素（默认只扫菜单项类元素，避免误点页面导航里的 li） */
-  async function untilVisibleMatch(timeout, re, selector = 'li, .ant-dropdown-menu-item, [role="menuitem"], .ant-menu-item, .ant-modal-footer button, .ant-drawer button', scope = document) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
-      for (const el of scope.querySelectorAll(selector)) {
-        if (isRenamePanel(el) || !_isVisible(el)) continue;
-        const txt = (el.textContent || '').replace(/\s+/g, '').trim();
-        if (re.test(txt)) return el;
-      }
-      await sleep(120);
-    }
-    return null;
-  }
-
-  /* ===== 行内改名（夸克真实实现）=====
-   * 文件名单元格：`<div class="filename-text editable-cell editable-cell-allow" title="原名">原名</div>`
-   * 点它 → 原地变成 `<input class="ant-input input-edit" maxlength="250" value="原名">`（无弹窗）。
-   * 输入新名后按 Enter 或失焦提交。*/
 
   function findInlineRenameInput(originalName = '', doc = document) {
     const want = getComparableFileName(originalName);
@@ -1637,78 +1997,10 @@
     return inputs.find(i => getComparableFileName(i.value) === want) || null;
   }
 
-  /* 行内编辑是否还开着：绑定到具体元素 + 可见性判断（不要用"全文还有没有 input-edit"） */
   function isEditorOpen(input) {
     return !!(input && input.isConnected && _isVisible(input));
   }
 
-  /* 点开行内编辑：单击 → 两次点击 → F2，每一步都记日志，便于真机定位。
-   * 不用 dblclick：夸克列表页双击文件名会打开/预览文件（mp4 会拉播放器）。*/
-  async function openInlineRename(qa, nameCell, originalName, doc = document) {
-    if (!nameCell || !nameCell.isConnected) {
-      const row = (findListRowByName(qa, originalName, doc) || {}).row;
-      /* 只取真正的文件名单元格：getNameElInRow 会兜底返回整行，点整行会打开/选中文件 */
-      nameCell = getNameCellOnly(row);
-    }
-    if (!nameCell || !nameCell.isConnected) {
-      warn(` ⚠️ 改名：拿不到文件名单元格 —— ${originalName}`);
-      return null;
-    }
-
-    const row = nameCell.closest('tr');
-    log(` 改名·目标单元格：<${nameCell.tagName.toLowerCase()} class="${nameCell.className}"> text="${(nameCell.textContent || '').trim().slice(0, 40)}"`
-      + ` | 行选中=${!!(row && row.classList.contains('ant-table-row-selected'))}`
-      + ` 可编辑=${nameCell.classList.contains('editable-cell-allow') || nameCell.classList.contains('editable-cell')}`);
-
-    /* 鼠标先移到该行，让 hover-oper 就位（不改变勾选） */
-    try { dispatchHover(qa, nameCell); } catch {}
-
-    /* 手势顺序：单击 → 两次点击（选中后进入编辑）→ F2 → Enter（Enter 放最后，副作用最大）。
-     * 不用 dblclick：夸克列表页双击文件名会打开/预览文件（mp4 会拉播放器）。*/
-    for (const how of ['click', 'slowclick', 'f2', 'enterkey']) {
-      try {
-        if (how === 'click') qa.realClick(nameCell);
-        else if (how === 'slowclick') {
-          qa.realClick(nameCell);
-          await sleep(600);
-          if (!isEditorOpen(findInlineRenameInput(originalName, doc))) {
-            if (!nameCell.isConnected) {
-              const fresh = findListRowByName(qa, originalName, doc);
-              const el = fresh ? getNameCellOnly(fresh.row) : null;
-              /* 只点真正的文件名单元格；坚决不退回整行（点行会打开/选中文件） */
-              nameCell = el;
-            }
-            if (nameCell && nameCell.isConnected) qa.realClick(nameCell);
-          }
-        } else if (how === 'enterkey') {
-          /* 有些可编辑单元格要先聚焦，再按 Enter 才进编辑态 */
-          try { if (!nameCell.hasAttribute('tabindex')) nameCell.setAttribute('tabindex', '-1'); } catch {}
-          try { nameCell.focus(); } catch {}
-          pressKeyOn(nameCell, 'Enter');
-        } else pressKeyOn(nameCell, 'F2');
-      } catch (e) { warn(` ⚠️ 改名：${how} 手势异常`, e); }
-      const input = await waitInlineRenameInput(originalName, doc, how === 'click' ? 1500 : 1200);
-      if (input) {
-        log(` → 改名：进入行内编辑（${how}）`);
-        return input;
-      }
-    }
-    return null;
-  }
-
-  async function waitInlineRenameInput(originalName, doc = document, timeout = 1500) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
-      const input = findInlineRenameInput(originalName, doc);
-      if (input) return input;
-      await sleep(100);
-    }
-    return null;
-  }
-
-  /* 发键盘事件。
-   * 注意：KeyboardEventInit **不接收** keyCode/which，必须用 defineProperty 补，
-   * 否则 e.keyCode 恒为 0 —— 有些组件只认 keyCode 判 Enter/Esc/F2。*/
   function pressKeyOn(el, key) {
     const win = (el && el.ownerDocument ? el.ownerDocument.defaultView : window) || window;
     const code = { Enter: 13, Escape: 27, F2: 113 }[key] || 0;
@@ -1722,29 +2014,9 @@
       } catch {}
       try { el.dispatchEvent(ev); } catch {}
     };
-    fire('keydown');
-    fire('keypress');
-    fire('keyup');
+    fire('keydown'); fire('keypress'); fire('keyup');
   }
 
-  function dispatchHover(qa, el) {
-    const win = el.ownerDocument.defaultView || window;
-    const r = el.getBoundingClientRect();
-    const cx = r.left + r.width / 2;
-    const cy = r.top + r.height / 2;
-    const base = { bubbles: true, cancelable: true, view: win, clientX: cx, clientY: cy, button: 0, buttons: 0, pointerId: 1, pointerType: 'mouse', isPrimary: true };
-    for (const [type, ctor] of [['pointerover', win.PointerEvent], ['pointerenter', win.PointerEvent], ['pointermove', win.PointerEvent], ['mouseover', win.MouseEvent], ['mouseenter', win.MouseEvent], ['mousemove', win.MouseEvent]]) {
-      try { el.dispatchEvent(new ctor(type, base)); } catch {}
-    }
-  }
-
-  /* ===== 行内改名（夸克真实实现）=====
-   * 文件名单元格：`<div class="filename-text editable-cell editable-cell-allow" title="原名">原名</div>`
-   * 点它 → 原地变成 `<input class="ant-input input-edit" maxlength="250" value="原名">`（无弹窗）。
-   * 写入新名 → Enter（不行再失焦 / 点确认 / Ctrl+Enter）提交 → **等列表按完整新名确认到** 才算成功。
-   * fid：目标行的 data-row-key（改名不换 fid，用它绑定复核）。*/
-
-  /* 读取某一行"当前显示的单个文件名"（title 优先，退回 textContent）。*/
   function readRowRealName(fid, doc = document) {
     if (!fid) return '';
     const row = findRowByFid(fid, doc);
@@ -1754,11 +2026,10 @@
     .replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
   }
 
-  /* 在列表里按**完整文件名（含 [bgm] 标签）**精确查找：可见区找不到就全表滚动扫描。
-   * 这是改名确认的唯一依据 —— 必须能按新名（含标签）重新找到那一行。*/
   function normExactName(s) {
     return String(s ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
   }
+
   async function findExactNameAnywhere(qa, name, doc = document, maxMs = 4000) {
     const want = normExactName(name);
     if (!want) return null;
@@ -1770,11 +2041,6 @@
     } catch { return null; }
   }
 
-  /* ===== 改名落地确认（唯一判据，行内与弹窗两条路径共用）=====
-   * 用户要求：**必须按完整新名（含 [bgm] 标签）在列表里重新匹配到那一行**，才算改名成功。
-   * 只认"完整名精确相等"（可见区每 300ms 查一次、全表每 3s 查一次），
-   * 不用 includes / 不用会剥 [bgm] 的比较键（那等于把没改成判成功）。
-   * 返回 true(已确认) / false(确认没改成) / null(确认不了)。*/
   async function confirmRenamedInList(qa, opts = {}) {
     const doc = opts.doc || document;
     const fid = opts.fid || '';
@@ -1790,18 +2056,15 @@
     let lastLog = 0;
     let scrolled = false;
 
-    /* 可见区按"完整名"精确匹配（并校验 fid） */
     const visibleExact = () => {
       const hit = (qa.scanFileRows(doc) || []).find(f => normExactName(f.name) === newName);
       if (!hit) return false;
-      if (fid && hit.fid && hit.fid !== fid) return false;   /* 同名但不是目标行 */
+      if (fid && hit.fid && hit.fid !== fid) return false;
       return true;
     };
 
     while (Date.now() < deadline) {
       let seen = visibleExact();
-      /* 可见区没命中时才做全表兜底（虚拟滚动）：每 3 秒一次、单次最多 4 秒，
-       * 结果在两次之间沿用，保证"连续 2 秒看到新名"能攒满。*/
       if (!seen && Date.now() - lastFull > 3000) {
         lastFull = Date.now();
         const hit = await findExactNameAnywhere(qa, newName, doc, 4000);
@@ -1812,7 +2075,7 @@
       if (seen) {
         if (!stableSince) stableSince = Date.now();
         if (Date.now() - stableSince >= stableMs) {
-          log(` ✓ 改名：按完整名（含标签）在列表里确认到「${newName}」`);
+          log(` ✓ 改名：按完整名确认到「${newName}」`);
           return true;
         }
       } else {
@@ -1831,13 +2094,11 @@
       await sleep(300);
     }
 
-    /* 超时：再各查一次完整名（可见区 + 全表） */
     const finalHit = await findExactNameAnywhere(qa, newName, doc);
     if (finalHit && (!fid || !finalHit.fid || finalHit.fid === fid)) {
       log(` ✓ 改名：超时前一刻按完整名确认到「${newName}」`);
       return true;
     }
-    /* 旧名还在（完整名精确）→ 确认没改成 */
     if (oldName) {
       const oldHit = await findExactNameAnywhere(qa, oldName, doc);
       if (oldHit) return false;
@@ -1845,9 +2106,6 @@
     return null;
   }
 
-  /* 行内改名：写入新名并提交（提交动作本身）。
-   * fid 只用于日志；"是否真的改成"统一由 renameOneRow 调 confirmRenamedInList 判定。
-   * 返回 'submitted' | 'fail'。*/
   async function applyRenameViaInlineEditor(qa, input, oldName, newName, doc = document, fid = '') {
     if (!input || !input.isConnected) return 'fail';
 
@@ -1867,17 +2125,11 @@
     const editorClosed = () => !isEditorOpen(input);
     let closed = false;
 
-    /* ① Enter（带 keyCode） */
     pressKeyOn(input, 'Enter');
     closed = await until(() => editorClosed(), 150, 3000);
 
-    /* ② 失焦 */
-    if (!closed) {
-      try { input.blur(); } catch {}
-      closed = await until(() => editorClosed(), 150, 3000);
-    }
+    if (!closed) { try { input.blur(); } catch {} closed = await until(() => editorClosed(), 150, 3000); }
 
-    /* ③ 单元格里的确认按钮 */
     if (!closed) {
       const cell = input.closest('.filename, .file-click-wrap, td') || doc;
       const okBtn = [...cell.querySelectorAll('button, .anticon-check, [class*="confirm"], [class*="sure"], [class*="save"]')]
@@ -1889,7 +2141,6 @@
       }
     }
 
-    /* ④ Ctrl+Enter 兜底 */
     if (!closed) {
       try {
         const win = input.ownerDocument.defaultView || window;
@@ -1909,10 +2160,9 @@
     }
 
     if (!closed) {
-      /* 还没关：按 Esc 收尾，避免残留编辑器污染后面的行 */
       pressKeyOn(input, 'Escape');
       await until(() => editorClosed(), 120, 1500);
-      warn(' ⚠️ 改名：行内编辑未提交（Enter/失焦/确认按钮都无效），已按 Esc 放弃');
+      warn(' ⚠️ 改名：行内编辑未提交，已按 Esc 放弃');
       return 'fail';
     }
 
@@ -1920,8 +2170,6 @@
     return 'submitted';
   }
 
-  /* 找改名的 ant-modal：输入框的值必须就是原文件名（或去标识符后同名）。
-   * 不做"弹窗文本含重命名"的兜底 —— 那会把别的行的改名弹窗也认下来，改错文件。*/
   function findRenameModal(originalName, doc = document) {
     const want = getComparableFileName(originalName);
     const modals = doc.querySelectorAll('.ant-modal, [role="dialog"], .ant-drawer-content, .base-confirm-modal .ant-modal');
@@ -1938,25 +2186,13 @@
     return null;
   }
 
-  async function waitRenameDialog(originalName, doc = document, timeout = 2500) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
-      const m = findRenameModal(originalName, doc);
-      if (m) return m;
-      await sleep(120);
-    }
-    return null;
-  }
-
-  /* 输入新名 → 确认 → 等关闭。
-   * scope 可能是行内编辑的 <input>（夸克真实路径）或改名弹窗（改动后的 Quark 版本）。*/
   async function applyRenameInDialog(qa, scope, originalName, newName, doc = document, fid = '') {
     if (!scope || !scope.isConnected) { warn(' ⚠️ 改名：改名编辑器已消失'); return false; }
 
     const inpSel = 'input.input-edit, input[type="text"], input:not([type]), input.ant-input';
     const collect = () => (typeof scope.querySelectorAll === 'function' && !(scope.tagName === 'INPUT'))
-    ? [...scope.querySelectorAll(inpSel)].filter(i => !isRenamePanel(i))
-    : [scope];
+      ? [...scope.querySelectorAll(inpSel)].filter(i => !isRenamePanel(i))
+      : [scope];
     const inputs = collect();
     const want = getComparableFileName(originalName);
     const input = inputs.find(i => {
@@ -1974,7 +2210,6 @@
       try { input.dispatchEvent(new Event('change', { bubbles: true })); } catch {}
     };
 
-    /* 行内编辑：Enter 或失焦提交；弹窗：点确认按钮 */
     if (input.classList.contains('input-edit')) {
       return await applyRenameViaInlineEditor(qa, input, originalName, newName, doc, fid);
     }
@@ -2003,8 +2238,6 @@
     }
 
     qa.realClick(btn);
-    /* 等**同一个弹窗元素**真正关闭：不能用 findRenameModal(originalName) —— 输入框值已改成新名，
-     * 那个判据在改值瞬间就恒为 null，等于没等（残留遮罩会挡住后续每个文件的点击）。*/
     const modalEl = (scope && scope.tagName !== 'INPUT' && scope.isConnected) ? scope : null;
     const closed = await qa.until(
       () => (modalEl ? (!modalEl.isConnected || !_isVisible(modalEl)) : !findRenameModal(originalName, doc)),
@@ -2020,8 +2253,6 @@
     return 'submitted';
   }
 
-  /* 刷新后等列表出现本次转存的文件名（用尾巴 token 匹配，避免被标识符影响）。
-   * 超时不算失败：后续 applyListRenames 会自己再等一次并逐个跳过找不到的行。*/
   async function waitRowsForRename(qa, plan, timeout = 8000, doc = document) {
     const tokens = [];
     for (const e of plan) {
@@ -2039,17 +2270,14 @@
 
     const got = await until(hitAll, 200, timeout);
     if (got) { log(' ✓ 刷新后列表已出现本次转存文件，开始改名'); return true; }
-    warn(` ⚠️ 改名：${timeout}ms 内列表未出现全部目标文件（可能仍在加载），继续尝试改名`);
+    warn(` ⚠️ 改名：${timeout}ms 内列表未出现全部目标文件`);
     return false;
   }
 
-  /* 单行改名：返回 true 表示"已确认改名落地"。
-   * 提交动作由行内编辑/弹窗完成；**是否真的改成**统一在这里用 confirmRenamedInList 判定，
-   * 两条路径共用同一判据（绝不"提交了就当你成功"）。*/
   async function renameOneRow(qa, m, doc = document) {
     const row = (m.row && m.row.isConnected) ? m.row : ((findListRowByName(qa, m.old, doc) || {}).row || null);
     const editor = await openRenameDialog(qa, row, m.nameEl || getNameElInRow(row), m.old, doc);
-    if (!editor) { warn(` ⚠️ 改名：打不开改名编辑器（行内编辑与按钮都没成功） —— ${m.old}`); return false; }
+    if (!editor) { warn(` ⚠️ 改名：打不开改名编辑器 —— ${m.old}`); return false; }
 
     const r = await applyRenameInDialog(qa, editor, m.old, m.next, doc, m.fid || '');
     if (r === 'fail' || r === false) {
@@ -2061,40 +2289,56 @@
       return false;
     }
 
-    /* ===== 落地确认（唯一判据）===== */
     const verdict = await confirmRenamedInList(qa, {
       fid: m.fid || '', oldName: m.old, newName: m.next, doc, budgetMs: 45000,
     });
-    if (verdict === true) { log(' ✓ 改名：列表已确认新名'); return true; }
-    if (verdict === false) { warn(` ⚠️ 改名：确认没改成（列表仍是旧名）—— ${m.old}`); return false; }
+
+    if (verdict === true) {
+      log(' ✓ 改名：列表已确认新名');
+      await until(() => !isShareTableLoading(doc), 150, 5000);
+      await sleep(300);
+      return true;
+    }
+    if (verdict === false) { warn(` ⚠️ 改名：确认没改成 —— ${m.old}`); return false; }
+
+    const oldStill = await findExactNameAnywhere(qa, m.old, doc, 3000);
+    if (!oldStill) {
+      log(` ✓ 改名：旧名已不在列表，视为改名成功 —— ${m.old} → ${m.next}`);
+      await until(() => !isShareTableLoading(doc), 150, 5000);
+      await sleep(300);
+      return true;
+    }
     warn(` ⚠️ 改名：45s 内无法确认是否改成 —— ${m.old} → ${m.next}`);
     return false;
   }
 
-  /* 批量改名：把已转存文件改成 [bgm]acg最终名称[bgm]原始文件名
-   * opts.waitMs：单个文件在列表里等待出现的上限（未成功刷新时可缩短，避免白等） */
   async function applyListRenames(qa, plan, opts = {}) {
     const doc = opts.doc || document;
     const waitMs = Number(opts.waitMs) > 0 ? Number(opts.waitMs) : 8000;
     const entries = Array.isArray(plan) ? plan.filter(x => x && x.old && x.next) : [];
     if (!entries.length) { log('★ 改名：无需要改名的文件'); return { renamed: 0, failed: 0, skipped: 0, confirmed: [], failedEntries: [], pairs: [] }; }
 
-    log(`★ 改名：待改名 ${entries.length} 个 → ${FILE_NAME_MARKER}acg名称${FILE_NAME_MARKER}原始文件名`);
+    log(`★ 改名：待改名 ${entries.length} 个`);
     for (const e of entries) log(` - ${e.old}  →  ${e.next}`);
 
     let renamed = 0, failed = 0, skipped = 0;
     const confirmed = [];
     const failedEntries = [];
 
-    /* 单趟改名；确认成功才计入 confirmed */
     const doOne = async (e, label) => {
-      /* 优先按 fid 定位（名字可能带 (2) 后缀或已被改过）；行可能在可见区外 → 先滚动 */
+      await until(() => !isShareTableLoading(doc), 150, 10000);
+      await sleep(300);
+
+      try {
+        await clearAllViaHeader(qa, doc);
+        await until(() => getHeaderCheckState(doc) === 'none', 100, 2000);
+      } catch {}
+
       let loaded = null;
       if (e.fid) {
         const row = findRowByFid(e.fid, doc);
         if (row) {
           const nc = row.querySelector('.filename-text, [class*="filename-text"], .file-name, [class*="file-name"]');
-          /* 当前名优先用 title（scanFileRows 同口径）；退回 textContent；再退回计划里的老名字 */
           const curName = nc
             ? String(nc.getAttribute('title') || nc.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim()
             : '';
@@ -2105,12 +2349,15 @@
       if (!loaded) loaded = await until(() => findListRowByName(qa, e.old, doc), 200, waitMs);
       if (!loaded) loaded = await scrollToRowByName(qa, doc, e.old, { cacheKey: currentCacheKey(), maxMs: 6000 });
       if (!loaded) {
+        const alreadyNew = findListRowByName(qa, e.next, doc);
+        if (alreadyNew) {
+          log(` ↺ 改名：${label} 已是目标名，跳过`);
+          return { ok: true, missing: false, alreadyDone: true };
+        }
         warn(` ⚠️ 改名：${label} 列表里找不到该文件 —— ${e.old}`);
         return { ok: false, missing: true };
       }
       const fid = e.fid || loaded.fid || (loaded.row && loaded.row.getAttribute && loaded.row.getAttribute('data-row-key')) || '';
-      /* 关键：old 必须换成**该行的真实当前名**（可能是 02(2).mp4），
-       * 否则行内编辑的输入框（值=真实当前名）匹配不上、弹窗也会认错行。*/
       let realName = '';
       try {
         if (fid) realName = readRowRealName(fid, doc);
@@ -2120,7 +2367,7 @@
         }
       } catch {}
       const oldName = realName || e.old;
-      if (oldName !== e.old) log(`   ↳ 列表真实名：${oldName}（计划名 ${e.old}，夸克重名加了后缀）`);
+      if (oldName !== e.old) log(`   ↳ 列表真实名：${oldName}（计划名 ${e.old}）`);
       const r = await renameOneRow(qa, { row: loaded.row, nameEl: getNameElInRow(loaded.row), old: oldName, next: e.next, fid }, doc);
       if (r) {
         const row = findRowByExactName(qa, e.next, doc);
@@ -2129,7 +2376,11 @@
       } else {
         warn(` ✗ 改名失败 ${label} ${oldName}`);
       }
-      try { await qa.clearAllSelection(); } catch {}
+
+      try {
+        await clearAllViaHeader(qa, doc);
+        await until(() => getHeaderCheckState(doc) === 'none', 100, 2000);
+      } catch {}
       await sleep(250);
       return { ok: !!r, missing: false };
     };
@@ -2142,10 +2393,11 @@
       else { failed++; failedEntries.push(e); }
     }
 
-    /* 没成功的再来一趟：列表可能刚好还在刷、行还没渲染出来 */
     if (failedEntries.length) {
-      log(`★ 改名：第一趟后仍有 ${failedEntries.length} 个没成功，重试一趟…`);
-      await sleep(1500);
+      log(`★ 改名：第一趟后仍有 ${failedEntries.length} 个没成功，等待列表稳定后重试…`);
+      await sleep(2500);
+      await until(() => !isShareTableLoading(doc), 150, 10000);
+      await sleep(500);
       const retry = failedEntries.slice();
       failedEntries.length = 0;
       failed = 0; skipped = 0;
@@ -2159,8 +2411,8 @@
     }
 
     if (failedEntries.length) {
-      warn(` ⚠️ 改名：${failedEntries.length} 个文件最终未确认改名成功（不会自动补做）：`
-        + failedEntries.map(e => e.old).join('、'));
+      warn(` ⚠️ 改名：${failedEntries.length} 个文件最终未确认改名成功：`
+           + failedEntries.map(e => e.old).join('、'));
     }
 
     try { qa.refreshGray(); } catch {}
@@ -2168,7 +2420,6 @@
     return { renamed, failed, skipped, confirmed, failedEntries, pairs: [] };
   }
 
-  /* 改名自检：对当前可见的第一个文件加/改标识符前缀，用于验证改名路径是否可用 */
   async function runRenameSmokeTest(qa, doc = document) {
     const files = (qa.scanFileRows(doc) || []).filter(f => f.fid && f.row && !isFolderFile(f));
     if (!files.length) { alert('当前可见区没有可改名的文件行'); return; }
@@ -2181,21 +2432,15 @@
     log('=== 改名自检 ===');
     log(` 当前名：${f.name}`);
     log(` 目标名：${next}`);
-    const btns = [...doc.querySelectorAll('.btn-group button, button')]
-    .map(b => (b.textContent || '').replace(/\s+/g, '')).filter(Boolean);
-    log(' 页面按钮文本：', btns.join(' | '));
 
     const rep = await applyListRenames(qa, [{ old: f.name, next, fid: f.fid }]);
     if (rep.renamed) {
-      alert(`✅ 改名成功（已确认列表中新名生效）\n\n${f.name}\n→ ${next}\n\n（自检用，验证完可手动改回）`);
+      alert(`✅ 改名成功\n\n${f.name}\n→ ${next}`);
     } else {
-      alert(`❌ 改名未确认成功（成功 ${rep.renamed} / 失败 ${rep.failed} / 跳过 ${rep.skipped}）\n\n`
-        + `若文件其实已经改名：说明列表刷新慢于 45s，请把控制台 [桥接] 日志发我。\n`
-        + `若完全没改名：请看日志里"打不开改名编辑器/行内编辑未提交"的具体原因。`);
+      alert(`❌ 改名未确认成功（成功 ${rep.renamed} / 失败 ${rep.failed} / 跳过 ${rep.skipped}）`);
     }
   }
 
-  /* 改名诊断（只读）：不改动任何文件，只报告入口元素/按钮/勾选状态，便于真机排查 */
   function runRenameDiagnose(qa, doc = document) {
     const lines = [];
     const files = (qa.scanFileRows(doc) || []).filter(f => f.fid && f.row && !isFolderFile(f));
@@ -2203,7 +2448,7 @@
 
     const f = files[0];
     if (!f) {
-      const msg = lines.join('\n') + '\n\n当前可见区没有文件行（列表可能还在加载）';
+      const msg = lines.join('\n') + '\n\n当前可见区没有文件行';
       log('=== 改名诊断 ===\n' + msg);
       alert(msg);
       return;
@@ -2212,96 +2457,55 @@
     const cell = getNameCellOnly(f.row);
     lines.push(`首个文件：${f.name}`);
     lines.push(`fid：${f.fid}`);
+    lines.push(`mtime：${f.mtime || '（无）'}`);
     lines.push(`行 class：${f.row.className}`);
-    lines.push(`行选中：${f.row.classList.contains('ant-table-row-selected')}`);
     lines.push(`名字单元格：${cell ? `<${cell.tagName.toLowerCase()} class="${cell.className}">` : '未找到 .filename-text'}`);
     if (cell) {
       lines.push(`title：${cell.getAttribute('title')}`);
-      lines.push(`可编辑标记：editable-cell-allow=${cell.classList.contains('editable-cell-allow')} editable-cell=${cell.classList.contains('editable-cell')}`);
       const style = (cell.ownerDocument.defaultView || window).getComputedStyle(cell);
-      lines.push(`样式：pointer-events=${style.pointerEvents} user-select=${style.userSelect} cursor=${style.cursor}`);
+      lines.push(`样式：pointer-events=${style.pointerEvents}`);
     }
-    /* 行内改名会写入的名字长度检查：超长会被夸克 maxlength=250 砍掉/拒绝 */
     const fit = fitAcgName('测试改名', f.name);
-    lines.push(`改名目标名示例：${fit.name || '（构不出）'}${fit.truncated ? '（acg 名称会被截短以适配 250）' : ''}`);
+    lines.push(`改名目标名示例：${fit.name || '（构不出）'}${fit.truncated ? '（会被截短）' : ''}`);
+    lines.push(`needRename(当前名, '测试改名') = ${needRename(f.name, '测试改名')}`);
 
-    const btns = [...doc.querySelectorAll('.btn-group button.btn-file')]
-    .map(b => (b.textContent || '').replace(/\s+/g, '') || b.className).filter(Boolean);
-    lines.push(`顶栏按钮：${btns.join(' | ') || '（无）'}`);
     const tbRename = findToolbarRenameButton(doc);
-    lines.push(`顶栏「重命名」按钮：${tbRename
-      ? `已找到（disabled=${!!(tbRename.disabled || tbRename.classList.contains('ant-btn-disabled'))}）`
-      : '未找到'}`);
+    lines.push(`顶栏「重命名」按钮：${tbRename ? '已找到' : '未找到'}`);
     lines.push(`表头全选状态：${getHeaderCheckState(doc)}`);
     lines.push(`可见选中行：${getSelectedFids(doc).length}`);
-    lines.push(`当前行内编辑 input：${findInlineRenameInput('', doc) ? '有' : '无'}`);
-    const closer = f.row.closest('.filename') || f.row;
-    lines.push(`目标行内 .hoitem-more：${closer.querySelectorAll('.hoitem-more, .hover-oper-item.ant-dropdown-trigger').length} 个`);
 
     const msg = lines.join('\n');
     log('=== 改名诊断 ===\n' + msg);
-    alert(msg + '\n\n（本诊断不改动任何文件；详细内容见控制台 [桥接] 日志）');
+    alert(msg);
   }
 
-  /* 手动放行：改名没确认时 BUSY_KEY 会一直保持（阻止自动下载）。用户确认要用原名下载时点这里。*/
-  async function runAllowDownloadAfterRename(qa) {
-    let busy = false;
-    try { busy = sessionStorage.getItem(BUSY_KEY) === '1'; } catch {}
-    if (busy && !confirm('改名未全部确认，当前已阻止下载。\n\n确定要按当前文件名（可能还是旧名）继续下载吗？')) return;
-    releaseBusy();
-    log('★ 用户确认允许下载：已解除忙碌标志，触发下载');
-    if (qa.isPaused && qa.isPaused()) { alert('已允许下载，但夸克助手处于暂停状态（点「▶️ 继续下载」后再下载）。'); return; }
-    if (typeof qa.autoDownloadWorkflow !== 'function') { alert('已解除限制；请点夸克面板「⬇️ 下载」。'); return; }
-    await qa.autoDownloadWorkflow();
-  }
-
-  /* ===== 逐行勾选（虚拟滚动兼容） ===== */
+  /* ===== 逐行勾选 ===== */
   async function applyTargetChecks(qa, doc, targets, opts = {}) {
     if (!targets || !targets.size) return { ok: true, applied: 0, failed: 0 };
-
     const cacheKey = opts.cacheKey || null;
-
     const body = getTableBody(doc);
     const needScroll = body && isVirtualScrolling(body);
-
     const entries = [...targets.entries()];
     let applied = 0, failed = 0;
     const failedNames = [];
 
     for (const [name, desired] of entries) {
       let f;
-      if (needScroll) {
-        f = await scrollToRowByName(qa, doc, name, { cacheKey });
-      } else {
-        f = qa.scanFileRows(doc).find(x => x.name === name);
-      }
-      if (!f) {
-        warn(` ⚠️ 找不到行：${name}`);
-        failed++; failedNames.push(name);
-        continue;
-      }
+      if (needScroll) f = await scrollToRowByName(qa, doc, name, { cacheKey });
+      else f = qa.scanFileRows(doc).find(x => x.name === name);
+      if (!f) { warn(` ⚠️ 找不到行：${name}`); failed++; failedNames.push(name); continue; }
       if (!!f.checked === desired) { applied++; continue; }
       const r = await setRowCheckbox(qa, f.row, desired);
       if (r.ok) applied++;
       else { failed++; failedNames.push(name); }
       await sleep(80);
     }
-
-    return {
-      ok: failed === 0,
-      applied, failed,
-      details: failedNames.map(n => ({ name: n })),
-    };
+    return { ok: failed === 0, applied, failed, details: failedNames.map(n => ({ name: n })) };
   }
 
-  /* ===== 表头全选方案 =====
-   * 少量勾选：表头清空后逐个滚动勾选；大量勾选：表头全选后逐个滚动取消。
-   * 目标全 true 且表头已 all / 全 false 且表头已 none 时直接快速返回。 */
   async function applyTargetChecksViaSelectAll(qa, doc, targets, opts = {}) {
     if (!targets || !targets.size) return { ok: true, applied: 0, failed: 0 };
-
     const cacheKey = opts.cacheKey || null;
-
     const entries = [...targets.entries()];
     const trueEntries = entries.filter(([, v]) => v === true);
     const falseEntries = entries.filter(([, v]) => v === false);
@@ -2313,29 +2517,20 @@
     log(` 表头状态：${headerState}；目标：${trueCount} 勾选 / ${falseCount} 取消`);
 
     if (trueCount === totalCount && headerState === 'all') {
-      log(` ✓ 表头已全选，无需操作`);
       return { ok: true, applied: 0, failed: 0, method: 'header-all-satisfied' };
     }
-
     if (falseCount === totalCount && headerState === 'none') {
-      log(` ✓ 表头已全不选，无需操作`);
       return { ok: true, applied: 0, failed: 0, method: 'header-none-satisfied' };
     }
 
-    /* 少量勾选：表头清空后逐个滚动勾选目标 */
     if (trueCount > 0 && trueCount < totalCount / 2) {
-      log(` ★ 少量勾选（${trueCount}/${totalCount}），走「表头全不选 → 单独勾」快速路径`);
-
+      log(` ★ 少量勾选（${trueCount}/${totalCount}），走「表头全不选 → 单独勾」`);
       if (headerState !== 'none') {
         const cls = await clearAllViaHeader(qa, doc);
         if (!cls.ok) {
           warn(` ⚠️ 表头清空失败（${cls.reason}），回退逐行模式`);
           return await applyTargetChecks(qa, doc, targets, { cacheKey });
         }
-        log(` 已通过表头全部取消（点击 ${cls.tries} 次）`);
-        await sleep(120);
-      } else {
-        log(` 表头已全不选，跳过清空`);
       }
 
       let ok = 0;
@@ -2357,7 +2552,6 @@
       };
     }
 
-    /* 大量勾选：表头全选后逐个滚动取消排除项 */
     const anyTrue = trueCount > 0;
     const targetHeaderState = anyTrue ? 'all' : 'none';
 
@@ -2367,10 +2561,6 @@
         warn(` ⚠️ 表头复选框操作失败（${hdr.reason}），回退逐行模式`);
         return await applyTargetChecks(qa, doc, targets, { cacheKey });
       }
-      log(` 表头已${anyTrue ? '全选' : '全不选'}（${hdr.method}${hdr.tries ? ', 点击 ' + hdr.tries + ' 次' : ''}）`);
-      await sleep(120);
-    } else {
-      log(` 表头已${anyTrue ? '全选' : '全不选'}，跳过点击`);
     }
 
     if (!falseEntries.length) {
@@ -2397,30 +2587,37 @@
   }
 
   /* ===== 表格稳定等待 ===== */
+  /* 等表格稳定：有 expected 时必须 cnt >= expected 才算稳定；
+   * cnt 稳定但 < expected 时继续等（不提前返回），等超时再返回实际行数，
+   * 避免 ant-table 分批渲染时只拿到 1 行就返回。 */
   async function waitTableStable(qa, doc = document, maxMs = 20000) {
     const t0 = Date.now();
     const expected = getShareFileCount(doc);
     log(` 头部显示共 ${expected == null ? '?' : expected} 个；等待表格稳定...`);
 
-    /* 等"表格专用加载层"消失（不误判分页器/按钮的 spin） */
     await until(() => !isShareTableLoading(doc), 150, maxMs);
     log(` 表格加载层已消失，等待行数稳定...`);
 
     let lastCount = -1;
     let stableHits = 0;
+    let lastWarn = 0;
     const remain = () => Math.max(0, maxMs - (Date.now() - t0));
 
     const files = await until(() => {
-      /* 中途又出现加载层：重置稳定计数 */
       if (isShareTableLoading(doc)) { lastCount = -1; stableHits = 0; return null; }
 
       const rows = qa.scanFileRows(doc);
       const cnt = rows.length;
+
       if (expected && cnt >= expected && cnt === lastCount) {
         if (++stableHits >= 2) return rows;
-      } else if (cnt > 0 && cnt === lastCount) {
+      } else if (!expected && cnt > 0 && cnt === lastCount) {
         if (++stableHits >= 4) return rows;
       } else {
+        if (expected && cnt > 0 && cnt < expected && Date.now() - lastWarn > 3000) {
+          lastWarn = Date.now();
+          log(`  ⏳ 扫描到 ${cnt} 行 < 头部 ${expected}，继续等待...`);
+        }
         stableHits = 0;
       }
       lastCount = cnt;
@@ -2429,8 +2626,37 @@
 
     if (files) return files;
     const cur = qa.scanFileRows(doc);
-    log(` 等待超时，当前扫描到 ${cur.length} 行`);
+    log(` 等待超时，当前扫描到 ${cur.length} 行（头部 ${expected == null ? '?' : expected}）`);
     return cur;
+  }
+
+  async function waitForListRowsStable(qa, doc, expectedMin, timeout = 10000) {
+    const t0 = Date.now();
+    const expMin = Math.max(1, Number(expectedMin) || 1);
+    let last = -1, stable = 0;
+
+    while (Date.now() - t0 < timeout) {
+      if (isShareTableLoading(doc)) { last = -1; stable = 0; await sleep(200); continue; }
+      const cnt = (qa.scanFileRows(doc) || []).length;
+      if (cnt === last && cnt > 0) {
+        stable++;
+        if (cnt >= expMin && stable >= 2) {
+          log(` ★ 刷新后列表稳定：${cnt} 行（期望 ≥${expMin}）`);
+          return cnt;
+        }
+        if (cnt < expMin && stable >= 6) {
+          log(` ⏱ 刷新后行数稳定但少于预期：${cnt} < ${expMin}，继续`);
+          return cnt;
+        }
+      } else {
+        stable = 0;
+      }
+      last = cnt;
+      await sleep(200);
+    }
+    const finalCnt = (qa.scanFileRows(doc) || []).length;
+    log(` ⏱ 刷新后等待超时：当前 ${finalCnt} 行（期望 ≥${expMin}）`);
+    return finalCnt;
   }
 
   /* ===== 批次执行器 ===== */
@@ -2465,8 +2691,10 @@
           index: bi, count: batch.length, result: 'check-failed',
           recorded: false, names: batch.map(f => f.name),
         });
-        return { ok: false, kind: 'check-failed', savedFiles, batchResults,
-                details: r.details || [], result: overall };
+        return {
+          ok: false, kind: 'check-failed', savedFiles, batchResults,
+          details: r.details || [], result: overall,
+        };
       }
 
       const result = await clickSaveOnce(qa, doc);
@@ -2482,7 +2710,7 @@
           savedFiles.push(...batch);
           recorded = true;
         } else {
-          warn(` ⚠️ 批 ${bi + 1} 结果 unknown 且未见成功模态框，视为未成功，不记录`);
+          warn(` ⚠️ 批 ${bi + 1} 结果 unknown 且未见成功模态框`);
         }
       }
 
@@ -2513,43 +2741,76 @@
     if (saved > 0) return { kind: 'partial', saved, total, failed: failedNames.length, failedReasons };
     return { kind: 'fail', saved: 0, total, failed: failedNames.length, failedReasons };
   }
-  /* 文件名列表拼接，超过 maxShow 个则截断 */
+
   function fmtNames(arr, maxShow = 20) {
     const names = (arr || []).map(x => (typeof x === 'string' ? x : x.name)).filter(Boolean);
     if (!names.length) return '（无）';
     if (names.length <= maxShow) return names.join('、');
     return names.slice(0, maxShow).join('、') + ` 等 ${names.length} 个`;
   }
+
   /* ===== 分享页准备 ===== */
   async function prepareShareSave(qa, doc = document, opts = {}) {
-    const splitOldest = opts.splitOldest !== false;
     const cacheKey = currentCacheKey();
 
     await ensureTimeDescSort(qa, doc);
 
-    /* 先等可见区表格稳定 */
     let files = await waitTableStable(qa, doc, 20000);
     files = (files || []).filter(f => !isFolderFile(f));
     if (!files.length) return { ok: false, kind: 'no-files', files: [] };
 
     await sleep(300);
 
-    /* 一次滚动收集全表；后续命中缓存不再滚动 */
     files = await scanAllRowsByScroll(qa, doc, { key: cacheKey, useCache: true });
     files = (files || []).filter(f => !isFolderFile(f));
     if (!files.length) return { ok: false, kind: 'no-files', files: [] };
 
-    const records = loadRecords();
-    const savedInfos = collectSavedInfos(records);
+    /* 扫描完整性校验：扫到的行数必须 >= 头部显示的总数。
+     * 如果不足，强制二次全表扫描（不用缓存），避免因 ant-table 分批渲染
+     * 导致只扫到部分文件，进而把"已转存"误判为"未转存"引发重转。 */
+    const expected = getShareFileCount(doc);
+    if (expected && files.length < expected) {
+      warn(` ⚠️ 首次扫描不完整（${files.length}/${expected}），强制全表扫描一次...`);
+      await sleep(500);
+      files = await scanAllRowsByScroll(qa, doc, { key: cacheKey, useCache: false, maxMs: 40000 });
+      files = (files || []).filter(f => !isFolderFile(f));
+      if (files.length < expected) {
+        warn(` ⚠️ 二次扫描仍不完整（${files.length}/${expected}），本轮按已扫到的 ${files.length} 个处理；未扫到的文件可能被重复转存`);
+      } else {
+        log(` ✓ 二次扫描完整：${files.length} 个`);
+      }
+    }
+
+    const shareKey = normalizeShareKey(location.href);
+    const clearFlagAtStart = Number(GM_getValue(GM_CLEAR_FLAG, 0) || 0);
+    const savedInfos = healShareRecords(shareKey, files);
+
+    try {
+      const recsAll = loadRecords({ consumeClear: false });
+      const allKeys = Object.keys(recsAll);
+      log(` 分享 key：${shareKey}`);
+      log(` 记录 keys（${allKeys.length}）：${allKeys.join(', ') || '（空）'}`);
+    } catch {}
 
     const saved = files.filter(f => isFileSaved(f, savedInfos));
     const pending = files.filter(f => !isFileSaved(f, savedInfos));
     const excludeNames = new Set(saved.map(f => f.name));
 
     log(` 共 ${files.length} 个（已排除文件夹）：已转存 ${saved.length}，待转存 ${pending.length}`);
-    log(` 逐行判定：`);
     for (const f of files) {
-      log(` - ${f.name} sizeStr="${f.sizeStr}" → ${isFileSaved(f, savedInfos) ? 'SAVED' : 'PENDING'}`);
+      log(` - ${f.name} sizeStr="${f.sizeStr}" mtime="${f.mtime || '-'}" fid="${f.fid || '-'}" → ${isFileSaved(f, savedInfos) ? 'SAVED' : 'PENDING'}`);
+    }
+
+    /* 全量重转 Debug：只在"扫描完整 + 全部未命中"时记录。
+     * 扫描不完整时跳过 debug，避免假报警。 */
+    if (files.length > 0 && saved.length === 0) {
+      const incomplete = !!expected && files.length < expected;
+      maybeSaveFullResaveDebug(qa, files, savedInfos, {
+        source: opts.source || 'child-task',
+        clearFlagAtStart,
+        incomplete,
+        expected,
+      });
     }
 
     setShareFullCounts(qa, saved.length, files.length);
@@ -2558,15 +2819,13 @@
       return { ok: false, kind: 'all-saved', needSave: [], skipped: saved, excludeNames, files };
     }
 
-    let batches;
-    if (splitOldest && pending.length > 1) {
-      const rest = pending.slice(0, -1);
-      const oldest = pending[pending.length - 1];
-      batches = [rest, [oldest]];
-      log(` ★ 全量转存：拆两批 — 第1批 ${rest.length} 个（除最旧），第2批 1 个（最旧：${oldest.name}）`);
-    } else {
-      batches = [pending];
-    }
+    try {
+      const okPack = ensurePackDirUnchecked(qa, doc);
+      log(` ★ 转存前"保存为文件夹"：${okPack ? '已取消/无此项' : '取消失败'}`);
+    } catch (e) { warn('取消"保存为文件夹"异常', e); }
+
+    const batches = [pending];
+    log(` ★ 全量转存：单批 ${pending.length} 个`);
 
     return {
       ok: true, kind: 'ready',
@@ -2595,7 +2854,7 @@
     qa.mountPanel();
     qa.setStatus('子任务处理中...', 'running');
     qa.setProgress('-');
-    startSharePolling(qa); // 让子任务页可见区也置灰
+    startSharePolling(qa);
 
     const finish = (kind, extra = {}) => {
       setResult(shareId, { kind, ...extra });
@@ -2605,7 +2864,7 @@
 
     let prep;
     try {
-      prep = await prepareShareSave(qa, document);
+      prep = await prepareShareSave(qa, document, { source: 'child-task' });
     } catch (e) {
       warn(' 准备失败', e);
       finish('fail', { message: 'prepare-error:' + String(e && e.message || e) });
@@ -2635,8 +2894,11 @@
         const prev = recs[key] || {};
         const merged = Array.isArray(prev.fileInfos) ? prev.fileInfos.slice() : [];
         for (const f of savedFiles) {
-          const item = { name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig };
-          if (!merged.some(mi => isSameFile(mi, item))) merged.push(item);
+          const item = {
+            name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig,
+            fid: f.fid || '', mtime: f.mtime || '',
+          };
+          upsertFileInfo(merged, item);
         }
         recs[key] = {
           ...prev,
@@ -2650,7 +2912,10 @@
       }
 
       const summary = describeExec(exec);
-      const savedBrief = savedFiles.map(f => ({ name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig }));
+      const savedBrief = savedFiles.map(f => ({
+        name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig,
+        fid: f.fid || '', mtime: f.mtime || '',
+      }));
 
       let kind = 'fail';
       if (summary.kind === 'success') kind = 'success';
@@ -2691,7 +2956,8 @@
     clearTask(shareId);
     return { kind: 'timeout', message: 'tab-timeout' };
   }
-  /* ===== 个人页：点击页面内"刷新"按钮（替代整页 reload） ===== */
+
+  /* ===== 个人页：点击页面内刷新 ===== */
   function findListRefreshButton(doc = document) {
     const el = doc.querySelector('.fl-refresh');
     if (el && _isVisible(el)) return el;
@@ -2701,8 +2967,6 @@
   async function clickListRefresh(qa, doc = document) {
     const wrap = findListRefreshButton(doc);
     if (!wrap) return false;
-
-    // 优先点内部 img（避免 hover 层拦截），退化为点容器
     const target = wrap.querySelector('img') || wrap;
     try {
       if (qa && typeof qa.realClick === 'function') qa.realClick(target);
@@ -2714,10 +2978,9 @@
     }
   }
 
-  /* 点击刷新后，等表格 loading 出现再消失（列表重拉一次） */
   async function clickListRefreshAndWait(qa, doc = document, opts = {}) {
     const appearedTimeout = opts.appearedTimeout ?? 3000;
-    const settleTimeout  = opts.settleTimeout  ?? 12000;
+    const settleTimeout = opts.settleTimeout ?? 12000;
 
     const ok = await clickListRefresh(qa, doc);
     if (!ok) return false;
@@ -2725,7 +2988,6 @@
     const tableWrap = doc.querySelector('.ant-table-wrapper');
     if (!tableWrap) { await sleep(800); return true; }
 
-    // 等 spin 出现（有 loading 才算真的触发了重拉）
     const appeared = await until(
       () => !!tableWrap.querySelector('.ant-spin-spinning'),
       100, appearedTimeout
@@ -2734,41 +2996,37 @@
     if (appeared) {
       await until(() => !tableWrap.querySelector('.ant-spin-spinning'), 150, settleTimeout);
     } else {
-      // 有的情况下刷新很快 / 没有明显 spin，给个短稳定期
       await sleep(800);
     }
     return true;
   }
-  /* ===== 把"刚转存的文件"对上列表里的真实行 =====
-   * 关键：夸克转存到已有同名文件时会自动加 (2) 后缀（02.mp4 → 02(2).mp4），
-   * 所以**不能按名字找行**。优先用图标签名（thumbnail URL 去掉 fid 查询参数后是文件自身的标识）。
-   * 退路：名字去 (n) 后缀相等（按后缀号最大者优先 = 夸克给新文件分配的号最大）。*/
 
-  /* 图标签名归一化：**保留 fid**（fid 就是文件身份，改名/转存都不变），其余 query 参数去掉。
-   * 输入形如 `bg:https://drive-pc.quark.cn/1/clouddrive/file/video/thumbnail?fid=…&pr=ucpro&fr=pc`。*/
+  /* ===== 图标签名 ===== */
   function normalizeIconSig(sig) {
     let s = String(sig ?? '').trim();
     if (!s) return '';
     s = s.replace(/&amp;/g, '&').replace(/^([A-Za-z]+):/, (m, p) => p.toLowerCase() + ':');
-    /* 去掉可能包裹的引号/实体 */
     s = s.replace(/^([a-z]+:)\s*["']?/, '$1').replace(/["']\s*$/, '').trim();
+
+    if (/^bg:.*thumb-.*drive\.quark\.cn\//i.test(s) || /^bg:.*\/thumbnail_/i.test(s)) {
+      const q = s.indexOf('?');
+      return (q >= 0 ? s.slice(0, q) : s).replace(/\/+$/, '');
+    }
+
     const q = s.indexOf('?');
     if (q < 0) return s.replace(/\/+$/, '');
     const base = s.slice(0, q).replace(/\/+$/, '');
     const params = s.slice(q + 1).split('&').filter(Boolean);
     const fidKv = params.find(p => /^fid=/i.test(p));
-    if (fidKv) return base + '?' + fidKv;          /* 身份 = 路径 + fid */
+    if (fidKv) return base + '?' + fidKv;
     return base + '?' + params.slice().sort().join('&');
   }
 
-  /* 取签名里的 fid（没有则为空） */
   function iconFid(sig) {
     const m = normalizeIconSig(sig).match(/[?&]fid=([^&]+)/i);
     return m ? m[1] : '';
   }
 
-  /* 签名是否"可按文件区分"：只有真实图片/缩略图 URL 才算。
-   * `svg:`/`cls:` 是**按类型**生成的（同类型文件完全相同），不能当身份用。*/
   function isIdentifiableIconSig(sig) {
     const s = String(sig ?? '').trim();
     if (!s || /^(svg|cls):/i.test(s)) return false;
@@ -2776,10 +3034,6 @@
     return /thumbnail|\.(png|jpe?g|webp|gif|avif)/i.test(s) || /[?&]fid=/i.test(s);
   }
 
-  /* 两个图标签名是否同一份文件：
-   * - **带 fid 的签名：只比 fid**（fid 就是身份；跨页前缀 img:/bg:、host、其它参数不同也算同一份）；
-   * - 都无 fid 的真实图片：路径全等即同一份；
-   * - 任一方是 svg/cls 类型签名 → 一律不算（避免同类型误配）。*/
   function sameIconSig(a, b) {
     if (!isIdentifiableIconSig(a) || !isIdentifiableIconSig(b)) return false;
     const fa = iconFid(a), fb = iconFid(b);
@@ -2788,11 +3042,9 @@
     return !!na && na === nb;
   }
 
-  /* 判定"目录里已存在的文件" vs "刚转存进来的新文件" */
   function stripDedupSuffix(name) {
     let t = String(name ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
     let suffix = 0;
-    /* 夸克可能叠后缀（01(1) (1).mkv），循环剥掉 */
     for (let i = 0; i < 5; i++) {
       const m = t.match(/^(.*?)\s*\((\d{1,3})\)(\.[^.]*)$/);
       if (!m || !m[1]) break;
@@ -2807,14 +3059,11 @@
     try { return normalizeSizeStr(s); } catch { return String(s ?? '').trim().toUpperCase(); }
   }
 
-  /* 上一次 matchSavedToListRow 的判定备注：'' = 正常/找不到，'ambiguous' = 有多行但无法判定谁是新的 */
   let lastMatchReason = '';
 
-  /* saved：转存结果记录（share 页拿到的原始文件名，可能没有大小）
-   * rows：个人页当前列表行（qa.scanFileRows）
-   * savedBefore：本次转存前的已转存名单（用于区分"已存在的旧同名文件"与"刚转存进来的新文件"）
-   * 返回 { row, currentName, base, how }；base 一律取**列表真实当前名**（不剥 (n)），
-   * 避免目标名与目录里已存在的文件撞名。*/
+  /* 转存记录与列表行的匹配（用于"转存后定位行去改名"）。
+   * 只处理本轮新转存记录，saved.name 即当时记录的名字（原始文件名）。
+   * 优先 icon / 快照 / 名字；名字部分同时考虑 [bgm] 新旧格式（通过 normalizeFileName 剥离） */
   function matchSavedToListRow(saved, rows, savedBefore, opts = {}) {
     const beforeFids = (opts && opts.beforeFids) || null;
     lastMatchReason = '';
@@ -2827,39 +3076,31 @@
 
     const mk = (r, how) => ({ row: r, currentName: r.name, base: stripMarkerBlock(r.name).trim(), how });
 
-    /* 先算出"与转存名完全相同"的候选行（纯计算，无副作用）：
-     * 后续 icon 路径要用它排除"早就存在的纯名旧行"，避免把旧文件当成刚转存的新文件。*/
     const exactCand = [];
     const baseCand = [];
     for (const r of rows) {
       const cur = String(r.name || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
       if (!cur) continue;
-      if (stripMarkerBlock(cur) !== cur) continue;   /* 已带 [bgm] 前缀的历史改名行，不参与匹配 */
+      if (stripMarkerBlock(cur) !== cur) continue;
       const curKey = getComparableFileName(cur);
       const rs = stripDedupSuffix(cur);
       if (curKey === wantName) { exactCand.push({ r, cur, suffix: rs.suffix }); continue; }
-      /* 去后缀后与转存名同名，且自身确实带后缀 */
       if (rs.suffix > 0 && getComparableFileName(rs.base) === wantName) {
         baseCand.push({ r, cur, suffix: rs.suffix });
       }
     }
     const exactAlreadySaved = Array.isArray(savedBefore)
-      && savedBefore.some(si => isSameFile(si, { name: savedName, sizeStr: (saved && saved.sizeStr) || '', iconSig: (saved && saved.iconSig) || '' }));
+    && savedBefore.some(si => isSameFile(si, { name: savedName, sizeStr: (saved && saved.sizeStr) || '', iconSig: (saved && saved.iconSig) || '' }));
 
-    /* ① 图标签名一致（**主判据**）。用户确认：图标本身不会变，URL 里的 fid 就是文件身份。
-     * ①-a 带 fid 的签名：**唯一**命中即为同一份文件（不依赖名字/记录/后缀；不唯一就绝不猜）；
-     * ①-b 只认路径的签名（无 fid）：必须名字收敛 + 排除纯名旧行 + 唯一 + 大小可辨。*/
     if (isIdentifiableIconSig(savedIcon)) {
       const sameIcon = rows.filter(r => sameIconSig(r.iconSig, savedIcon));
       if (sameIcon.length) {
         if (iconFid(savedIcon)) {
           if (sameIcon.length === 1) {
-            log(` ★ 改名：${savedName} 按 icon（fid=${iconFid(savedIcon)}）唯一命中「${sameIcon[0].name}」`);
+            log(` ★ 改名：${savedName} 按 icon（fid=${iconFid(savedIcon)}）唯一命中`);
             return mk(sameIcon[0], 'icon-fid');
           }
-          /* fid 命中多行（fid 不是逐文件唯一）→ icon 不能当身份用，改走快照/名字路径 */
-          log(` ★ 改名：${savedName} 的 icon(fid=${iconFid(savedIcon)}) 命中 ${sameIcon.length} 行（fid 非唯一），`
-            + `icon 不作身份用 → 改走快照/名字匹配`);
+          log(` ★ 改名：${savedName} 的 icon 命中 ${sameIcon.length} 行`);
         } else {
           const nameOk = r => {
             const cur = String(r.name || '');
@@ -2868,7 +3109,7 @@
             const rs = stripDedupSuffix(cur);
             return rs.suffix > 0 && getComparableFileName(rs.base) === wantName;
           };
-          const oldRows = new Set(exactCand.map(c => c.r));   /* 无条件排除纯名旧行 */
+          const oldRows = new Set(exactCand.map(c => c.r));
           const byIcon = sameIcon.filter(r => nameOk(r) && !oldRows.has(r));
           if (byIcon.length) {
             const sized = savedSize ? byIcon.filter(r => normSizeKey(r.sizeStr) === savedSize) : [];
@@ -2878,17 +3119,10 @@
           }
         }
       } else {
-        log(` ★ 改名：${savedName} 的 icon 在列表里没有匹配行（icon=${String(savedIcon).slice(0, 80)}）`);
+        log(` ★ 改名：${savedName} 的 icon 在列表里没有匹配行`);
       }
     }
 
-    /* ② 名字一致或只差 (n) 后缀。
-     * 判定顺序（越来越弱）：
-     * ②-a **转存前快照**：候选行里 fid 在转存前不存在的那个 = 刚转存进来的新文件（最可靠，
-     *      夸克重名转存会新建一个 fid）。不需要知道"最大后缀号"是什么规则。
-     * ②-b 只剩唯一候选 → 就是它。
-     * ②-c 转存记录里已有纯名行（旧文件）→ 新的是带后缀的那个，取后缀号最大者。
-     * ②-d 纯名行 + 带后缀行并存、又没有快照/记录佐证 → 不猜（宁可不改，不可改错）。*/
     const allCand = exactCand.concat(baseCand);
     const suffixed = exactCand.filter(c => c.suffix > 0).concat(baseCand);
     const pickBySize = list => {
@@ -2904,7 +3138,6 @@
       return p[0];
     };
 
-    /* ②-a 快照判定：哪一行的 fid 是转存后新出现的 */
     if (beforeFids && beforeFids.size && allCand.length) {
       const fresh = allCand.filter(c => c.r && c.r.fid && !beforeFids.has(c.r.fid));
       if (fresh.length) {
@@ -2913,54 +3146,35 @@
         return mk(pick.r, 'new-fid');
       }
       if (allCand.every(c => c.r && c.r.fid && beforeFids.has(c.r.fid))) {
-        log(` ★ 改名：${savedName} 的候选行在转存前就都存在（没有新行），改用记录/后缀判定`);
+        log(` ★ 改名：${savedName} 的候选行在转存前就都存在`);
       }
     }
 
-    /* ②-b 唯一候选 */
     if (allCand.length === 1) return mk(allCand[0].r, 'name-only');
+    if (exactAlreadySaved && suffixed.length) return mk(pickMaxSuffix(suffixed).r, 'name');
 
-    /* ②-c 记录里已有纯名行 → 取带后缀的最新那个 */
-    if (exactAlreadySaved && suffixed.length) {
-      const pick = pickMaxSuffix(suffixed);
-      return mk(pick.r, 'name');
-    }
-
-    /* ②-d 无法判定 */
     if (exactCand.length && baseCand.length) {
-      warn(` ⚠️ 改名：${savedName} 同时存在 ${exactCand.length} 个同名行与 ${baseCand.length} 个带后缀行，`
-        + `且没有"转存前快照/记录"能说明哪一行是新转存的 → 跳过（宁可不改，不可改错）`);
+      warn(` ⚠️ 改名：${savedName} 同时存在 ${exactCand.length} 个同名行与 ${baseCand.length} 个带后缀行 → 跳过`);
       lastMatchReason = 'ambiguous';
       return null;
     }
 
     const cand = exactCand.length ? exactCand : baseCand;
-    if (cand.length) {
-      const pick = pickMaxSuffix(cand);
-      return mk(pick.r, 'name');
-    }
+    if (cand.length) return mk(pickMaxSuffix(cand).r, 'name');
 
-    /* ③ 兜底：仅按可比较名匹配 */
     const hit = rows.find(r => getComparableFileName(r.name) === wantName);
     if (hit) return mk(hit, 'name-only');
     return null;
   }
 
-  /* 本次转存结果 → 改名计划（[bgm]acg最终名称[bgm]原始文件名）。
-   * listRows：个人页当前列表行（用于把"刚转存的文件"对上真实行，含 (n) 后缀场景）。
-   * old 一律保留"列表页当前名"原样（applyListRenames 靠它定位行）。
-   * 同一个原始文件名出现在多个分享、但 acg 最终名称不一致 → 无法判定，跳过不改名。*/
   function buildRenamePlan(savedByUrl, bd, listRows = [], alreadySaved = [], beforeFids = null) {
     const { map: nameByShare, conflict } = collectShareNameMap(bd);
-    /* 先给每个"转存结果"配上列表里真实的行与未被转存前就存在的同名文件 */
     const items = [];
     const usedFids = new Set();
     const usedRows = new Set();
-    /* 需要改名但没能对上列表行的文件（含"被同批占用"）—— 调用方据此**禁止下载**：
-     * 一旦有文件没改名成功，就绝不能按旧名开始下载。*/
     const unmatched = [];
-    let ambiguous = [];    /* 有多行但无法判定哪个是刚转存的（要用户/真机确认） */
-    const noName = [];       /* 所在分享在 acg 清单里找不到最终名称 → 没有名字可改 */
+    let ambiguous = [];
+    const noName = [];
     for (const entry of (Array.isArray(savedByUrl) ? savedByUrl : [])) {
       if (!entry || !Array.isArray(entry.files) || !entry.files.length) continue;
       const acgName = nameByShare.get(entry.url);
@@ -2976,21 +3190,18 @@
       for (const f of entry.files) {
         const savedName = String((f && f.name) || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim();
         if (!savedName) continue;
-        /* 同一个列表行只允许被一个转存结果占用：同名多渠道转存时，不能让两个结果抢同一行
-         * （否则 seenOld 会静默丢掉一个，等于漏改）。
-         * 无 fid 的行用行对象本身当占用键，避免 fid 为空时过滤失效。*/
         const freeRows = listRows.filter(r => !usedRows.has(r) && !(r.fid && usedFids.has(r.fid)));
         const m = matchSavedToListRow(f, freeRows, alreadySaved, { beforeFids });
         if (!m) {
           if (lastMatchReason === 'ambiguous') {
             ambiguous.push(savedName);
-            log(` ★ 改名：${savedName} 有多行同名/带后缀且无法判定哪一行是新转存的，跳过（宁可不改）`);
+            log(` ★ 改名：${savedName} 有多行同名/带后缀 → 跳过`);
           } else {
             const exists = !!matchSavedToListRow(f, listRows, alreadySaved, { beforeFids });
             unmatched.push(savedName);
             log(exists
-              ? ` ★ 改名：${savedName} 对应的行已被另一个同批文件占用，跳过（宁可不改，不可改错）`
-              : ` ★ 改名：列表里找不到 ${savedName} 对应的行（转存后可能尚未显示），跳过`);
+                ? ` ★ 改名：${savedName} 对应的行已被另一个同批文件占用，跳过`
+                : ` ★ 改名：列表里找不到 ${savedName} 对应的行`);
           }
           continue;
         }
@@ -3006,7 +3217,6 @@
       return empty;
     }
 
-    /* 原始文件名（去标识符后）→ acg 名称；同一原始名对应不同 acg 名 → 冲突跳过 */
     const targetByBase = new Map();
     const conflictNames = new Set();
     let tooLong = 0, truncated = 0;
@@ -3019,33 +3229,38 @@
       if (prev === undefined) { targetByBase.set(it.base, it.acgName); continue; }
       if (prev !== it.acgName) { targetByBase.delete(it.base); conflictNames.add(it.base); }
     }
-    if (tooLong) warn(` ⚠️ 改名：${tooLong} 个文件即使用截短后的 acg 名称也放不下（原始文件名太长），保留原名不改`);
-    if (truncated) log(` ★ 改名：${truncated} 个文件的目标名超过夸克 250 上限，acg 名称已自动截短（原始文件名保持不变）`);
+    if (tooLong) warn(` ⚠️ 改名：${tooLong} 个文件即使用截短后的 acg 名称也放不下，保留原名不改`);
+    if (truncated) log(` ★ 改名：${truncated} 个文件的目标名超过夸克 250 上限，acg 名称已自动截短`);
 
     const out = [];
     const seenOld = new Set();
     ambiguous = [];
-    const notRenamed = unmatched.slice();      /* 没对上行的：也要算"没改名成功" */
+    const notRenamed = unmatched.slice();
     for (const it of items) {
-      const oldName = it.currentName;                /* 列表里的真实当前名（可能带 (2)） */
+      const oldName = it.currentName;
       if (!oldName || seenOld.has(oldName)) { if (oldName) ambiguous.push(oldName); continue; }
       seenOld.add(oldName);
 
       if (conflictNames.has(it.base)) {
         log(` ★ 改名：跳过 ${oldName} —— 同名文件对应了不同的 acg 名称`);
-        ambiguous.push(oldName);        /* 刻意未改名 → 也要计入闸门，不放行下载 */
+        ambiguous.push(oldName);
         continue;
       }
       const name = targetByBase.get(it.base);
       if (!name) { notRenamed.push(oldName); continue; }
-      /* 目标名用"列表真实当前名的原始名部分"重建（保留 (2) 后缀，已有 [bgm] 前缀则替换为新 acg 名）。
-       * acg 名称超长时 buildRenamedFileName 会自动截短 acg 名称部分，原始文件名一字不动。*/
-      const baseForTarget = stripMarkerBlock(String(it.currentName ?? '')).trim();
+
+      /* 目标格式：acg 名称 + 原始文件名（剥离 [bgm] 后的）
+       * it.base 已是 stripMarkerBlock 后的原始文件名，可以直接作为 base。 */
+      const baseForTarget = String(it.base || '').trim();
       if (!baseForTarget) { notRenamed.push(oldName); continue; }
       const next = buildRenamedFileName(name, baseForTarget);
-      if (!next) { notRenamed.push(oldName); continue; }        /* 即使截短也放不下 → 没改成 */
-      if (!needRename(it.currentName, name)) continue;          /* 已经是目标名 → 不改 */
-      out.push({ old: oldName, next, acgName: name, truncated: fitAcgName(name, baseForTarget).truncated, matchedBy: it.how, fid: (it.row && it.row.fid) || '' });
+      if (!next) { notRenamed.push(oldName); continue; }
+      if (!needRename(it.currentName, name)) continue;
+      out.push({
+        old: oldName, next, acgName: name,
+        truncated: fitAcgName(name, baseForTarget).truncated,
+        matchedBy: it.how, fid: (it.row && it.row.fid) || '',
+      });
       if (it.how !== 'icon') log(`   ↳ ${oldName} 非 icon 命中（matchedBy=${it.how}），目标名 ${next}`);
     }
     out.unmatched = notRenamed;
@@ -3054,9 +3269,6 @@
     return out;
   }
 
-  /* 改名成功 → 下载记录里那一行也换成新名（fid 不变，不会重复下载）。
-     记录键可能是 fid（夸克助手）或名字（历史遗留键），两种都覆盖；只改命中的那条。
-     整表只读写一次，避免与夸克助手并发整表覆盖；ts 保留原值（不因改名延长 TTL）。*/
   function refreshDlRecordsAfterRename(pairs) {
     if (!Array.isArray(pairs) || !pairs.length) return 0;
     let n = 0;
@@ -3087,7 +3299,6 @@
     return n;
   }
 
-  /* 批量转存 */
   async function runSaveAllFlow(qa, pendingUrlsOverride) {
     let pending;
 
@@ -3116,24 +3327,22 @@
     if (!pending.length) return;
 
     acquireBusy();
-    log('★ 已标记桥接忙碌，QuarkAutoAssistant 暂停自动下载（下载由本脚本在改名确认后触发）');
-    /* 本轮转存**之前**的已转存名单：用来区分"目录里早就存在的旧同名文件"与"刚转存进来的新文件"
-     * （夸克重名转存会给新文件加 (2)，不能靠名字判断哪个是新的）。*/
-    const savedNamesBefore = collectSavedInfos(loadRecords())
-    .map(si => ({ name: si.name, sizeStr: si.sizeStr, iconSig: si.iconSig }));
+    log('★ 已标记桥接忙碌，QuarkAutoAssistant 暂停自动下载');
 
-    /* 本次改名是否全部确认成功（false 时不允许下载、也不允许关页）。
-     * 必须声明在 try 之外 —— catch/finally 要用它。*/
+    const savedNamesBefore = collectSavedInfos(loadRecords())
+    .map(si => ({
+      name: si.name, sizeStr: si.sizeStr, iconSig: si.iconSig,
+      fid: si.fid || '', mtime: si.mtime || '',
+    }));
+
     let renameAllConfirmedOut = true;
     let hadRenamePlan = false;
 
-    /* 转存**前**给列表拍快照：转存后哪个 fid 是新出现的，那一行就是刚转存的文件。
-     * 这是除 icon 之外最可靠的判据（不依赖"最大后缀号"这类猜测）。*/
     let preRows = [];
     try {
       preRows = await scanAllRowsByScroll(qa, document, { key: currentCacheKey(), useCache: false, maxMs: 12000 }) || [];
     } catch (e) {
-      warn('⚠️ 改名：转存前快照失败（不影响 icon 主判据）', e);
+      warn('⚠️ 改名：转存前快照失败', e);
       preRows = qa.scanFileRows(document) || [];
     }
     log(` ★ 改名：转存前列表快照 ${preRows.length} 行`);
@@ -3142,7 +3351,6 @@
       qa.setStatus('转存中...', 'running');
       let successCount = 0;
       let partialCount = 0;
-      /* 本次真正转存成功的文件：按来源分享收集，供改名使用 */
       const savedByUrl = [];
 
       for (let i = 0; i < pending.length; i++) {
@@ -3157,12 +3365,8 @@
         log(`--- [${i + 1}/${pending.length}] ${url}`);
 
         let r;
-        try {
-          r = await saveShareUrlViaTab(qa, url);
-        } catch (e) {
-          warn(`处理失败：${url}`, e);
-          continue;
-        }
+        try { r = await saveShareUrlViaTab(qa, url); }
+        catch (e) { warn(`处理失败：${url}`, e); continue; }
 
         const key = normalizeShareKey(url);
         if (r.kind === 'success' || r.kind === 'partial') {
@@ -3173,8 +3377,11 @@
           const prev = recs[key] || {};
           const merged = Array.isArray(prev.fileInfos) ? prev.fileInfos.slice() : [];
           for (const f of (r.savedFiles || [])) {
-            const item = { name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig };
-            if (!merged.some(mi => isSameFile(mi, item))) merged.push(item);
+            const item = {
+              name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig,
+              fid: f.fid || '', mtime: f.mtime || '',
+            };
+            upsertFileInfo(merged, item);
           }
           recs[key] = {
             ...prev,
@@ -3186,7 +3393,7 @@
           saveRecords(recs);
 
           if (r.kind === 'partial') {
-            warn(`⚠️ 部分成功（${(r.savedFiles || []).length}/${r.totalPlanned}）：${url}，失败原因 ${(r.failedReasons || []).join(', ') || '未知'}`);
+            warn(`⚠️ 部分成功（${(r.savedFiles || []).length}/${r.totalPlanned}）：${url}`);
           } else {
             log(`✅ 已记录 ${merged.length} 条到 ${key}`);
           }
@@ -3194,7 +3401,10 @@
           if (Array.isArray(r.savedFiles) && r.savedFiles.length) {
             savedByUrl.push({
               url: key,
-              files: r.savedFiles.map(f => ({ name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig })),
+              files: r.savedFiles.map(f => ({
+                name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig,
+                fid: f.fid || '', mtime: f.mtime || '',
+              })),
             });
           }
         } else if (r.kind === 'all-saved') {
@@ -3216,34 +3426,30 @@
 
       if (successCount + partialCount > 0) {
         log('★ 有新转存，点击页面内刷新按钮触发列表更新...');
-        /* 注意：此处不放开 BUSY_KEY —— 刷新和改名期间放开会让夸克助手的 boot 自动下载抢跑 */
         await sleep(500);
 
         const ok = await clickListRefreshAndWait(qa, document, {
           appearedTimeout: 3000,
           settleTimeout: 12000,
         });
-        if (ok) log('✓ 已点击页面内刷新按钮，等待列表更新完成');
-        else warn('⚠️ 未找到页面内刷新按钮：列表可能还是旧行，改名多半会失败（会逐个跳过），最后回退整页重载');
-
-        /* ===== 刷新完成 → ★ 按 acg 最终名称改名 → 触发下载 ===== */
+        if (ok) log('✓ 已点击页面内刷新按钮');
+        else warn('⚠️ 未找到页面内刷新按钮');
+        if (ok) {
+          const savedTotalForSnap0 = savedByUrl.reduce((n, en) => n + ((en && en.files) || []).length, 0);
+          const expectedMin = preRows.length + savedTotalForSnap0;
+          await waitForListRowsStable(qa, document, expectedMin, 10000);
+        }
         let plan = [];
         let planBuildOk = true;
-        let planUnmatched = [];      /* 有 acg 名称但没对上列表行的文件（=没改名成功） */
-        let planAmbiguous = [];      /* 无法判定/被同批占用的 */
-        let planNoName = [];         /* acg 清单里找不到最终名称 → 没有名字可改（按原名下载） */
+        let planUnmatched = [];
+        let planAmbiguous = [];
+        let planNoName = [];
         try {
-          /* 把"转存结果"对上列表真实行：夸克重名会加 (2) 后缀，所以要拿当前列表行来比对。
-           * 用**全表滚动扫描**而不是只看渲染行 —— 虚拟滚动下新文件可能不在视野内。
-           * beforeFids：转存前的 fid 快照（区分"旧同名文件"与"刚转存的新文件"）；
-           * savedNamesBefore：本轮转存前的已转存名单。*/
           let listRows = [];
           try {
             listRows = await scanAllRowsByScroll(qa, document, { key: currentCacheKey(), useCache: false }) || [];
-          } catch (e) { warn('⚠️ 改名：全表扫描失败，退回可见区', e); listRows = qa.scanFileRows(document) || []; }
+          } catch (e) { warn('⚠️ 改名：全表扫描失败', e); listRows = qa.scanFileRows(document) || []; }
           log(` ★ 改名：列表共扫到 ${listRows.length} 行用于匹配`);
-          /* 快照完整性：转存后应比转存前多 0..本轮转存成功数 行。
-           * （成功转存必然新增行，所以不能用"行数相等"；用"新增行数不超过本轮转存数"排除漏扫。）*/
           const savedTotalForSnap = savedByUrl.reduce((n, en) => n + ((en && en.files) || []).length, 0);
           const addedRows = listRows.length - preRows.length;
           let beforeFids = null;
@@ -3251,8 +3457,7 @@
             beforeFids = new Map(preRows.map(r => [r.fid, String(r.name || '')]));
             log(` ★ 改名：使用转存前快照判定新行（${beforeFids.size} 个 fid，新增 ${addedRows} 行）`);
           } else if (preRows.length) {
-            warn(` ⚠️ 改名：转存前 ${preRows.length} 行 / 转存后 ${listRows.length} 行（新增 ${addedRows}，本轮转存 ${savedTotalForSnap}）`
-              + `，快照看起来不完整 → 不按快照判定新行`);
+            warn(` ⚠️ 改名：转存前 ${preRows.length} 行 / 转存后 ${listRows.length} 行 → 不按快照判定新行`);
           }
           plan = buildRenamePlan(savedByUrl, loadBangumiData(), listRows, savedNamesBefore, beforeFids);
           planUnmatched = plan.unmatched || [];
@@ -3261,80 +3466,82 @@
         } catch (e) { warn('⚠️ 改名计划构建失败', e); planBuildOk = false; }
         if (!planBuildOk) {
           qa.setStatus('改名计划构建失败，已暂停下载', 'error');
-          warn('⛔ 改名计划构建失败：本轮不下载（避免按旧名落盘）');
+          warn('⛔ 改名计划构建失败：本轮不下载');
         }
 
-        /* 本次真正转存成功的文件数（仅用于日志） */
         const savedTotal = savedByUrl.reduce((n, en) => n + ((en && en.files) || []).length, 0);
         if (savedTotal && planUnmatched.length) {
-          warn(` ⛔ 改名：${planUnmatched.length} 个已转存文件在列表里没找到对应行（未改名成功）：${planUnmatched.join('、')}`);
+          warn(` ⛔ 改名：${planUnmatched.length} 个已转存文件在列表里没找到对应行：${planUnmatched.join('、')}`);
         }
         if (planAmbiguous.length) {
-          warn(` ⚠️ 改名：${planAmbiguous.length} 个文件无法唯一判定是哪一行，未改名：${planAmbiguous.join('、')}`);
+          warn(` ⚠️ 改名：${planAmbiguous.length} 个文件无法唯一判定：${planAmbiguous.join('、')}`);
         }
         if (planNoName.length) {
-          warn(` ⚠️ 改名：${planNoName.length} 个文件所在分享在 acg 清单里找不到最终名称（没有名字可改），将按原文件名下载：`
-            + planNoName.join('、'));
+          warn(` ⚠️ 改名：${planNoName.length} 个文件清单里没有最终名称：${planNoName.join('、')}`);
         }
 
         if (plan.length && ok) {
           await waitRowsForRename(qa, plan);
         } else if (plan.length) {
-          warn(` ★ 改名：未成功刷新，直接在当前列表上尝试改名（找不到的行会跳过）；本次未改名成功的文件不会自动补做`);
+          warn(` ★ 改名：未成功刷新，直接在当前列表上尝试改名`);
         }
 
-        let renameReport = { renamed: 0, failed: 0, skipped: 0, pairs: [] };
+        let renameReport = { renamed: 0, failed: 0, skipped: 0, pairs: [], confirmed: [], failedEntries: [] };
         let renameStepOk = true;
         if (plan.length) {
           try {
             renameReport = await applyListRenames(qa, plan, { waitMs: ok ? 8000 : 1500 });
           } catch (e) { warn('⚠️ 改名过程异常', e); renameStepOk = false; }
 
-          /* pairs 只取"本次确认为改成功"的行（不要用比较键反推：它会剥掉标识符，新旧名键相同） */
+          /* 改名成功（含曾用名）后：
+           * 1) 更新下载记录的 name
+           * 2) 把 old 名写入分享记录的 formerNames */
           if (renameReport.renamed > 0) {
-            renameReport.pairs = (renameReport.confirmed || [])
-            .filter(c => c && c.fid)
-            .map(c => ({ fid: c.fid, old: c.old, next: c.next }));
-            const missingFid = (renameReport.confirmed || []).filter(c => !c.fid).length;
-            if (missingFid) warn(` ⚠️ 改名：${missingFid} 个已改名文件拿不到 fid，未同步下载记录名（不影响下载判定）`);
+            const confirmedWithFid = (renameReport.confirmed || []).filter(c => c && c.fid);
+            renameReport.pairs = confirmedWithFid.map(c => ({ fid: c.fid, old: c.old, next: c.next }));
+
+            /* 写曾用名 */
+            let wroteCount = 0;
+            for (const c of confirmedWithFid) {
+              try {
+                if (recordFormerNameByFid(c.fid, c.old)) wroteCount++;
+              } catch (e) { warn('⚠️ 写曾用名异常', e); }
+            }
+            if (wroteCount) log(` ★ 改名：写入曾用名 ${wroteCount} 条`);
+
             try {
               const n = refreshDlRecordsAfterRename(renameReport.pairs);
               if (n) log(` ★ 改名：同步 ${n} 条下载记录到新名`);
-            } catch (e) { warn('⚠️ 同步下载记录失败（不影响下载）', e); }
+            } catch (e) { warn('⚠️ 同步下载记录失败', e); }
           }
         } else if (!planUnmatched.length && !planAmbiguous.length) {
-          log('★ 改名：本次无需改名（清单里没有对应最终名称）');
+          log('★ 改名：本次无需改名');
         } else {
-          log('★ 改名：没有可执行的改名计划（见上方未匹配/无法判定的告警）');
+          log('★ 改名：没有可执行的改名计划');
         }
 
-        /* 下载前先把"改名结果"讲清楚，并决定这一轮还能不能下载 */
         const confirmedCount = (renameReport.confirmed || []).length;
         const notConfirmed = (renameReport.failed || 0) + (renameReport.skipped || 0);
         if (plan.length || planUnmatched.length || planAmbiguous.length || planNoName.length) {
           log(`★ 改名结果：按完整名确认 ${confirmedCount} / 应改名 ${plan.length + planUnmatched.length + planAmbiguous.length}`
-            + `（计划 ${plan.length}，未匹配 ${planUnmatched.length}，无法判定 ${planAmbiguous.length}）`
-            + (planNoName.length ? `，清单无名称 ${planNoName.length}（按原名）` : '')
-            + (notConfirmed ? `，本次未确认 ${notConfirmed}` : ''));
+              + (planNoName.length ? `，清单无名称 ${planNoName.length}` : '')
+              + (notConfirmed ? `，本次未确认 ${notConfirmed}` : ''));
         }
         if (planNoName.length) {
           qa.setStatus('注意：有文件清单里没有名称，按原名下载', 'running');
         }
-        /* 用户要求：**必须按完整新名（含标签）在列表里重新匹配到**才算改名成功；
-         * 只要还有"本次转存成功但没改名成功"的文件（未确认 / 没匹配到行 / 无法判定 / 计划构建失败），
-         * 就一律不下载、不重载、不关页。*/
+
         const renameAllConfirmed = planBuildOk && renameStepOk
-          && planUnmatched.length === 0
-          && planAmbiguous.length === 0
-          && (renameReport.failedEntries || []).length === 0
-          && confirmedCount >= plan.length;
+        && planUnmatched.length === 0
+        && planAmbiguous.length === 0
+        && (renameReport.failedEntries || []).length === 0
+        && confirmedCount >= plan.length;
         renameAllConfirmedOut = renameAllConfirmed;
         hadRenamePlan = plan.length > 0 || planUnmatched.length > 0 || planAmbiguous.length > 0;
 
         await sleep(600);
 
         if (renameAllConfirmed) {
-          /* 改名已全部确认，放开忙碌标志后再触发下载 */
           releaseBusy();
           if (qa.isPaused && qa.isPaused()) {
             log('⏸ 夸克助手已暂停，跳过自动下载触发');
@@ -3343,55 +3550,47 @@
             await qa.autoDownloadWorkflow();
             log('★ 下载流程已结束');
           } else {
-            warn('⚠️ quarkAssistant.autoDownloadWorkflow 不可用，无法触发下载');
+            warn('⚠️ quarkAssistant.autoDownloadWorkflow 不可用');
           }
         } else {
           const failedNames = (renameReport.failedEntries || []).map(e => e.old);
           const allBad = [...new Set([...failedNames, ...planUnmatched, ...planAmbiguous])];
           warn(`⛔ 改名未全部确认（已确认 ${confirmedCount} / 计划 ${plan.length}，未匹配 ${planUnmatched.length}`
-            + `${planBuildOk ? '' : '，改名计划构建失败'}），已跳过下载、保持本页：${allBad.join('、') || '（见上方日志）'}`);
+               + `${planBuildOk ? '' : '，改名计划构建失败'}），已跳过下载：${allBad.join('、') || '（见上方日志）'}`);
           qa.setStatus('改名未确认，已暂停下载', 'error');
           alert(`⚠️ 改名未全部确认，已跳过下载并保持本页。\n\n`
-            + `已按完整名（含标签）确认：${confirmedCount} / 计划 ${plan.length}\n`
-            + (planUnmatched.length ? `列表里没找到对应行（未改名）：${planUnmatched.join('、')}\n` : '')
-            + (planAmbiguous.length ? `无法唯一判定是哪一行：${planAmbiguous.join('、')}\n` : '')
-            + (planNoName.length ? `清单里没有最终名称（将按原名下载）：${planNoName.join('、')}\n` : '')
-            + (allBad.length ? '\n' : '')
-            + `处理建议：\n`
-            + `1) 先点「🔍 改名诊断」看入口，再点「🏷️ 测试改名」验证该文件能否改成功；\n`
-            + `2) 也可以直接在文件名上点一下手动改名，改完按 Enter；\n`
-            + `3) 改好后点「🔓 允许下载」继续下载（下载已被阻止，不会按旧名先下）；\n`
-            + `4) 若重新点「▶️ 转存」提示"均已处理完毕"，说明本轮没有新转存，用第 3 步即可。`);
+                + `已按完整名（含曾用名）确认：${confirmedCount} / 计划 ${plan.length}\n`
+                + (planUnmatched.length ? `列表里没找到对应行（未改名）：${planUnmatched.join('、')}\n` : '')
+                + (planAmbiguous.length ? `无法唯一判定是哪一行：${planAmbiguous.join('、')}\n` : '')
+                + (planNoName.length ? `清单里没有最终名称（将按原名下载）：${planNoName.join('、')}\n` : '')
+                + (allBad.length ? '\n' : '')
+                + `可在文件名上手动改名后，重新点「▶️ 转存」。`);
         }
 
         if (renameAllConfirmed) {
           if (!ok) {
-            warn('⚠️ 未找到页面内刷新按钮，回退整页重载（改名已在上方就地完成）');
+            warn('⚠️ 未找到页面内刷新按钮，回退整页重载');
             await sleep(1000);
             location.reload();
           }
         } else if (!ok) {
-          warn('⚠️ 未找到页面内刷新按钮且改名未确认：不重载页面，避免把未确认状态掩盖掉');
+          warn('⚠️ 未找到页面内刷新按钮且改名未确认：不重载页面');
         }
       } else {
         log('无新转存文件，跳过刷新');
       }
       return { hadPlan: hadRenamePlan, allConfirmed: renameAllConfirmedOut };
     } catch (e) {
-      /* 流程异常：绝不"出错后还按旧名下载" —— 忙碌标志保持，挡住夸克助手自动下载 */
-      warn('⛔ 转存流程异常，本轮不下载（保持忙碌标志，阻挡自动下载）', e);
+      warn('⛔ 转存流程异常，本轮不下载', e);
       qa.setStatus('流程异常，已暂停下载', 'error');
       hadRenamePlan = true;
       renameAllConfirmedOut = false;
       throw e;
     } finally {
-      /* 只有"改名全部确认"或"本轮根本不需要改名"才放开忙碌标志。
-       * 未确认时保持 BUSY_KEY —— 否则夸克助手的 boot/手动下载会立刻按旧名下载。*/
       if (renameAllConfirmedOut || !hadRenamePlan) {
         releaseBusy();
       } else {
-        warn('⛔ 改名未全部确认：保持忙碌标志（夸克助手在此期间不会自动下载）；'
-          + '点面板「🔓 允许下载」可解除并继续下载。');
+        warn('⛔ 改名未全部确认：保持忙碌标志');
       }
     }
   }
@@ -3413,7 +3612,6 @@
       usingAll = true;
       scope = allFiles;
     } else {
-      /* partial：滚动收集所有被勾选的行（而非只看可见区） */
       log(` 表头 partial，滚动收集所有勾选行...`);
       const checkedAll = await scanCheckedRowsByScroll(qa, document, { cacheKey });
       if (!checkedAll.length) { usingAll = true; scope = allFiles; }
@@ -3422,16 +3620,22 @@
 
     log(`=== 转存当前页 ===`);
     log(` URL: ${url}`);
-    log(` 表头状态：${headerState}`);
     log(` 范围: ${usingAll ? `全部 ${allFiles.length} 个` : `勾选 ${scope.length} 个`}`);
 
-    const records = loadRecords();
-    const savedInfos = collectSavedInfos(records);
+    const clearFlagAtStart = Number(GM_getValue(GM_CLEAR_FLAG, 0) || 0);
+    const savedInfos = healShareRecords(url, allFiles);
     const scopeSaved = scope.filter(f => isFileSaved(f, savedInfos));
     const scopePending = scope.filter(f => !isFileSaved(f, savedInfos));
 
-    log(` 已转存跳过 ${scopeSaved.length}：${scopeSaved.map(f => f.name).join(', ') || '无'}`);
-    log(` 待转存 ${scopePending.length}：${scopePending.map(f => f.name).join(', ') || '无'}`);
+    log(` 已转存跳过 ${scopeSaved.length}`);
+    log(` 待转存 ${scopePending.length}`);
+
+    if (usingAll && scope.length > 0 && scopeSaved.length === 0) {
+      maybeSaveFullResaveDebug(qa, scope, savedInfos, {
+        source: 'save-current-page',
+        clearFlagAtStart,
+      });
+    }
 
     if (!scopePending.length) {
       alert(
@@ -3443,21 +3647,18 @@
       return;
     }
 
-    let batches;
-    if (usingAll && scopePending.length > 1) {
-      batches = [
-        scopePending.slice(0, -1),
-        [scopePending[scopePending.length - 1]],
-      ];
-      log(` ★ 全量转存：拆两批 — 第1批 ${batches[0].length} 个（除最旧），第2批 1 个（最旧：${batches[1][0].name}）`);
-    } else {
-      batches = [scopePending];
-    }
+    try {
+      const okPack = ensurePackDirUnchecked(qa, document);
+      log(` ★ "保存为文件夹"：${okPack ? '已取消/无此项' : '取消失败'}`);
+    } catch {}
+
+    const batches = [scopePending];
+    log(` ★ 转存：单批 ${scopePending.length} 个`);
 
     const msg =
           `范围：${usingAll ? `全部 ${allFiles.length} 个` : `勾选 ${scope.length} 个`}\n` +
           `转存：${scopePending.length} 个` +
-          (usingAll && scopePending.length > 1 ? `（分 2 批：先 ${batches[0].length} 个，再最旧 1 个）` : '') + `\n` +
+          (usingAll && scopePending.length > 1 ? `（单批全选转存）` : '') + `\n` +
           (scopeSaved.length ? `跳过已转存：${scopeSaved.map(f => f.name).join(', ')}\n` : '') +
           `\n继续？`;
     if (!confirm(msg)) return;
@@ -3478,8 +3679,11 @@
         const prev = recs[url] || {};
         const merged = Array.isArray(prev.fileInfos) ? prev.fileInfos.slice() : [];
         for (const f of savedFiles) {
-          const item = { name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig };
-          if (!merged.some(mi => isSameFile(mi, item))) merged.push(item);
+          const item = {
+            name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig,
+            fid: f.fid || '', mtime: f.mtime || '',
+          };
+          upsertFileInfo(merged, item);
         }
         recs[url] = {
           ...prev,
@@ -3509,9 +3713,9 @@
       } else if (summary.kind === 'partial') {
         title = `⚠️ 部分成功：${summary.saved} / ${total}`;
       } else if (summary.kind === 'fail') {
-        if (summary.failedReasons.includes('space')) title = '❌ 空间不足，全部未转存';
-        else if (summary.failedReasons.includes('over_limit')) title = '❌ 超过转存限额，全部未转存';
-        else if (summary.failedReasons.includes('check-failed') || summary.failedReasons.includes('still-unchecked')) title = '❌ 勾选状态设置失败，全部未转存';
+        if (summary.failedReasons.includes('space')) title = '❌ 空间不足';
+        else if (summary.failedReasons.includes('over_limit')) title = '❌ 超过转存限额';
+        else if (summary.failedReasons.includes('check-failed') || summary.failedReasons.includes('still-unchecked')) title = '❌ 勾选状态设置失败';
         else title = `❌ 转存失败：${summary.failedReasons.join(', ') || '未知原因'}`;
       } else {
         title = '⚠️ 未执行任何转存';
@@ -3528,7 +3732,7 @@
       alert('❌ 出错：' + (e && e.message || e));
     }
     qa.refreshGray();
-    refreshFullCounts(qa);
+    await refreshShareFullCounts(qa);
   }
 
   /* ===== 分享页：标记 / 清除 ===== */
@@ -3548,7 +3752,6 @@
       usingAll = true;
       scope = allFiles;
     } else {
-      /* partial：滚动收集所有被勾选的行（而非只看可见区） */
       log(` 表头 partial，滚动收集所有勾选行...`);
       const checkedAll = await scanCheckedRowsByScroll(qa, document, { cacheKey });
       if (!checkedAll.length) { usingAll = true; scope = allFiles; }
@@ -3556,8 +3759,8 @@
     }
 
     const msg = usingAll
-      ? `无勾选，标记全部 ${allFiles.length} 个文件为已转存？\n${scope.map(f => f.name).join(', ')}`
-      : `标记勾选的 ${scope.length} 个文件为已转存？\n${scope.map(f => f.name).join(', ')}`;
+      ? `无勾选，标记全部 ${allFiles.length} 个文件为已转存？`
+      : `标记勾选的 ${scope.length} 个文件为已转存？`;
     if (!confirm(msg)) return;
 
     const recs = loadRecords();
@@ -3565,8 +3768,11 @@
     const merged = Array.isArray(prev.fileInfos) ? prev.fileInfos.slice() : [];
     let added = 0;
     for (const f of scope) {
-      const item = { name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig };
-      if (!merged.some(mi => isSameFile(mi, item))) { merged.push(item); added++; }
+      const item = {
+        name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig,
+        fid: f.fid || '', mtime: f.mtime || '',
+      };
+      if (upsertFileInfo(merged, item)) added++;
     }
     recs[url] = {
       ...prev,
@@ -3602,7 +3808,6 @@
       usingAll = true;
       scope = allFiles;
     } else {
-      /* partial：滚动收集所有被勾选的行（而非只看可见区） */
       log(` 表头 partial，滚动收集所有勾选行...`);
       const checkedAll = await scanCheckedRowsByScroll(qa, document, { cacheKey });
       if (!checkedAll.length) { usingAll = true; scope = allFiles; }
@@ -3611,7 +3816,7 @@
 
     const recs = loadRecords();
     const rec = recs[url];
-    if (!rec) { qa.refreshGray(); refreshFullCounts(qa); alert('当前分享无记录'); return; }
+    if (!rec) { qa.refreshGray(); await refreshShareFullCounts(qa); alert('当前分享无记录'); return; }
 
     if (usingAll) {
       if (!confirm(`当前分享无勾选，将删除全部记录（共 ${(rec.fileInfos || []).length} 条）？`)) return;
@@ -3624,7 +3829,10 @@
     }
 
     const existing = Array.isArray(rec.fileInfos) ? rec.fileInfos : [];
-    const toRemove = scope.map(f => ({ name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig }));
+    const toRemove = scope.map(f => ({
+      name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig,
+      fid: f.fid || '', mtime: f.mtime || '',
+    }));
     const hitCount = existing.filter(fi => toRemove.some(tr => isSameFile(tr, fi))).length;
     if (!hitCount) { alert(`勾选的 ${scope.length} 个文件无转存记录`); return; }
     if (!confirm(`从记录中移除 ${hitCount} 个勾选文件？（当前记录共 ${existing.length} 条）`)) return;
@@ -3696,13 +3904,47 @@
     const tryInject = () => {
       const overlay = document.getElementById('gmEditOverlay');
       if (!overlay) return;
-      if (overlay.querySelector('#acgrip-quark-section')) return;
-      const host = overlay.querySelector('#lastTableHost');
-      if (!host) return;
-      injectQuarkSection(host);
+      if (!overlay.querySelector('#acgrip-quark-section')) {
+        const host = overlay.querySelector('#lastTableHost');
+        if (host) injectQuarkSection(host);
+      }
+      injectTriggerQuarkButton();
     };
     new MutationObserver(tryInject).observe(document.body, { childList: true, subtree: true });
     tryInject();
+  }
+
+  function injectTriggerQuarkButton() {
+    const airedBtn = document.getElementById('openAiredResourceBtn');
+    if (!airedBtn) return;
+    const bar = airedBtn.parentElement;
+    if (!bar) return;
+    if (bar.querySelector('#acgrip-trigger-quark-btn')) return;
+
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.id = 'acgrip-trigger-quark-btn';
+    btn.textContent = '立即转存';
+    btn.title = '立即触发夸克转存（忽略 CD）';
+    btn.addEventListener('click', () => {
+      try {
+        const r = runQuarkAutoTrigger({ force: true });
+        if (r && r.triggered) {
+          alert(`已打开夸克处理 ${r.count} 个链接`);
+        } else {
+          const reasonMap = {
+            'no-folder': '未设置夸克文件夹路径',
+            'no-data': '无 bangumiData',
+            'no-urls': '清单中没有夸克链接',
+            'all-cd': '所有链接仍在 CD 内',
+          };
+          alert('未触发：' + (reasonMap[r && r.reason] || (r && r.reason) || '未知原因'));
+        }
+      } catch (e) {
+        alert('转存触发失败：' + (e && e.message || e));
+      }
+    });
+    bar.appendChild(btn);
   }
 
   function injectQuarkSection(host) {
@@ -3713,8 +3955,8 @@
 
     sec.innerHTML = `
  <label><strong>夸克网盘</strong></label>：
- <button type="button" id="resetQuarkCdBtn">重置夸克检查 CD</button>
- <button type="button" id="triggerQuarkBtn">立即触发转存</button>
+ <button type="button" id="resetQuarkCdBtn">重置 CD</button>
+ <button type="button" id="triggerQuarkBtn">立即转存</button>
  <span class="hint" id="quarkCdInfo"></span>
  <span class="hint" style="margin:2px 0 4px 0;display:block;">
  打开夸克个人页时使用的文件夹路径（留空则不自动触发）。
@@ -3730,7 +3972,7 @@
     const info = sec.querySelector('#quarkCdInfo');
     function refreshInfo() {
       const state = gmGet(GM_CD, {}) || {};
-      const recs = loadRecords();
+      const recs = loadRecords({ consumeClear: false });
       const pend = gmGet(GM_PENDING_URLS, {}) || {};
       const pendCount = Array.isArray(pend.urls) ? pend.urls.length : 0;
       info.textContent = `CD ${Object.keys(state).length} | 已转存 ${Object.keys(recs).length} | 待处理 ${pendCount}`;
@@ -3747,6 +3989,31 @@
       refreshInfo();
     };
     refreshInfo();
+    try { injectTriggerQuarkButton(); } catch {}
+  }
+
+  function registerFullResaveDebugMenu() {
+    try {
+      GM_registerMenuCommand('🐞 查看全量重转 Debug', () => {
+        const arr = loadFullResaveDebug();
+        if (!arr.length) { alert('暂无全量重转 Debug'); return; }
+        const lines = arr.map((e, i) => {
+          const head = `#${i + 1} ${e.time} [${e.source}]`;
+          const sum = `文件 ${e.totalFiles}，记录 ${e.savedInfosCount}，记录keys ${e.recordKeysCount}，clearFlag=${e.clearFlag}`;
+          const note = e.note || '';
+          const first = (e.files || []).slice(0, 3).map(f =>
+                                                        `  - ${f.name} (${f.sizeStr || '-'}/${f.mtime || '-'}/${f.fid || '-'}) → ${f.result || ''}`
+                                                       ).join('\n');
+          return `${head}\n${sum}\n${note}\n${first}`;
+        }).join('\n\n');
+        alert(lines + '\n\n完整 JSON 见控制台：acgripQuarkBridge.fullResaveDebug()');
+      });
+      GM_registerMenuCommand('🗑️ 清空全量重转 Debug', () => {
+        if (!confirm('清空全量重转 Debug？')) return;
+        clearFullResaveDebug();
+        alert('已清空');
+      });
+    } catch {}
   }
 
   async function initAcgRipSide() {
@@ -3772,21 +4039,42 @@
       });
       GM_registerMenuCommand('📊 查看状态', () => {
         const state = gmGet(GM_CD, {}) || {};
-        const recs = loadRecords();
+        const recs = loadRecords({ consumeClear: false });
         const pend = gmGet(GM_PENDING_URLS, {}) || {};
         const auto = Number(GM_getValue(GM_AUTO_TRIGGER, 0) || 0);
         alert(
-          `转存记录：${Object.keys(recs).length} 条（不按时间过期；过期只依据 acg.rip 清单）\n` +
+          `转存记录：${Object.keys(recs).length} 条\n` +
           `CD：${Object.keys(state).length} 个 URL\n` +
           `待处理清单：${Array.isArray(pend.urls) ? pend.urls.length : 0} 项\n` +
-          `自动触发标记：${auto ? new Date(auto).toLocaleTimeString() : '无'}`
+          `自动触发标记：${auto ? new Date(auto).toLocaleTimeString() : '无'}\n` +
+          `全量重转 Debug：${loadFullResaveDebug().length} 条`
         );
       });
     } catch {}
+    registerFullResaveDebugMenu();
 
-    /* 过期只依据 acg.ripImprove 清单；清单不可用时 sweepObsoleteRecords 会自行跳过，绝不误删。 */
     setTimeout(() => { try { sweepObsoleteRecords(); } catch (e) { warn('过期清理失败', e); } }, 2000);
-
+    /* 每 6 小时检查一次：处理"宽限期到期"的情况；用户长时间开着 acg 页面也能触发清理 */
+    setInterval(() => { try { sweepObsoleteRecords(); } catch (e) { warn('过期清理失败', e); } }, 6 * 60 * 60 * 1000);
+    try {
+      unsafeWindow.acgripQuarkBridge = {
+        version: '1.2.5',
+        trigger: (opts = {}) => runQuarkAutoTrigger({ force: opts.force !== false }),
+        status: () => {
+          const state = gmGet(GM_CD, {}) || {};
+          const recs = loadRecords({ consumeClear: false });
+          const pend = gmGet(GM_PENDING_URLS, {}) || {};
+          return {
+            cd: Object.keys(state).length,
+            saved: Object.keys(recs).length,
+            pending: Array.isArray(pend.urls) ? pend.urls.length : 0,
+            fullResaveDebug: loadFullResaveDebug().length,
+          };
+        },
+        fullResaveDebug: () => loadFullResaveDebug(),
+        clearFullResaveDebug: () => clearFullResaveDebug(),
+      };
+    } catch (e) { warn('暴露 acgripQuarkBridge 失败', e); }
     log('已启动（acg.rip 端）');
   }
 
@@ -3798,11 +4086,148 @@
     }, 150, timeout);
   }
 
+  function isQAVersionOk(qa) {
+    const ver = String((qa && qa.version) || '');
+    const m = ver.match(/^(\d+)\.(\d+)\.(\d+)/);
+    if (!m) return { ok: false, ver, reason: 'cannot-parse' };
+    const [a, b, c] = [Number(m[1]), Number(m[2]), Number(m[3])];
+    const [ra, rb, rc] = MIN_QA_VERSION;
+    if (a > ra) return { ok: true, ver };
+    if (a < ra) return { ok: false, ver, reason: `需要 ≥${ra}.${rb}.${rc}` };
+    if (b > rb) return { ok: true, ver };
+    if (b < rb) return { ok: false, ver, reason: `需要 ≥${ra}.${rb}.${rc}` };
+    if (c >= rc) return { ok: true, ver };
+    return { ok: false, ver, reason: `需要 ≥${ra}.${rb}.${rc}` };
+  }
+
+  async function ensurePreflightCleanupDone(qa, opts = {}) {
+    const tag = opts.tag || 'trigger';
+
+    if (!qa || typeof qa.runPreflightCleanup !== 'function') {
+      warn(`⛔ [${tag}] 预清理不可用：quarkAssistant.runPreflightCleanup 不存在。`
+           + `请把 QuarkAutoAssistant 更新到 ${MIN_QA_VERSION.join('.')}+ 后再试。`);
+      try { qa && qa.setStatus && qa.setStatus(`请更新夸克助手到 ${MIN_QA_VERSION.join('.')}+`, 'error'); } catch {}
+      return { ok: false, skipped: true, reason: 'api-missing' };
+    }
+
+    const verCheck = isQAVersionOk(qa);
+    if (!verCheck.ok) {
+      warn(`⛔ [${tag}] QuarkAutoAssistant 版本不满足要求：当前 ${verCheck.ver}（${verCheck.reason}）。`);
+      try { qa.setStatus && qa.setStatus(`助手版本过低(${verCheck.ver})`, 'error'); } catch {}
+      return { ok: false, skipped: true, reason: 'version-too-old', version: verCheck.ver };
+    }
+
+    warn(`★ [${tag}] 预清理：调用 quarkAssistant.runPreflightCleanup（force=true，最多等 30s）...`);
+    try { qa.setStatus && qa.setStatus('预清理中...', 'running'); } catch {}
+    try { qa.setProgress && qa.setProgress('-'); } catch {}
+
+    const t0 = Date.now();
+    let pr;
+    try {
+      pr = await qa.runPreflightCleanup({ tag, listWaitMs: 30000, force: true });
+    } catch (e) {
+      warn(`⚠️ [${tag}] 预清理异常`, e);
+      pr = { ok: false, skipped: true, reason: 'exception:' + String(e && e.message || e) };
+    }
+    warn(`★ [${tag}] 预清理返回（耗时 ${Date.now() - t0}ms）：${JSON.stringify(pr)}`);
+
+    if (!pr) {
+      warn(`⛔ [${tag}] 预清理未返回结果，本轮不打开子任务`);
+      return { ok: false, skipped: true, reason: 'no-result' };
+    }
+    if (pr.skipped) {
+      if (pr.reason === 'recently-done') {
+        warn(`★ [${tag}] 预清理：近期已清理，视为完成，继续`);
+        return pr;
+      }
+      if (pr.reason === 'paused') {
+        warn(`⏸ [${tag}] 预清理：暂停中`);
+        return pr;
+      }
+      warn(`⛔ [${tag}] 预清理未完成（reason=${pr.reason || 'unknown'}），本轮不打开子任务`);
+      try { qa.setStatus && qa.setStatus(`预清理未完成(${pr.reason || 'unknown'})`, 'error'); } catch {}
+      return pr;
+    }
+    if (pr.ok !== true || pr.didRun !== true) {
+      warn(`⛔ [${tag}] 预清理返回异常（ok=${pr.ok}, didRun=${pr.didRun}），本轮不打开子任务`);
+      return { ok: false, skipped: true, reason: 'didrun-false' };
+    }
+    warn(`★ [${tag}] 预清理：完成，继续`);
+    return pr;
+  }
+
+  let _autoRunning = false;
+
+  async function handleAutoTriggerIfAny(qa) {
+    if (_autoRunning) { log('自动触发：已有任务在跑，跳过'); return false; }
+
+    const autoTs = Number(GM_getValue(GM_AUTO_TRIGGER, 0) || 0);
+    if (!(autoTs > 0)) return false;
+    if ((Date.now() - autoTs) >= AUTO_TTL) { log('自动触发：标记已过期，跳过'); return false; }
+
+    _autoRunning = true;
+    try {
+      const ts2 = Number(GM_getValue(GM_AUTO_TRIGGER, 0) || 0);
+      if (ts2 !== autoTs) { log('自动触发：已被其他标签页消费，跳过'); return false; }
+      GM_setValue(GM_AUTO_TRIGGER, 0);
+      warn('★ 自动触发：开始处理（已消费标记）');
+
+      if (qa.isPaused && qa.isPaused()) {
+        warn('⏸ 自动任务：夸克助手已暂停，直接关闭页面');
+        setTimeout(() => { try { window.close(); } catch {} }, 300);
+        return true;
+      }
+
+      const pack = gmGet(GM_PENDING_URLS, null);
+      const urls = (pack && Array.isArray(pack.urls)) ? pack.urls : null;
+      if (!urls || !urls.length) {
+        warn('自动触发但 pending_urls 为空，跳过');
+        return true;
+      }
+      warn(`★ 自动触发：从 pending_urls 读取 ${urls.length} 个 URL，先执行预清理`);
+
+      const pr = await ensurePreflightCleanupDone(qa, { tag: 'auto-trigger' });
+      if (pr && pr.skipped) {
+        if (pr.reason === 'paused') {
+          setTimeout(() => { try { window.close(); } catch {} }, 300);
+        }
+        warn(`⛔ 预清理未通过（reason=${pr.reason || 'skipped'}），本轮不打开子任务`);
+        return true;
+      }
+
+      warn('★ 预清理已通过，开始子任务');
+      let autoResult = null;
+      try { autoResult = await runSaveAllFlow(qa, urls); }
+      catch (e) { warn('自动转存流程异常', e); }
+
+      if (!autoResult || autoResult.allConfirmed !== true) {
+        warn('⛔ 自动任务：未确认改名全部完成，保持本页');
+        return true;
+      }
+
+      /* 下载已触发：延迟 AUTO_CLOSE_DELAY_MS 再关页，
+       * 避免浏览器/夸克客户端还在处理下载请求、页面就被关掉导致下载丢失。
+       * 期间页面保持开启，面板显示倒计时状态。 */
+      warn(`★ 自动任务完成：下载已触发，${AUTO_CLOSE_DELAY_MS / 1000}s 后关闭本页（避免下载未唤起就关页）`);
+      try { qa.setStatus && qa.setStatus(`下载已触发，${AUTO_CLOSE_DELAY_MS / 1000}s 后关闭`, 'done'); } catch {}
+      try { qa.setProgress && qa.setProgress('-'); } catch {}
+      setTimeout(() => {
+        warn('★ 自动任务：延时结束，关闭本页');
+        try { window.close(); } catch {}
+      }, AUTO_CLOSE_DELAY_MS);
+      return true;
+    } finally {
+      _autoRunning = false;
+    }
+  }
+
   async function initQuarkSide() {
     cleanupBridgeComm();
     const qa = await waitForQA();
     if (!qa) { warn('quarkAssistant 未就绪'); return; }
     log('quarkAssistant 就绪 v' + qa.version);
+
+    registerFullResaveDebugMenu();
 
     const isChild = await tryHandleChildTask(qa);
     if (isChild) {
@@ -3824,20 +4249,16 @@
       qa.setStatus('待机（分享页）');
       qa.setProgress('-');
 
-      /* 桥接自主的分享页轮询：只刷可见区置灰 + 进度 */
       startSharePolling(qa);
 
-      /* 排序会触发新的加载，完成后需再刷一次灰置 */
       ensureTimeDescSort(qa, document).then(async (r) => {
         log(`★ 分享页初始化排序结果：${JSON.stringify(r)}`);
         if (r && r.ok && r.method !== 'already') {
           await until(() => !isShareTableLoading(document), 150, 15000);
           refreshShareUI(qa);
-          log(`★ 排序后刷新灰置：可见区已刷新`);
         }
       });
 
-      /* 等首屏加载完再刷灰色，避免加载中查到空表格 */
       (async () => {
         await until(() => !isShareTableLoading(document), 150, 20000);
         refreshShareUI(qa);
@@ -3846,17 +4267,31 @@
       })();
 
       log(`★ 分享页初始化（等待用户操作 / 子任务触发）`);
-      /* 不主动 refreshShareFullCounts：未点击按钮前显示 '-'，不触发全表滚动 */
     } else if (isList) {
       qa.setActions([
         {
           label: '▶️ 转存', color: '#09AAFF',
-          title: '处理 pending_urls 或 bangumiData 里的分享，逐条转存；刷新后按 acg 最终名称改名再触发下载',
-          onclick: () => runSaveAllFlow(qa, null),
+          title: '先执行夸克侧预清理（失效记录+过期文件），再处理 pending_urls 或 bangumiData 里的分享，逐条转存；刷新后按 acg 名称+原始文件名改名',
+          onclick: async () => {
+            warn('★ [manual-trigger] 用户点击「▶️ 转存」，先执行预清理');
+            try {
+              const pr = await ensurePreflightCleanupDone(qa, { tag: 'manual-trigger' });
+              if (pr && pr.skipped) {
+                const reason = pr.reason || '';
+                if (reason !== 'recently-done' && reason !== 'paused') {
+                  alert(`预清理未通过：${reason}\n请检查控制台 [桥接]/[夸克助手] 日志。`);
+                  return;
+                }
+              }
+            } catch (e) {
+              warn('⚠️ [manual-trigger] 预清理异常', e);
+            }
+            return runSaveAllFlow(qa, null);
+          },
         },
         {
           label: '🏷️ 测试改名', color: '#da9328',
-          title: '对当前可见的第一个文件试改名（只加标识符前缀，用于验证改名路径）',
+          title: '对当前可见的第一个文件试改名（用 acg名称+原始文件名 的新格式）',
           onclick: () => runRenameSmokeTest(qa),
         },
         {
@@ -3864,44 +4299,23 @@
           title: '只报告改名入口的 DOM/按钮/勾选状态，不改动任何文件',
           onclick: () => runRenameDiagnose(qa),
         },
-        {
-          label: '🔓 允许下载', color: '#52c41a',
-          title: '改名未确认时默认阻止下载；点这里确认后用当前文件名下载',
-          onclick: () => runAllowDownloadAfterRename(qa),
-        },
       ]);
       qa.setStatus('待机（个人页）');
 
-      const autoTs = Number(GM_getValue(GM_AUTO_TRIGGER, 0) || 0);
-      const fresh = autoTs > 0 && (Date.now() - autoTs) < AUTO_TTL;
-      if (fresh) {
-        GM_setValue(GM_AUTO_TRIGGER, 0);
+      try {
+        GM_addValueChangeListener(GM_AUTO_TRIGGER, (name, oldVal, newVal, remote) => {
+          if (!remote) return;
+          const ts = Number(newVal) || 0;
+          if (ts <= 0) return;
+          if (Date.now() - ts > AUTO_TTL) return;
+          setTimeout(() => {
+            handleAutoTriggerIfAny(qa).catch(e => warn('自动触发处理异常', e));
+          }, 500);
+        });
+        log('已注册 GM_AUTO_TRIGGER 监听（跨标签页即时触发）');
+      } catch (e) { warn('注册 GM_AUTO_TRIGGER 监听失败', e); }
 
-        if (qa.isPaused && qa.isPaused()) {
-          log('⏸ 自动任务：夸克助手已暂停，直接关闭页面');
-          setTimeout(() => { try { window.close(); } catch {} }, 300);
-          return;
-        }
-
-        const pack = gmGet(GM_PENDING_URLS, null);
-        const urls = (pack && Array.isArray(pack.urls)) ? pack.urls : null;
-        let autoResult = null;
-        if (urls && urls.length) {
-          log(`★ 自动触发：从 pending_urls 读取 ${urls.length} 个 URL`);
-          try { autoResult = await runSaveAllFlow(qa, urls); } catch (e) { warn('自动转存流程异常', e); }
-        } else {
-          warn('自动触发但 pending_urls 为空');
-        }
-        /* 关页白名单：只有"明确全部确认"才自动关闭。
-         * 结果为空（异常）、或 allConfirmed !== true，一律保持页面，避免把未确认状态掩盖掉。*/
-        if (!autoResult || autoResult.allConfirmed !== true) {
-          warn('⛔ 自动任务：未确认改名全部完成，保持本页（不自动关闭）');
-          return;
-        }
-        setTimeout(() => { try { window.close(); } catch {} }, 300);
-      }
-    } else {
-      // 其他页
+      await handleAutoTriggerIfAny(qa);
     }
 
     log('已启动（夸克端）');

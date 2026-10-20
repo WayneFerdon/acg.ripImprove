@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.10.5
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；自动子任务前强制等待夸克侧预清理完成；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描时自愈旧记录空字段）
+// @version 3.11.0
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；自动子任务前强制等待夸克侧预清理完成；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描时自愈旧记录空字段；扫描不完整时中止转存；后台标签页加大步进与超时）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -1007,6 +1007,23 @@
     const useCache = opts.useCache === true;
     const key = opts.key || null;
 
+    /* 后台标签页节流：大幅加大 sleep 步进和总超时，避免"扫一遍就中止"。
+     * Chrome 对后台 tab 的 setTimeout 最小间隔为 1s（简单节流）/ 60s（深度节流），
+     * 我们没法绕过，但可以拉长单次 sleep 让每次 sleep 至少跨过一个 tick。 */
+    const isHidden = !!doc.hidden;
+    const maxMsBase = opts.maxMs || 40000;
+    const maxMs = isHidden ? maxMsBase * 3 : maxMsBase;
+    const sleepStep = isHidden ? 300 : 100;
+    const sleepSmall = isHidden ? 250 : 150;
+    const sleepFinal = isHidden ? 400 : 200;
+    const sleepRestore = isHidden ? 250 : 120;
+    const loadingMoreWait = isHidden ? 4500 : 1500;
+    const loadingMoreCheck = isHidden ? 150 : 60;
+
+    if (isHidden) {
+      warn(` ⚠️ 检测到后台标签页，扫描步进加大（sleep=${sleepStep}ms, maxMs=${maxMs}ms）`);
+    }
+
     if (useCache && key) {
       const cached = getAllFilesCache(key);
       if (cached) {
@@ -1020,7 +1037,6 @@
       }
     }
 
-    const maxMs = opts.maxMs || 40000;
     const expected = getShareFileCount(doc);
 
     if (isShareTableLoading(doc)) {
@@ -1067,7 +1083,7 @@
     };
 
     body.scrollTop = 0;
-    await qa.sleep(150);
+    await qa.sleep(sleepSmall);
     harvest();
 
     let lastScrollH = body.scrollHeight;
@@ -1086,9 +1102,9 @@
 
       if (atBottom) {
         if (hasLoadingMore()) {
-          await qa.until(() => !hasLoadingMore(), 60, 1500);
+          await qa.until(() => !hasLoadingMore(), loadingMoreCheck, loadingMoreWait);
         } else {
-          await qa.sleep(100);
+          await qa.sleep(sleepStep);
         }
 
         const added = harvest();
@@ -1113,7 +1129,7 @@
 
       const step = Math.max(200, Math.floor(bodyH * 0.8));
       body.scrollTop = Math.min(curTop + step, scrollH);
-      await qa.sleep(100);
+      await qa.sleep(sleepStep);
 
       const added = harvest();
       if (added === 0) {
@@ -1126,11 +1142,11 @@
       lastScrollH = body.scrollHeight;
     }
 
-    await qa.sleep(200);
+    await qa.sleep(sleepFinal);
     harvest();
 
     body.scrollTop = startTop;
-    await qa.sleep(120);
+    await qa.sleep(sleepRestore);
 
     const result = [...visited.values()];
     log(` ★ 滚动扫描：收集 ${result.length} 行（期望 ${expected || '?'}）`);
@@ -1359,6 +1375,8 @@
     } catch { return false; }
   }
 
+  /* 成功模态框判定：只看 DOM 存在 + CSS 可见，不再依赖 getBoundingClientRect。
+   * 后台标签页 layout 冻结时 getBoundingClientRect 可能返回 0，导致"模态框明明在"被误判。 */
   function isSuccessModalPresent(doc = document) {
     const m = doc.querySelector('.save-share-file-success-modal');
     if (!m) return false;
@@ -1366,8 +1384,6 @@
       const wrap = m.closest('.ant-modal-wrap') || m.closest('.ant-modal-root') || m;
       const cs = (wrap.ownerDocument.defaultView || window).getComputedStyle(wrap);
       if (cs.display === 'none' || cs.visibility === 'hidden') return false;
-      const r = m.getBoundingClientRect();
-      if (r.width <= 0 || r.height <= 0) return false;
     } catch { return false; }
     return true;
   }
@@ -2513,6 +2529,25 @@
     const falseCount = falseEntries.length;
     const totalCount = entries.length;
 
+    /* ===== 关键保护：后台标签页 或 扫描不完整 → 强制回退逐行勾选 =====
+     * 表头全选是"勾选页面上所有行"（包括尚未渲染/未扫到的），扫描不完整时
+     * 会造成 savedFiles 只记录 batch 里的部分文件，而实际转存了全部 → 记录不完整
+     * → 下次看起来又是"未转存" → 重复转存 + 改名计划对不上 → 跳过下载。 */
+    const expected = getShareFileCount(doc);
+    const hidden = !!doc.hidden;
+    if (hidden || (expected && totalCount < expected)) {
+      warn(` ⚠️ ${hidden ? '后台标签页' : `扫描不完整 ${totalCount}/${expected}`}，回退逐行勾选（避免表头全选误勾未扫到的行）`);
+      const cls = await clearAllViaHeader(qa, doc);
+      if (!cls.ok) {
+        return {
+          ok: false, applied: 0, failed: totalCount,
+          details: entries.map(([name]) => ({ name })),
+          method: 'clear-failed-before-rowcheck',
+        };
+      }
+      return await applyTargetChecks(qa, doc, targets, { cacheKey });
+    }
+
     const headerState = getHeaderCheckState(doc);
     log(` 表头状态：${headerState}；目标：${trueCount} 勾选 / ${falseCount} 取消`);
 
@@ -2701,17 +2736,26 @@
       log(` [批 ${bi + 1}/${batches.length}] 转存结果：${result}`);
       overall = result;
 
+      /* ===== 成功后按实际勾选记录 =====
+       * 走表头全选或"清空+逐行"分支时，batch 只是"计划勾选"，
+       * 实际勾选数可能不等于 batch（例如回退逐行时漏勾、或表头全选时有额外行）。
+       * 这里重新扫描，用"实际仍处于勾选状态"的行作为本次转存结果。 */
       let recorded = false;
-      if (result === 'success') {
-        savedFiles.push(...batch);
+      if (result === 'success' || (result === 'unknown' && isSuccessModalPresent(doc))) {
+        const allRows = qa.scanFileRows(doc) || [];
+        const actuallySaved = allRows.filter(row => row.checked);
+        if (actuallySaved.length) {
+          savedFiles.push(...actuallySaved);
+          if (actuallySaved.length !== batch.length) {
+            warn(` ⚠️ 批 ${bi + 1} 实际勾选 ${actuallySaved.length} 个 ≠ 计划 ${batch.length} 个，按实际记录`);
+          }
+        } else {
+          /* 扫描不到勾选状态时退回 batch（极少见；可能是清空后立刻关闭成功模态框） */
+          savedFiles.push(...batch);
+        }
         recorded = true;
       } else if (result === 'unknown') {
-        if (isSuccessModalPresent(doc)) {
-          savedFiles.push(...batch);
-          recorded = true;
-        } else {
-          warn(` ⚠️ 批 ${bi + 1} 结果 unknown 且未见成功模态框`);
-        }
+        warn(` ⚠️ 批 ${bi + 1} 结果 unknown 且未见成功模态框`);
       }
 
       batchResults.push({
@@ -2766,8 +2810,9 @@
     if (!files.length) return { ok: false, kind: 'no-files', files: [] };
 
     /* 扫描完整性校验：扫到的行数必须 >= 头部显示的总数。
-     * 如果不足，强制二次全表扫描（不用缓存），避免因 ant-table 分批渲染
-     * 导致只扫到部分文件，进而把"已转存"误判为"未转存"引发重转。 */
+     * 如果不足，强制二次全表扫描（不用缓存）；二次仍不足 → 中止本轮。
+     * 否则未扫到的行不会被记录、不会改对名，下次又会被判为"未转存" → 重复转存
+     * 且改名计划对不上 → 跳过下载（本次要根治的问题）。 */
     const expected = getShareFileCount(doc);
     if (expected && files.length < expected) {
       warn(` ⚠️ 首次扫描不完整（${files.length}/${expected}），强制全表扫描一次...`);
@@ -2775,10 +2820,10 @@
       files = await scanAllRowsByScroll(qa, doc, { key: cacheKey, useCache: false, maxMs: 40000 });
       files = (files || []).filter(f => !isFolderFile(f));
       if (files.length < expected) {
-        warn(` ⚠️ 二次扫描仍不完整（${files.length}/${expected}），本轮按已扫到的 ${files.length} 个处理；未扫到的文件可能被重复转存`);
-      } else {
-        log(` ✓ 二次扫描完整：${files.length} 个`);
+        warn(` ⚠️ 二次扫描仍不完整（${files.length}/${expected}），中止本轮以避免误转存`);
+        return { ok: false, kind: 'scan-incomplete', files, expected };
       }
+      log(` ✓ 二次扫描完整：${files.length} 个`);
     }
 
     const shareKey = normalizeShareKey(location.href);
@@ -2801,14 +2846,12 @@
       log(` - ${f.name} sizeStr="${f.sizeStr}" mtime="${f.mtime || '-'}" fid="${f.fid || '-'}" → ${isFileSaved(f, savedInfos) ? 'SAVED' : 'PENDING'}`);
     }
 
-    /* 全量重转 Debug：只在"扫描完整 + 全部未命中"时记录。
-     * 扫描不完整时跳过 debug，避免假报警。 */
+    /* 全量重转 Debug：只在"扫描完整 + 全部未命中"时记录。 */
     if (files.length > 0 && saved.length === 0) {
-      const incomplete = !!expected && files.length < expected;
       maybeSaveFullResaveDebug(qa, files, savedInfos, {
         source: opts.source || 'child-task',
         clearFlagAtStart,
-        incomplete,
+        incomplete: false,
         expected,
       });
     }
@@ -2874,6 +2917,11 @@
     if (prep.kind === 'no-files') { finish('skip', { message: 'no-files' }); return true; }
     if (prep.kind === 'all-saved') {
       finish('all-saved', { fileCount: prep.files.length, files: prep.files.map(f => f.name) });
+      return true;
+    }
+    if (prep.kind === 'scan-incomplete') {
+      warn(` ⛔ [子任务] 扫描不完整（${prep.files.length}/${prep.expected}），中止转存`);
+      finish('fail', { message: `scan-incomplete:${prep.files.length}/${prep.expected}` });
       return true;
     }
     if (!prep.ok) {
@@ -3061,9 +3109,7 @@
 
   let lastMatchReason = '';
 
-  /* 转存记录与列表行的匹配（用于"转存后定位行去改名"）。
-   * 只处理本轮新转存记录，saved.name 即当时记录的名字（原始文件名）。
-   * 优先 icon / 快照 / 名字；名字部分同时考虑 [bgm] 新旧格式（通过 normalizeFileName 剥离） */
+  /* 转存记录与列表行的匹配（用于"转存后定位行去改名"）。 */
   function matchSavedToListRow(saved, rows, savedBefore, opts = {}) {
     const beforeFids = (opts && opts.beforeFids) || null;
     lastMatchReason = '';
@@ -3249,8 +3295,6 @@
       const name = targetByBase.get(it.base);
       if (!name) { notRenamed.push(oldName); continue; }
 
-      /* 目标格式：acg 名称 + 原始文件名（剥离 [bgm] 后的）
-       * it.base 已是 stripMarkerBlock 后的原始文件名，可以直接作为 base。 */
       const baseForTarget = String(it.base || '').trim();
       if (!baseForTarget) { notRenamed.push(oldName); continue; }
       const next = buildRenamedFileName(name, baseForTarget);
@@ -3351,6 +3395,7 @@
       qa.setStatus('转存中...', 'running');
       let successCount = 0;
       let partialCount = 0;
+      let scanIncompleteCount = 0;
       const savedByUrl = [];
 
       for (let i = 0; i < pending.length; i++) {
@@ -3414,6 +3459,9 @@
           log(`⏸ 子任务因暂停直接关闭：${url}`);
           qa.setStatus('已暂停', 'running');
           break;
+        } else if (r.kind === 'fail' && r.message && String(r.message).startsWith('scan-incomplete:')) {
+          warn(`⚠️ 扫描不完整，跳过本轮转存：${url}（${r.message}）`);
+          scanIncompleteCount++;
         } else {
           warn(`⚠️ 结果 ${r.kind}: ${url}`);
         }
@@ -3423,6 +3471,10 @@
 
       qa.setStatus('转存完成', 'done');
       qa.setProgress('-');
+
+      if (scanIncompleteCount > 0) {
+        warn(`⚠️ ${scanIncompleteCount} 个 URL 因扫描不完整被跳过（未转存，下次重试），见上方日志`);
+      }
 
       if (successCount + partialCount > 0) {
         log('★ 有新转存，点击页面内刷新按钮触发列表更新...');
@@ -3602,9 +3654,23 @@
     const url = normalizeShareKey(location.href);
     const cacheKey = currentCacheKey();
 
-    const allFiles = (await scanAllRowsByScroll(qa, document, { key: cacheKey, useCache: true }) || [])
+    let allFiles = (await scanAllRowsByScroll(qa, document, { key: cacheKey, useCache: true }) || [])
     .filter(f => !isFolderFile(f));
     if (!allFiles.length) { alert('当前页无文件（或仅含文件夹）'); return; }
+
+    /* 手动转存也要做完整性检查：否则同样会"扫到多少存多少"，
+     * 未扫到的行不勾、不存、不记录，下次又是"未转存"。 */
+    const expected = getShareFileCount(document);
+    if (expected && allFiles.length < expected) {
+      warn(` ⚠️ 扫描不完整（${allFiles.length}/${expected}），强制重扫一次`);
+      await sleep(500);
+      const retry = (await scanAllRowsByScroll(qa, document, { key: cacheKey, useCache: false, maxMs: 40000 }) || [])
+      .filter(f => !isFolderFile(f));
+      if (retry.length > allFiles.length) allFiles = retry;
+      if (allFiles.length < expected) {
+        if (!confirm(`⚠️ 扫描仍不完整（${allFiles.length}/${expected}），可能导致未转存的文件被跳过。\n\n继续？`)) return;
+      }
+    }
 
     const headerState = getHeaderCheckState(document);
     let usingAll, scope;
@@ -4058,7 +4124,7 @@
     setInterval(() => { try { sweepObsoleteRecords(); } catch (e) { warn('过期清理失败', e); } }, 6 * 60 * 60 * 1000);
     try {
       unsafeWindow.acgripQuarkBridge = {
-        version: '1.2.5',
+        version: '1.2.6',
         trigger: (opts = {}) => runQuarkAutoTrigger({ force: opts.force !== false }),
         status: () => {
           const state = gmGet(GM_CD, {}) || {};

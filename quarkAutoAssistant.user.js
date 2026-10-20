@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      5.7.6
+// @version      5.7.7
 // @description  夸克网盘平台层：UI + DOM 工具 + 批量下载 + 下载记录 + 暂停控制 + 底层删除工具（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -309,6 +309,21 @@
     return '';
   }
 
+  /* 读取页面"共 N 个"提示（列表页/个人页）。没有则返回 null。 */
+  function getListFileCountHint() {
+    try {
+      const sels = ['.info-stat span', '.list-info-stat span', '.share-info .info-stat span'];
+      for (const sel of sels) {
+        for (const el of document.querySelectorAll(sel)) {
+          const t = (el.textContent || '').trim();
+          const m = t.match(/共\s*(\d+)\s*个/);
+          if (m) return Number(m[1]);
+        }
+      }
+    } catch {}
+    return null;
+  }
+
   function loadDlRecords() { return gmGet(GM_DL_RECORDS, {}) || {}; }
   function saveDlRecords(recs) { gmSet(GM_DL_RECORDS, recs); }
 
@@ -491,7 +506,16 @@
 
     await until(() => !document.querySelector('.swal2-popup'), 150, 3000);
   }
-
+  /* 修复夸克 download_url 中 filename 参数里的 +（x-www-form-urlencoded 空格）
+  * 只动 filename= 这一段，其他 query 参数的 + 保留原样 */
+  function fixFilenamePlusInUrl(url) {
+    if (!url) return url;
+    try {
+      return String(url).replace(/([?&]filename=)([^&#]*)/gi, (m, prefix, value) => {
+        return prefix + value.replace(/\+/g, '%20');
+      });
+    } catch { return url; }
+  }
   async function collectApiLinks(timeout = 15000) {
     const popup = await until(() => {
       const p = document.querySelector('.swal2-popup');
@@ -505,12 +529,27 @@
     if (popup.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning')) return null;
 
     const links = [...popup.querySelectorAll('.listener-link-api')];
-    return links.map(a => ({
-      el: a,
-      fid: a.dataset.fid || '',
-      filename: a.dataset.filename || '',
-      link: a.dataset.link || '',
-    }));
+    return links.map(a => {
+      const original = a.dataset.link || '';
+      const fixed = fixFilenamePlusInUrl(original);
+      /* 关键：在 realClick 之前把 <a> 上的 URL 也改掉，
+      * 直链助手的 handler 读的是 a.dataset.link，
+      * 所以它拿到的 iframe src 已经是修复后的 URL，
+      * FDM 下载出来的文件名就不会再带 +。 */
+      if (fixed !== original) {
+        try { a.dataset.link = fixed; } catch {}
+        try { a.setAttribute('data-link', fixed); } catch {}
+        if (a.getAttribute('href') === original) {
+          try { a.setAttribute('href', fixed); } catch {}
+        }
+      }
+      return {
+        el: a,
+        fid: a.dataset.fid || '',
+        filename: a.dataset.filename || '',   // 这个本来就是正确的（原始 file_name）
+        link: fixed,                          // 记录里也存修复后的 URL
+      };
+    });
   }
 
   function waitForApiReady() {
@@ -788,22 +827,81 @@
     return innerH > body.clientHeight + 50;
   }
 
+  /* 是否"完全渲染"。为保守起见，没有 .ant-table-body 时不再假定为 true，
+   * 因为夸克列表页在初始渲染阶段可能暂时不生成 .ant-table-body。
+   * 上层建议优先使用 getListFileCountHint() + waitListStableEx() 做判据。 */
   function isWholeListRendered() {
     const body = document.querySelector('.ant-table-wrapper .ant-table-body');
-    if (!body) return true;
+    if (!body) {
+      /* 无 body 时依赖"是否有共 N 个提示且行数已达到"来判定；否则保守 false */
+      const hint = getListFileCountHint();
+      if (!hint) return false;
+      const cnt = scanFileRows().length;
+      return cnt >= hint;
+    }
     if (body.scrollHeight > body.clientHeight + 50) return false;
     return !isTableVirtual();
   }
 
-  function purgeMissingRecords(opts = {}) {
+  /* 等待列表稳定：行数连续 minWaitMs 不变，且（有 expected 时）行数 >= expected。
+   * 返回 { stable, count, emptyUi }。 */
+  async function waitListStableEx(doc = document, opts = {}) {
+    const minWaitMs = Number(opts.minWaitMs) >= 0 ? Number(opts.minWaitMs) : 2000;
+    const maxWaitMs = Number(opts.maxWaitMs) > 0 ? Number(opts.maxWaitMs) : 10000;
+    const expected = opts.expected !== undefined ? opts.expected : getListFileCountHint();
+    const t0 = Date.now();
+    let lastCount = -1;
+    let stableStart = 0;
+    let lastWarn = 0;
+
+    while (Date.now() - t0 < maxWaitMs) {
+      const loading = isLoadingAnimPresent();
+      const rows = loading ? [] : scanFileRows(doc);
+      const cnt = rows.length;
+      const emptyUi = loading ? false : isEmptyUiVisible();
+
+      if (!loading && (cnt > 0 || emptyUi) && cnt === lastCount) {
+        if (!stableStart) stableStart = Date.now();
+        const waited = Date.now() - stableStart;
+        if (waited >= minWaitMs) {
+          if (!expected || cnt >= expected) {
+            return { stable: true, count: cnt, emptyUi };
+          }
+          if (Date.now() - lastWarn > 2000) {
+            lastWarn = Date.now();
+            log(`  列表稳定但行数 ${cnt} < 期望 ${expected}，继续等…`);
+          }
+        }
+      } else {
+        stableStart = 0;
+      }
+      lastCount = cnt;
+      await sleep(300);
+    }
+    return { stable: false, count: lastCount };
+  }
+
+  async function purgeMissingRecords(opts = {}) {
     const manual = opts.manual === true;
     if (!isListPage()) return 0;
 
     if (!isListLoaded()) { log('对比清理：列表尚未加载完，跳过（避免误删）'); return 0; }
 
+    /* 稳定性校验：连续 minWaitMs 行数不变 */
+    const stab = await waitListStableEx(document, {
+      minWaitMs: manual ? 800 : 2000,
+      maxWaitMs: 8000,
+    });
+    if (!stab.stable) {
+      log('对比清理：列表未稳定，跳过本次（避免误删记录）');
+      return 0;
+    }
+
     const files = scanFileRows();
     const pageFids = new Set(files.map(f => f.fid).filter(Boolean));
     const emptyUi = !pageFids.size && isEmptyUiVisible();
+    const hint = getListFileCountHint();
+    const incompleteRender = !!(hint && files.length < hint);
 
     if (!pageFids.size && !emptyUi) {
       log('对比清理：本页无可用 fid，且不是"没有文件"空态，跳过');
@@ -829,18 +927,26 @@
       const ok = confirm(
         `将清理目录「${scope}」中 ${stale.length} 条“文件已不存在”的下载记录` +
         (emptyUi ? '（当前目录为空）' : '') + `。\n` +
-        (notWhole
-         ? '⚠️ 当前列表可滚动 / 为虚拟滚动，DOM 里只有部分行；未被渲染的行也会被算作“不存在”。\n'
+        (notWhole || incompleteRender
+         ? '⚠️ 当前列表可能未完全渲染；未被渲染的行也会被算作“不存在”。\n'
          : '') +
         `（其它目录的记录不受影响）\n\n继续？`
       );
       if (!ok) return 0;
-    } else if (!emptyUi && !isWholeListRendered()) {
-      log(`对比清理：列表仍可滚动或为虚拟滚动（DOM 仅 ${files.length} 行），跳过`);
-      return 0;
-    } else if (!emptyUi && stale.length > Math.max(20, files.length)) {
-      log(`对比清理：自动清理疑似误删（待删 ${stale.length} > 本页 ${files.length}），跳过`);
-      return 0;
+    } else if (!emptyUi) {
+      /* 自动模式：多重保护 */
+      if (incompleteRender) {
+        log(`对比清理：本页 ${files.length} 行 < 提示总数 ${hint}，跳过（列表未渲染完）`);
+        return 0;
+      }
+      if (!isWholeListRendered()) {
+        log(`对比清理：列表仍可滚动或为虚拟滚动（DOM 仅 ${files.length} 行），跳过`);
+        return 0;
+      }
+      if (stale.length > Math.max(20, files.length)) {
+        log(`对比清理：自动清理疑似误删（待删 ${stale.length} > 本页 ${files.length}），跳过`);
+        return 0;
+      }
     }
 
     const n = clearDlRecordsFids(stale);
@@ -926,13 +1032,14 @@
 
  /* 删除指定 fid 的行。失败时重试（默认最多 3 次，间隔 2s），
    * 每次只处理当前 DOM 里能匹配的行；成功的 fid 从剩余集合中移除。
-   * 自动触发场景下 ant-table 刚渲染时按钮可能还没出来，重试能覆盖。 */
+   * 返回值：{ count, fids } — count 为成功删除的数量，fids 为成功删除的 fid 列表。 */
   async function deleteRowsByFids(fids, opts = {}) {
-    if (!fids || !fids.length) return 0;
+    if (!fids || !fids.length) return { count: 0, fids: [] };
     const maxAttempts = Number(opts.maxAttempts) > 0 ? Number(opts.maxAttempts) : 3;
     const retryDelay = Number(opts.retryDelay) >= 0 ? Number(opts.retryDelay) : 2000;
 
     const remaining = new Set(fids);
+    const deletedFidsOut = [];
     let totalPicked = 0;
     let lastResult = '';
 
@@ -991,7 +1098,10 @@
       await until(() => !document.querySelector('.base-confirm-modal'), 100, 800);
 
       if (r === 'success') {
-        for (const fid of pickedFids) remaining.delete(fid);
+        for (const fid of pickedFids) {
+          remaining.delete(fid);
+          deletedFidsOut.push(fid);
+        }
         totalPicked += pickedFids.size;
         await sleep(500);
       }
@@ -1000,16 +1110,26 @@
     if (remaining.size > 0) {
       warn(`  删除未完成：${remaining.size}/${fids.length} 个文件未删除（最后结果：${lastResult}）`);
     }
-    return totalPicked;
+    return { count: totalPicked, fids: deletedFidsOut };
   }
 
  /* 过期清理：只有"确实删除了文件"或"列表完全渲染时确认文件已不存在"才清除记录。
    * 文件在当前页但删除失败、文件不在当前页且列表非完全渲染（虚拟滚动/别的目录）→ 保留记录，等下次处理。
-   * 避免"记录删了、文件还在"导致下次看起来像全部未转存。 */
+   * 避免"记录删了、文件还在"导致下次看起来像全部未转存。
+   *
+   * 稳定性校验：先 waitListStableEx 等列表稳定（连续 minWaitMs 行数不变，且满足 expected）；
+   * 删除后再重扫一次，用最新 DOM 判断剩余行，避免快照误判。 */
   async function purgeExpiredRecordsWithFiles() {
     if (!isListPage()) return { records: 0, files: 0 };
     if (!isListLoaded()) {
       log('过期清理：列表尚未加载完，跳过');
+      return { records: 0, files: 0 };
+    }
+
+    /* 稳定性校验 */
+    const stab = await waitListStableEx(document, { minWaitMs: 2000, maxWaitMs: 8000 });
+    if (!stab.stable) {
+      log('过期清理：列表未稳定，跳过本次清理（避免误删）');
       return { records: 0, files: 0 };
     }
 
@@ -1026,8 +1146,9 @@
       log(`★ 过期清理：当前目录命中 ${toDelete.length} 个过期文件，开始删除…`);
       try {
         const pickedFids = toDelete.map(f => f.fid);
-        const n = await deleteRowsByFids(pickedFids, { maxAttempts: 3, retryDelay: 2000 });
-        if (n > 0) deletedFiles = n;
+        const delRes = await deleteRowsByFids(pickedFids, { maxAttempts: 3, retryDelay: 2000 });
+        deletedFiles = delRes.count || 0;
+        deletedFids.push(...(delRes.fids || []));
         await sleep(500);
       } catch (e) {
         warn('过期清理：删除文件失败', e);
@@ -1036,15 +1157,19 @@
       log('过期清理：当前目录未命中过期文件，检查是否有文件已不存在');
     }
 
- /* 判断"文件确实不存在"（可以安全删记录）的过期 fid */
+    /* 删除后重扫，用最新 DOM 判断剩余 */
+    await until(() => !isLoadingAnimPresent(), 200, 5000);
+    const filesAfterDelete = scanFileRows();
+    const pageFids = new Set(filesAfterDelete.map(f => f.fid).filter(Boolean));
     const wholeRendered = isWholeListRendered();
     const emptyUi = isEmptyUiVisible();
-    const pageFids = new Set(files.map(f => f.fid).filter(Boolean));
+    const hint = getListFileCountHint();
+    const incompleteRender = !!(hint && filesAfterDelete.length < hint);
     const curScope = currentListScope();
     const recs = loadDlRecords();
 
     const missingFids = []; // 文件已不存在，记录可删
-    const keptFids = []; // 保留记录（虚拟滚动/别的目录/删除失败）
+    const keptFids = []; // 保留记录（虚拟滚动/别的目录/删除失败/渲染不完整）
 
     for (const fid of expiredFids) {
       if (deletedFids.includes(fid)) continue;
@@ -1054,23 +1179,29 @@
 
       const recScope = String(rec.scope || '');
       if (recScope && recScope !== curScope) {
-     /* 别的目录，当前页无法判断文件是否存在 */
+        /* 别的目录，当前页无法判断文件是否存在 */
         keptFids.push(fid);
         continue;
       }
 
       if (pageFids.has(fid)) {
-     /* 当前页可见但删除失败 → 保留 */
+        /* 当前页可见但删除失败 → 保留 */
         keptFids.push(fid);
         continue;
       }
 
-   /* 当前页不可见 */
+      /* 当前页不可见 */
+      if (incompleteRender) {
+        /* 页面提示总数比 DOM 多 → 有行还没渲染，不能判定"不存在" */
+        keptFids.push(fid);
+        continue;
+      }
+
       if (wholeRendered || emptyUi) {
-     /* 列表完全渲染或空态 → 文件确实不存在 */
+        /* 列表完全渲染或空态 → 文件确实不存在 */
         missingFids.push(fid);
       } else {
-     /* 虚拟滚动/部分渲染 → 不确定，保留 */
+        /* 虚拟滚动/部分渲染 → 不确定，保留 */
         keptFids.push(fid);
       }
     }
@@ -1083,7 +1214,7 @@
     return { records: deletedRecords, files: deletedFiles };
   }
 
-  async function waitListReadyForCleanup(timeout, tag, minWaitMs = 1500) {
+  async function waitListReadyForCleanup(timeout, tag, minWaitMs = 3000) {
     const t0 = Date.now();
     let lastLog = 0;
     let firstReadyTs = 0;
@@ -1123,6 +1254,7 @@
   async function runPreflightCleanup(opts = {}) {
     const tag = opts.tag || 'preflight';
     const listWaitMs = Number(opts.listWaitMs) > 0 ? Number(opts.listWaitMs) : 30000;
+    const minWaitMs = Number(opts.minWaitMs) > 0 ? Number(opts.minWaitMs) : 3000;
     const minInterval = Number(opts.minInterval) >= 0 ? Number(opts.minInterval) : 0;
     const force = opts.force === true;
 
@@ -1148,8 +1280,8 @@
         return { ok: false, skipped: true, reason: 'paused', didRun: false, tag };
       }
 
-      warn(`★ ${tag}：开始（force=${force}, listWaitMs=${listWaitMs}）`);
-      const lr = await waitListReadyForCleanup(listWaitMs, tag);
+      warn(`★ ${tag}：开始（force=${force}, listWaitMs=${listWaitMs}, minWaitMs=${minWaitMs}）`);
+      const lr = await waitListReadyForCleanup(listWaitMs, tag, minWaitMs);
       if (!lr.ready) {
         warn(`★ ${tag}：列表未就绪，跳过清理（避免空跑）`);
         return { ok: false, skipped: true, reason: 'list-not-ready', didRun: false, tag };
@@ -1159,7 +1291,7 @@
       let expired = { records: 0, files: 0 };
       let hadError = false;
 
-      try { missing = purgeMissingRecords({ manual: false }); }
+      try { missing = await purgeMissingRecords({ manual: false }); }
       catch (e) { hadError = true; warn(`★ ${tag}：purgeMissingRecords 失败`, e); }
 
       try { expired = await purgeExpiredRecordsWithFiles(); }
@@ -1307,12 +1439,12 @@
       label: '🔍 清理失效记录',
       color: '#d46b08',
       title: '只清理「当前目录」中"记录存在但文件已不存在"的记录（需列表加载完；其它目录不受影响）',
-      onclick: () => {
-        const n = purgeMissingRecords({ manual: true });
+      onclick: async () => {
+        const n = await purgeMissingRecords({ manual: true });
         refreshGray();
         alert(n > 0
               ? `已清理 ${n} 条失效记录`
-              : '没有可清理的记录（若列表仍在加载，本次已跳过以避免误删）');
+              : '没有可清理的记录（若列表仍在加载或未渲染完，本次已跳过以避免误删）');
       },
     });
     addBuiltinAction({
@@ -1324,7 +1456,7 @@
   }
 
   unsafeWindow.quarkAssistant = {
-    version: '5.7.6',
+    version: '5.7.7',
     isReady: () => true,
     isListPage, isSharePage,
 
@@ -1351,16 +1483,29 @@
     if (!document.body) await new Promise(r => window.addEventListener('DOMContentLoaded', r, { once: true }));
 
     if (isListPage()) {
+      document.addEventListener('click', (e) => {
+        const a = e.target && e.target.closest && e.target.closest('.listener-link-api');
+        if (!a) return;
+        const original = a.dataset.link || '';
+        const fixed = fixFilenamePlusInUrl(original);
+        if (fixed !== original) {
+          try { a.dataset.link = fixed; } catch {}
+          try { a.setAttribute('data-link', fixed); } catch {}
+          if (a.getAttribute('href') === original) {
+            try { a.setAttribute('href', fixed); } catch {}
+          }
+        }
+      }, true);
       mountPanel();
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v5.7.6`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v5.7.7`);
       setTimeout(() => { tryAutoDownloadOnBoot(); }, 3000);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v5.7.6');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v5.7.7');
     } else {
-      log('平台层就绪（其他页）v5.7.6');
+      log('平台层就绪（其他页）v5.7.7');
     }
 
     startGrayPolling();

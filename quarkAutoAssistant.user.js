@@ -1,7 +1,17 @@
+/*
+ * @Author: WayneFerdon wayneferdon@hotmail.com
+ * @Date: 2026-10-09 03:44:59
+ * @LastEditors: WayneFerdon wayneferdon@hotmail.com
+ * @LastEditTime: 2026-10-20 23:37:18
+ * @FilePath: \acg.ripImprove\quarkAutoAssistant.user.js
+ * ----------------------------------------------------------------
+ * Licensed to the .NET Foundation under one or more agreements.
+ * The .NET Foundation licenses this file to you under the MIT license.
+ */
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      5.7.7
+// @version      5.7.8
 // @description  夸克网盘平台层：UI + DOM 工具 + 批量下载 + 下载记录 + 暂停控制 + 底层删除工具（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -22,18 +32,101 @@
   const THROTTLE = 5000;
   const BUSY_KEY = 'acgrip_bridge_busy';
   const PAUSE_KEY = 'quark_auto_pause_state';
+  const _1s = 1000;
 
   const log = (...a) => console.log(PREFIX, ...a);
   const warn = (...a) => console.warn(PREFIX, ...a);
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-  async function until(fn, delay = 200, timeout = 10000) {
-    const t0 = Date.now();
-    while (Date.now() - t0 < timeout) {
-      const r = await fn();
-      if (r) return r;
-      await sleep(delay);
+
+  /* ================= 计时 / 等待工具（后台标签页安全） =================
+   * Chrome 对隐藏标签页的 setTimeout 会节流到 1s 甚至 60s。
+   * 把 <1s 的 sleep 移到 Blob Worker 里执行可以绕过节流。
+   *
+   * 设计：
+   *   sleep(ms, isForBattle)
+   *     isForBattle=true 且 ms<1s → Worker 定时器
+   *     其他 → 主线程 setTimeout
+   *
+   *   until(condition, delay, maxWaitMs, opts)
+   *     maxWaitMs<=0（默认）  → 无限等待，直到条件满足
+   *     maxWaitMs>0           → 超时返回 null（保持旧语义）
+   *     opts.throwOnTimeout   → 超时抛异常
+   *
+   *   untilStrict(condition, delay, maxWaitMs) → 超时抛异常
+   *   untilOrGiveUp(condition, delay, maxWaitMs) → 超时返回 {ok:false}
+   */
+  let _timerWorkerFn = null;
+  function _getTimerWorker() {
+    if (_timerWorkerFn) return _timerWorkerFn;
+    try {
+      const code = `
+        let timerMap = {};
+        self.onmessage = (e) => {
+          const { id, ms } = e.data;
+          timerMap[id] = setTimeout(() => {
+            self.postMessage({ id });
+            delete timerMap[id];
+          }, ms);
+        };
+      `;
+      const blob = new Blob([code], { type: 'application/javascript' });
+      const url = URL.createObjectURL(blob);
+      const worker = new Worker(url);
+      const callbacks = new Map();
+      let idCounter = 0;
+      worker.onmessage = (e) => {
+        const { id } = e.data;
+        const resolve = callbacks.get(id);
+        if (!resolve) return;
+        resolve();
+        callbacks.delete(id);
+      };
+      _timerWorkerFn = (ms) => new Promise((resolve) => {
+        const id = idCounter++;
+        callbacks.set(id, resolve);
+        worker.postMessage({ id, ms });
+      });
+      return _timerWorkerFn;
+    } catch {
+      _timerWorkerFn = (ms) => new Promise((r) => setTimeout(r, ms));
+      return _timerWorkerFn;
     }
-    return null;
+  }
+
+  async function sleep(ms, isForBattle) {
+    if (!ms || ms <= 0) return;
+    if (!isForBattle || ms >= _1s) {
+      return new Promise((resolve) => setTimeout(resolve, ms));
+    }
+    ms = Math.max(ms, 50);
+    return _getTimerWorker()(ms);
+  }
+
+  async function until(condition, delay, maxWaitMs, opts = {}) {
+    const pollMs = delay === 0 ? 0 : Math.max(50, delay ?? 50);
+    const waitMs = Number(maxWaitMs) > 0 ? Number(maxWaitMs) : 0;
+    const throwOnTimeout = opts.throwOnTimeout === true;
+    const t0 = Date.now();
+    for (;;) {
+      const result = await condition();
+      if (result) return result;
+      if (waitMs > 0 && Date.now() - t0 >= waitMs) {
+        if (throwOnTimeout) throw new Error(`until 超时：${waitMs}ms`);
+        return null;
+      }
+      await sleep(pollMs, true);
+    }
+  }
+
+  async function untilStrict(condition, delay, maxWaitMs) {
+    return await until(condition, delay, maxWaitMs, { throwOnTimeout: true });
+  }
+
+  async function untilOrGiveUp(condition, delay, maxWaitMs) {
+    try {
+      return { ok: true, result: await until(condition, delay, maxWaitMs, { throwOnTimeout: true }) };
+    } catch {
+      return { ok: false, result: null };
+    }
   }
 
   function gmGet(key, def) {
@@ -60,7 +153,7 @@
     if (!isPaused()) return;
     setStatus('已暂停', 'running');
     log('⏸ 已暂停，等待恢复...');
-    while (isPaused()) await sleep(400);
+    while (isPaused()) await sleep(400, true);
     setStatus('继续中...', 'running');
     log('▶ 已恢复');
   }
@@ -309,7 +402,7 @@
     return '';
   }
 
-  /* 读取页面"共 N 个"提示（列表页/个人页）。没有则返回 null。 */
+  /* 读取页面"共 N 个"提示。没有则返回 null。 */
   function getListFileCountHint() {
     try {
       const sels = ['.info-stat span', '.list-info-stat span', '.share-info .info-stat span'];
@@ -436,6 +529,20 @@
     return null;
   }
 
+ /* ================= 关键：filename= 参数里的 + 修复 =================
+  * 夸克 API 返回的 download_url 中，filename 参数用 + 表示空格（x-www-form-urlencoded），
+  * 但 FDM 等下载器按 RFC 3986 解析 query string 时，+ 是字面字符，
+  * 导致下载下来的文件名中出现 +（例如 "十六夜膳房+02.mp4"）。
+  * 只替换 filename= 参数段里的 +，其它 query 参数保持原样（auth_key、token 里可能包含 + 是语义字符）。 */
+  function fixFilenamePlusInUrl(url) {
+    if (!url) return url;
+    try {
+      return String(url).replace(/([?&]filename=)([^&#]*)/gi, (m, prefix, value) => {
+        return prefix + value.replace(/\+/g, '%20');
+      });
+    } catch { return url; }
+  }
+
  /* ===== 下载流程 ===== */
   let downloadRunning = false;
 
@@ -448,24 +555,27 @@
       try { btnEl.dispatchEvent(new win.MouseEvent(t, { bubbles: true, view: win })); } catch {}
     }
 
-    const itemEl = await until(
+    const g = await untilOrGiveUp(
       () => document.querySelector('.pl-button-mode[data-mode="api"]'),
       100, 3000
     );
-    if (!itemEl) throw new Error('找不到 API 下载菜单项');
+    if (!g.ok) throw new Error('找不到 API 下载菜单项');
+    const itemEl = g.result;
 
     const $ = win.jQuery || win.$;
     const popupShown = () => !!document.querySelector('.swal2-popup');
 
     if ($) {
       try { $(itemEl).trigger('click'); } catch {}
-      if (await until(popupShown, 100, 800)) return;
+      const p = await untilOrGiveUp(popupShown, 100, 800);
+      if (p.ok) return;
     }
     if (popupShown()) return;
 
     if (itemEl.isConnected) {
       realClick(itemEl);
-      if (await until(popupShown, 100, 800)) return;
+      const p = await untilOrGiveUp(popupShown, 100, 800);
+      if (p.ok) return;
     }
     if (popupShown()) return;
 
@@ -475,15 +585,16 @@
   }
 
   async function handleApiDialog() {
-    const popup = await until(() => document.querySelector('.swal2-popup'), 250, 5000);
-    if (!popup) throw new Error('未弹出 API 下载对话框');
+    const g = await untilOrGiveUp(() => document.querySelector('.swal2-popup'), 250, 5000);
+    if (!g.ok) throw new Error('未弹出 API 下载对话框');
+    const popup = g.result;
     const link = await until(() => {
       const el = document.querySelector('.listener-link-api');
       if (el) return el;
       const err = document.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning');
       if (err) throw new Error('弹窗返回错误');
       return null;
-    }, 250, 8000);
+    }, 250, 8000, { throwOnTimeout: true });
     const dlink = link.dataset.link || '';
     const fname = link.dataset.filename || '';
 
@@ -506,18 +617,13 @@
 
     await until(() => !document.querySelector('.swal2-popup'), 150, 3000);
   }
-  /* 修复夸克 download_url 中 filename 参数里的 +（x-www-form-urlencoded 空格）
-  * 只动 filename= 这一段，其他 query 参数的 + 保留原样 */
-  function fixFilenamePlusInUrl(url) {
-    if (!url) return url;
-    try {
-      return String(url).replace(/([?&]filename=)([^&#]*)/gi, (m, prefix, value) => {
-        return prefix + value.replace(/\+/g, '%20');
-      });
-    } catch { return url; }
-  }
+
+  /* 收集 API 链接。关键：
+   *  1) 在 realClick 之前，把 <a>.dataset.link 里的 filename= 参数修复为 %20 空格
+   *     → 直链助手读 dataset.link 时拿到的就是修复后的 URL → FDM 文件名正确
+   *  2) 返回的 link 字段也用修复后的版本（写入记录、推送 RPC 都用它） */
   async function collectApiLinks(timeout = 15000) {
-    const popup = await until(() => {
+    const g = await untilOrGiveUp(() => {
       const p = document.querySelector('.swal2-popup');
       if (!p) return null;
       if (p.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning')) return p;
@@ -525,17 +631,14 @@
       return null;
     }, 200, timeout);
 
-    if (!popup) return null;
+    if (!g.ok) return null;
+    const popup = g.result;
     if (popup.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning')) return null;
 
     const links = [...popup.querySelectorAll('.listener-link-api')];
     return links.map(a => {
       const original = a.dataset.link || '';
       const fixed = fixFilenamePlusInUrl(original);
-      /* 关键：在 realClick 之前把 <a> 上的 URL 也改掉，
-      * 直链助手的 handler 读的是 a.dataset.link，
-      * 所以它拿到的 iframe src 已经是修复后的 URL，
-      * FDM 下载出来的文件名就不会再带 +。 */
       if (fixed !== original) {
         try { a.dataset.link = fixed; } catch {}
         try { a.setAttribute('data-link', fixed); } catch {}
@@ -546,8 +649,8 @@
       return {
         el: a,
         fid: a.dataset.fid || '',
-        filename: a.dataset.filename || '',   // 这个本来就是正确的（原始 file_name）
-        link: fixed,                          // 记录里也存修复后的 URL
+        filename: a.dataset.filename || '',
+        link: fixed,
       };
     });
   }
@@ -596,7 +699,7 @@
     return isChecked();
   }
 
- /* ===== 批量下载流程（返回详细结果，供桥接侧校验） ===== */
+ /* ===== 批量下载流程 ===== */
   async function autoDownloadWorkflow(opts = {}) {
     const { throttle = THROTTLE, waitForBusy = false, targetFids = null } = opts;
     const result = {
@@ -616,8 +719,8 @@
         return result;
       }
       warn('★ 自动下载：已有任务在跑，等待其完成（最多 3 分钟）…');
-      await until(() => !downloadRunning, 500, 180000);
-      if (downloadRunning) {
+      const g = await untilOrGiveUp(() => !downloadRunning, 500, 180000);
+      if (!g.ok) {
         warn('★ 自动下载：等待超时，仍被占用');
         result.reason = 'busy-timeout';
         return result;
@@ -761,7 +864,7 @@
           warn(`  下载失败 ${l.filename}: ${e.message}`);
         }
 
-        if (i < links.length - 1) await sleep(throttle);
+        if (i < links.length - 1) await sleep(throttle, true);
       }
 
       const cb = document.querySelector('.swal2-close');
@@ -816,95 +919,139 @@
 
   function isListLoaded() { return !isLoadingAnimPresent(); }
 
-  function isTableVirtual() {
-    const body = document.querySelector('.ant-table-wrapper .ant-table-body');
-    if (!body) return false;
-    const inner = body.firstElementChild;
-    if (!inner) return false;
-    const innerH = inner.getBoundingClientRect().height
-    || parseFloat(getComputedStyle(inner).height) || 0;
-    if (!innerH) return true;
-    return innerH > body.clientHeight + 50;
-  }
+  /* ================= 关键：列表完整性判定 =================
+   * 只依赖 scrollTop / scrollHeight / clientHeight、scanFileRows().length、
+   * getListFileCountHint()、isEmptyUiVisible() —— 这些在后台标签页也可靠，
+   * 不依赖 getBoundingClientRect / getComputedStyle。
+   *
+   * 完整判据（任一满足）：
+   *   A. hint 存在 且 rows.length >= hint
+   *   B. 空目录
+   *   C. 无滚动条（scrollHeight <= clientHeight+1）且行数连续 3 次不变
+   *   D. 滚到底部 且行数+scrollHeight 连续 3 次不变
+   *
+   * maxWaitMs=0（默认）→ 无限等待
+   * maxWaitMs>0       → 超时返回 { ok:false }，调用方必须放弃 */
+  async function waitListFullyLoaded(opts = {}) {
+    const tag = opts.tag || 'list';
+    const pollMs = opts.pollMs || 250;
+    const maxWaitMs = Number(opts.maxWaitMs) > 0 ? Number(opts.maxWaitMs) : 0;
 
-  /* 是否"完全渲染"。为保守起见，没有 .ant-table-body 时不再假定为 true，
-   * 因为夸克列表页在初始渲染阶段可能暂时不生成 .ant-table-body。
-   * 上层建议优先使用 getListFileCountHint() + waitListStableEx() 做判据。 */
-  function isWholeListRendered() {
-    const body = document.querySelector('.ant-table-wrapper .ant-table-body');
-    if (!body) {
-      /* 无 body 时依赖"是否有共 N 个提示且行数已达到"来判定；否则保守 false */
-      const hint = getListFileCountHint();
-      if (!hint) return false;
-      const cnt = scanFileRows().length;
-      return cnt >= hint;
-    }
-    if (body.scrollHeight > body.clientHeight + 50) return false;
-    return !isTableVirtual();
-  }
-
-  /* 等待列表稳定：行数连续 minWaitMs 不变，且（有 expected 时）行数 >= expected。
-   * 返回 { stable, count, emptyUi }。 */
-  async function waitListStableEx(doc = document, opts = {}) {
-    const minWaitMs = Number(opts.minWaitMs) >= 0 ? Number(opts.minWaitMs) : 2000;
-    const maxWaitMs = Number(opts.maxWaitMs) > 0 ? Number(opts.maxWaitMs) : 10000;
-    const expected = opts.expected !== undefined ? opts.expected : getListFileCountHint();
-    const t0 = Date.now();
     let lastCount = -1;
-    let stableStart = 0;
-    let lastWarn = 0;
+    let lastScrollH = -1;
+    let stableHits = 0;
 
-    while (Date.now() - t0 < maxWaitMs) {
-      const loading = isLoadingAnimPresent();
-      const rows = loading ? [] : scanFileRows(doc);
-      const cnt = rows.length;
-      const emptyUi = loading ? false : isEmptyUiVisible();
+    const scrollToBottom = () => {
+      const b = document.querySelector('.ant-table-wrapper .ant-table-body');
+      if (b) { try { b.scrollTop = b.scrollHeight; } catch {} }
+    };
 
-      if (!loading && (cnt > 0 || emptyUi) && cnt === lastCount) {
-        if (!stableStart) stableStart = Date.now();
-        const waited = Date.now() - stableStart;
-        if (waited >= minWaitMs) {
-          if (!expected || cnt >= expected) {
-            return { stable: true, count: cnt, emptyUi };
+    const check = () => {
+      if (isLoadingAnimPresent()) {
+        lastCount = -1; stableHits = 0;
+        return false;
+      }
+      const rows = scanFileRows();
+      const hint = getListFileCountHint();
+
+      if (hint && rows.length >= hint) {
+        warn(`★ [${tag}] 列表完整（hint=${hint}，已扫 ${rows.length}）`);
+        return { ok: true, count: rows.length, hint, via: 'hint' };
+      }
+      if (rows.length === 0 && isEmptyUiVisible()) {
+        warn(`★ [${tag}] 列表为空目录`);
+        return { ok: true, count: 0, hint, via: 'empty' };
+      }
+
+      const b = document.querySelector('.ant-table-wrapper .ant-table-body');
+      if (!b) {
+        if (rows.length > 0 && rows.length === lastCount) {
+          stableHits++;
+          if (stableHits >= 3 && (!hint || rows.length >= hint)) {
+            warn(`★ [${tag}] 无 table-body 但行数稳定（${rows.length}）`);
+            return { ok: true, count: rows.length, hint, via: 'no-body-stable' };
           }
-          if (Date.now() - lastWarn > 2000) {
-            lastWarn = Date.now();
-            log(`  列表稳定但行数 ${cnt} < 期望 ${expected}，继续等…`);
+        } else {
+          stableHits = 1;
+        }
+        lastCount = rows.length;
+        return false;
+      }
+
+      const sh = b.scrollHeight, ch = b.clientHeight;
+
+      if (sh > ch + 1) {
+        const atBottom = b.scrollTop + ch >= sh - 1;
+        if (atBottom) {
+          if (rows.length === lastCount && sh === lastScrollH) {
+            stableHits++;
+            if (stableHits >= 3) {
+              if (!hint || rows.length >= hint) {
+                warn(`★ [${tag}] 滚到底且稳定（${rows.length} 行，scrollH=${sh}）`);
+                return { ok: true, count: rows.length, hint, via: 'bottom-stable' };
+              }
+              /* 有 hint 但行数不足 → 继续等 */
+              stableHits = 0;
+              scrollToBottom();
+            }
+          } else {
+            stableHits = 1;
           }
+        } else {
+          stableHits = 0;
+          scrollToBottom();
         }
       } else {
-        stableStart = 0;
+        if (rows.length === lastCount) {
+          stableHits++;
+          if (stableHits >= 3 && (!hint || rows.length >= hint)) {
+            warn(`★ [${tag}] 无滚动条且稳定（${rows.length} 行）`);
+            return { ok: true, count: rows.length, hint, via: 'no-scroll-stable' };
+          }
+        } else {
+          stableHits = 1;
+        }
       }
-      lastCount = cnt;
-      await sleep(300);
+
+      lastCount = rows.length;
+      if (b) lastScrollH = sh;
+      return false;
+    };
+
+    if (maxWaitMs > 0) {
+      const g = await untilOrGiveUp(check, pollMs, maxWaitMs);
+      if (!g.ok) {
+        warn(`★ [${tag}] 等待列表完整超时（${maxWaitMs}ms），放弃本次操作`);
+        return { ok: false, count: lastCount };
+      }
+      return g.result;
     }
-    return { stable: false, count: lastCount };
+    return await until(check, pollMs);
   }
 
+  /* ================= 关键：对比清理 =================
+   * 硬约束：列表必须"确认完整"才允许继续；超时直接放弃、不删任何记录。 */
   async function purgeMissingRecords(opts = {}) {
     const manual = opts.manual === true;
     if (!isListPage()) return 0;
-
     if (!isListLoaded()) { log('对比清理：列表尚未加载完，跳过（避免误删）'); return 0; }
 
-    /* 稳定性校验：连续 minWaitMs 行数不变 */
-    const stab = await waitListStableEx(document, {
-      minWaitMs: manual ? 800 : 2000,
-      maxWaitMs: 8000,
+    const full = await waitListFullyLoaded({
+      tag: '对比清理',
+      maxWaitMs: manual ? 15000 : 30000,
     });
-    if (!stab.stable) {
-      log('对比清理：列表未稳定，跳过本次（避免误删记录）');
+    if (!full.ok) {
+      log('对比清理：列表未确认完整，跳过（避免误删记录）');
       return 0;
     }
 
     const files = scanFileRows();
     const pageFids = new Set(files.map(f => f.fid).filter(Boolean));
     const emptyUi = !pageFids.size && isEmptyUiVisible();
-    const hint = getListFileCountHint();
+    const hint = full.hint;
     const incompleteRender = !!(hint && files.length < hint);
-
-    if (!pageFids.size && !emptyUi) {
-      log('对比清理：本页无可用 fid，且不是"没有文件"空态，跳过');
+    if (incompleteRender) {
+      log(`对比清理：本页 ${files.length} 行 < 提示总数 ${hint}，跳过`);
       return 0;
     }
 
@@ -916,42 +1063,26 @@
     for (const fid of Object.keys(recs)) {
       const r = recs[fid];
       const s = (r && typeof r === 'object') ? String(r.scope || '') : '';
-      if (!s) continue;
-      if (s !== scope) continue;
+      if (!s || s !== scope) continue;
       if (!pageFids.has(fid)) stale.push(fid);
     }
     if (!stale.length) { log('对比清理：无失效记录'); return 0; }
 
     if (manual) {
-      const notWhole = !emptyUi && !isWholeListRendered();
       const ok = confirm(
-        `将清理目录「${scope}」中 ${stale.length} 条“文件已不存在”的下载记录` +
-        (emptyUi ? '（当前目录为空）' : '') + `。\n` +
-        (notWhole || incompleteRender
-         ? '⚠️ 当前列表可能未完全渲染；未被渲染的行也会被算作“不存在”。\n'
-         : '') +
-        `（其它目录的记录不受影响）\n\n继续？`
+        `将清理目录「${scope}」中 ${stale.length} 条"文件已不存在"的下载记录。\n` +
+        `列表已确认完整（${emptyUi ? '空目录' : `本页 ${pageFids.size} 个文件`}，via=${full.via}）。\n` +
+        `其它目录的记录不受影响。\n\n继续？`
       );
       if (!ok) return 0;
-    } else if (!emptyUi) {
-      /* 自动模式：多重保护 */
-      if (incompleteRender) {
-        log(`对比清理：本页 ${files.length} 行 < 提示总数 ${hint}，跳过（列表未渲染完）`);
-        return 0;
-      }
-      if (!isWholeListRendered()) {
-        log(`对比清理：列表仍可滚动或为虚拟滚动（DOM 仅 ${files.length} 行），跳过`);
-        return 0;
-      }
-      if (stale.length > Math.max(20, files.length)) {
-        log(`对比清理：自动清理疑似误删（待删 ${stale.length} > 本页 ${files.length}），跳过`);
-        return 0;
-      }
+    } else if (stale.length > Math.max(20, files.length)) {
+      log(`对比清理：自动清理疑似误删（待删 ${stale.length} > 本页 ${files.length}），跳过`);
+      return 0;
     }
 
     const n = clearDlRecordsFids(stale);
     log(`★ 对比清理：移除 ${n} 条失效记录（目录 ${scope}，` +
-        (emptyUi ? '空目录' : `本页 ${pageFids.size} 个文件`) + '）');
+        (emptyUi ? '空目录' : `本页 ${pageFids.size} 个文件`) + `）`);
     return n;
   }
 
@@ -1011,28 +1142,31 @@
     return true;
   }
 
-  async function waitDeleteResult(timeout = 8000) {
-    const r = await until(() => {
-      let text = '';
-      try {
-        for (const sel of ['.ant-message-notice', '.ant-notification-notice', '.swal2-popup']) {
-          for (const el of document.querySelectorAll(sel)) {
-            if (isVisible(el)) text += ' ' + (el.textContent || '');
+  /* ================= 关键：删除结果等待 =================
+   * 超时返回 'unknown'，调用方不得把 unknown 当成功。 */
+  async function waitDeleteResult(timeout = 30000) {
+    try {
+      return await untilStrict(() => {
+        let text = '';
+        try {
+          for (const sel of ['.ant-message-notice', '.ant-notification-notice', '.swal2-popup']) {
+            for (const el of document.querySelectorAll(sel)) {
+              if (isVisible(el)) text += ' ' + (el.textContent || '');
+            }
           }
-        }
-      } catch {}
-      if (/删除成功|已删除|删除完成/.test(text)) return 'success';
-      if (/删除失败|操作失败|无法删除/.test(text)) return 'fail';
-      const stillConfirm = document.querySelector('.base-confirm-modal');
-      if (!stillConfirm || !isVisible(stillConfirm)) return 'success';
-      return null;
-    }, 300, timeout);
-    return r || 'unknown';
+        } catch {}
+        if (/删除成功|已删除|删除完成/.test(text)) return 'success';
+        if (/删除失败|操作失败|无法删除/.test(text)) return 'fail';
+        const stillConfirm = document.querySelector('.base-confirm-modal');
+        if (!stillConfirm || !isVisible(stillConfirm)) return 'success';
+        return null;
+      }, 300, timeout);
+    } catch {
+      return 'unknown';
+    }
   }
 
- /* 删除指定 fid 的行。失败时重试（默认最多 3 次，间隔 2s），
-   * 每次只处理当前 DOM 里能匹配的行；成功的 fid 从剩余集合中移除。
-   * 返回值：{ count, fids } — count 为成功删除的数量，fids 为成功删除的 fid 列表。 */
+ /* 删除指定 fid 的行。返回值：{ count, fids }。 */
   async function deleteRowsByFids(fids, opts = {}) {
     if (!fids || !fids.length) return { count: 0, fids: [] };
     const maxAttempts = Number(opts.maxAttempts) > 0 ? Number(opts.maxAttempts) : 3;
@@ -1041,17 +1175,20 @@
     const remaining = new Set(fids);
     const deletedFidsOut = [];
     let totalPicked = 0;
-    let lastResult = '';
 
     for (let attempt = 1; attempt <= maxAttempts && remaining.size > 0; attempt++) {
       if (attempt > 1) {
-        log(`  删除重试 ${attempt}/${maxAttempts}：剩余 ${remaining.size} 个，等 ${retryDelay}ms…`);
-        await sleep(retryDelay);
-        await until(() => !isLoadingAnimPresent(), 200, 5000);
+        log(`  删除重试 ${attempt}/${maxAttempts}：剩余 ${remaining.size}，等 ${retryDelay}ms…`);
+        await sleep(retryDelay, true);
+        const g = await untilOrGiveUp(() => !isLoadingAnimPresent(), 200, 15000);
+        if (!g.ok) {
+          warn('  表格加载层 15s 内未消失，放弃本次删除尝试');
+          break;
+        }
       }
 
       await clearAllSelection();
-      await sleep(150);
+      await sleep(150, true);
 
       const rows = document.querySelectorAll('tr.ant-table-row[data-row-key]');
       const pickedFids = new Set();
@@ -1063,37 +1200,33 @@
         const input = row.querySelector('input.ant-checkbox-input');
         if (!input || !input.checked) {
           realClick(lbl);
-          const ok = await until(() => {
+          const g = await untilOrGiveUp(() => {
             const i = row.querySelector('input.ant-checkbox-input');
             return i && i.checked;
-          }, 80, 1200);
-          if (!ok) { try { realClick(lbl); await sleep(200); } catch {} }
+          }, 80, 2000);
+          if (!g.ok) { try { realClick(lbl); await sleep(200, true); } catch {} }
         }
         const recheck = row.querySelector('input.ant-checkbox-input');
         if (recheck && recheck.checked) pickedFids.add(fid);
       }
 
       if (!pickedFids.size) {
-        log(`  第 ${attempt} 次：目标 fid 在当前页未匹配到可勾选行（剩余 ${remaining.size}，可能是虚拟滚动/页面未加载完）`);
-        lastResult = 'no-match';
+        log(`  第 ${attempt} 次：目标 fid 在当前页未匹配到可勾选行（剩余 ${remaining.size}）`);
         continue;
       }
 
       if (!await clickDeleteButton(8000)) {
         warn(`  第 ${attempt} 次：未找到顶栏删除按钮`);
-        lastResult = 'no-delete-btn';
         continue;
       }
       if (!await confirmDeleteDialog(8000)) {
         warn(`  第 ${attempt} 次：未找到删除确认按钮`);
-        lastResult = 'no-confirm-btn';
         await until(() => !document.querySelector('.base-confirm-modal'), 100, 800);
         continue;
       }
 
-      const r = await waitDeleteResult(10000);
-      log(`  第 ${attempt} 次删除结果：${r}（勾选 ${pickedFids.size} 个）`);
-      lastResult = r;
+      const r = await waitDeleteResult(30000);
+      log(`  第 ${attempt} 次删除结果：${r}（勾选 ${pickedFids.size}）`);
 
       await until(() => !document.querySelector('.base-confirm-modal'), 100, 800);
 
@@ -1103,22 +1236,21 @@
           deletedFidsOut.push(fid);
         }
         totalPicked += pickedFids.size;
-        await sleep(500);
+        await sleep(500, true);
       }
     }
 
     if (remaining.size > 0) {
-      warn(`  删除未完成：${remaining.size}/${fids.length} 个文件未删除（最后结果：${lastResult}）`);
+      warn(`  删除未完成：${remaining.size}/${fids.length} 个文件未删除`);
     }
     return { count: totalPicked, fids: deletedFidsOut };
   }
 
- /* 过期清理：只有"确实删除了文件"或"列表完全渲染时确认文件已不存在"才清除记录。
-   * 文件在当前页但删除失败、文件不在当前页且列表非完全渲染（虚拟滚动/别的目录）→ 保留记录，等下次处理。
-   * 避免"记录删了、文件还在"导致下次看起来像全部未转存。
-   *
-   * 稳定性校验：先 waitListStableEx 等列表稳定（连续 minWaitMs 行数不变，且满足 expected）；
-   * 删除后再重扫一次，用最新 DOM 判断剩余行，避免快照误判。 */
+  /* ================= 关键：过期清理 =================
+   * 硬约束：
+   *   - 删文件前：列表必须确认完整
+   *   - 删记录前：删除后必须再次确认列表完整
+   *   - 任何一步超时 → 本步跳过，不删记录 */
   async function purgeExpiredRecordsWithFiles() {
     if (!isListPage()) return { records: 0, files: 0 };
     if (!isListLoaded()) {
@@ -1126,10 +1258,9 @@
       return { records: 0, files: 0 };
     }
 
-    /* 稳定性校验 */
-    const stab = await waitListStableEx(document, { minWaitMs: 2000, maxWaitMs: 8000 });
-    if (!stab.stable) {
-      log('过期清理：列表未稳定，跳过本次清理（避免误删）');
+    const full0 = await waitListFullyLoaded({ tag: '过期清理', maxWaitMs: 30000 });
+    if (!full0.ok) {
+      log('过期清理：列表未确认完整，跳过（避免误删）');
       return { records: 0, files: 0 };
     }
 
@@ -1149,7 +1280,6 @@
         const delRes = await deleteRowsByFids(pickedFids, { maxAttempts: 3, retryDelay: 2000 });
         deletedFiles = delRes.count || 0;
         deletedFids.push(...(delRes.fids || []));
-        await sleep(500);
       } catch (e) {
         warn('过期清理：删除文件失败', e);
       }
@@ -1157,95 +1287,59 @@
       log('过期清理：当前目录未命中过期文件，检查是否有文件已不存在');
     }
 
-    /* 删除后重扫，用最新 DOM 判断剩余 */
-    await until(() => !isLoadingAnimPresent(), 200, 5000);
-    const filesAfterDelete = scanFileRows();
-    const pageFids = new Set(filesAfterDelete.map(f => f.fid).filter(Boolean));
-    const wholeRendered = isWholeListRendered();
-    const emptyUi = isEmptyUiVisible();
-    const hint = getListFileCountHint();
-    const incompleteRender = !!(hint && filesAfterDelete.length < hint);
+    const full2 = await waitListFullyLoaded({ tag: '过期清理-删除后', maxWaitMs: 30000 });
+    if (!full2.ok) {
+      log('过期清理：删除后列表未确认完整，本轮不删记录（文件已尝试删除，记录保留待下次）');
+      refreshGray();
+      return { records: 0, files: deletedFiles };
+    }
+
+    const filesAfter = scanFileRows();
+    const pageFids = new Set(filesAfter.map(f => f.fid).filter(Boolean));
+    const emptyUi = !pageFids.size && isEmptyUiVisible();
+    const hint = full2.hint;
+    const incompleteRender = !!(hint && filesAfter.length < hint);
+    if (incompleteRender) {
+      log(`过期清理：删除后本页 ${filesAfter.length} 行 < 提示总数 ${hint}，本轮不删记录`);
+      refreshGray();
+      return { records: 0, files: deletedFiles };
+    }
+
     const curScope = currentListScope();
     const recs = loadDlRecords();
-
-    const missingFids = []; // 文件已不存在，记录可删
-    const keptFids = []; // 保留记录（虚拟滚动/别的目录/删除失败/渲染不完整）
+    const missingFids = [];
+    const keptFids = [];
 
     for (const fid of expiredFids) {
       if (deletedFids.includes(fid)) continue;
-
       const rec = recs[fid];
       if (!rec) continue;
-
       const recScope = String(rec.scope || '');
-      if (recScope && recScope !== curScope) {
-        /* 别的目录，当前页无法判断文件是否存在 */
-        keptFids.push(fid);
-        continue;
-      }
-
-      if (pageFids.has(fid)) {
-        /* 当前页可见但删除失败 → 保留 */
-        keptFids.push(fid);
-        continue;
-      }
-
-      /* 当前页不可见 */
-      if (incompleteRender) {
-        /* 页面提示总数比 DOM 多 → 有行还没渲染，不能判定"不存在" */
-        keptFids.push(fid);
-        continue;
-      }
-
-      if (wholeRendered || emptyUi) {
-        /* 列表完全渲染或空态 → 文件确实不存在 */
-        missingFids.push(fid);
-      } else {
-        /* 虚拟滚动/部分渲染 → 不确定，保留 */
-        keptFids.push(fid);
-      }
+      if (recScope && recScope !== curScope) { keptFids.push(fid); continue; }
+      if (pageFids.has(fid)) { keptFids.push(fid); continue; }
+      missingFids.push(fid);
     }
 
     const allToClear = [...deletedFids, ...missingFids];
     const deletedRecords = clearDlRecordsFids(allToClear);
     log(`★ 过期清理完成：删除文件 ${deletedFiles} 个，移除记录 ${deletedRecords} 条`
-        + `（其中文件已不存在 ${missingFids.length} 条，保留 ${keptFids.length} 条待下次处理${keptFids.length ? '：' + keptFids.join(', ') : ''}）`);
+        + `（文件不存在 ${missingFids.length} 条，保留 ${keptFids.length} 条待下次处理）`);
     refreshGray();
     return { records: deletedRecords, files: deletedFiles };
   }
 
+  /* 兼容旧接口：内部直接用 waitListFullyLoaded（更严格） */
   async function waitListReadyForCleanup(timeout, tag, minWaitMs = 3000) {
-    const t0 = Date.now();
-    let lastLog = 0;
-    let firstReadyTs = 0;
-
-    while (Date.now() - t0 < timeout) {
-      const wrapper = document.querySelector('.ant-table-wrapper');
-      const loading = isLoadingAnimPresent();
-      let rows = [];
-      try { rows = scanFileRows(); } catch {}
-      const emptyUi = isEmptyUiVisible();
-      const ready = !!wrapper && !loading && (rows.length > 0 || emptyUi);
-
-      if (ready) {
-        if (firstReadyTs === 0) firstReadyTs = Date.now();
-        const waited = Date.now() - firstReadyTs;
-        if (waited >= minWaitMs) {
-          warn(`★ ${tag}：列表就绪（wrapper=有, loading=否, rows=${rows.length}, emptyUi=${emptyUi}，就绪后再等 ${waited}ms）`);
-          return { ready: true, rows: rows.length, emptyUi, ms: Date.now() - t0 };
-        }
-      } else {
-        firstReadyTs = 0;
-      }
-
-      if (Date.now() - lastLog > 3000) {
-        lastLog = Date.now();
-        log(`… ${tag} 等待列表就绪（wrapper=${wrapper ? '有' : '无'}, loading=${loading}, rows=${rows.length}, emptyUi=${emptyUi}，已等 ${Math.round((Date.now() - t0) / 1000)}s）`);
-      }
-      await sleep(300);
-    }
-    warn(`★ ${tag}：等待列表就绪超时（${timeout}ms）`);
-    return { ready: false, ms: Date.now() - t0 };
+    const full = await waitListFullyLoaded({ tag, maxWaitMs: timeout || 30000 });
+    if (!full.ok) return { ready: false, ms: 0 };
+    return {
+      ready: true,
+      rows: full.count,
+      emptyUi: full.via === 'empty',
+      hint: full.hint,
+      via: full.via,
+      ms: 0,
+    };
   }
 
   let _preflightPromise = null;
@@ -1335,7 +1429,7 @@
         stableHits = 0;
       }
       lastCount = files.length;
-      await sleep(400);
+      await sleep(400, true);
     }
     if (!files.length) { log('  列表无文件，跳过下载'); return; }
 
@@ -1365,7 +1459,7 @@
       markFidDownloaded(
         f.fid,
         { name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig, mtime: f.mtime },
-        { keepTs: true } /* 手动标记：保留已有 ts */
+        { keepTs: true }
       );
     }
 
@@ -1455,8 +1549,28 @@
     });
   }
 
+  /* ===== 捕获阶段：兜底修复 .listener-link-api 的 filename=+ =====
+   * 覆盖"用户在模态框里手动点击 <a>"的场景。
+   * 自动下载流程已经由 collectApiLinks 修过 dataset.link，这里只是保险。 */
+  document.addEventListener('click', (e) => {
+    const a = e.target && e.target.closest && e.target.closest('.listener-link-api');
+    if (!a) return;
+    const original = a.dataset.link || '';
+    const fixed = fixFilenamePlusInUrl(original);
+    if (fixed !== original) {
+      try { a.dataset.link = fixed; } catch {}
+      try { a.setAttribute('data-link', fixed); } catch {}
+      if (a.getAttribute('href') === original) {
+        try { a.setAttribute('href', fixed); } catch {}
+      }
+    }
+  }, true);
+
+  /* ===== 对外暴露 =====
+   * 注意：until 保持旧语义（超时返回 null），Bridge 侧大量使用 `if (await qa.until(...))`，
+   * 不能改成抛异常。严格版本通过内部 untilStrict / untilOrGiveUp 使用。 */
   unsafeWindow.quarkAssistant = {
-    version: '5.7.7',
+    version: '5.7.8',
     isReady: () => true,
     isListPage, isSharePage,
 
@@ -1464,7 +1578,12 @@
     addBuiltinAction, clearBuiltinActions,
     refreshGray, setProgressLabel, showProgress, hideProgress,
 
-    isVisible, realClick, sleep, until,
+    isVisible, realClick,
+    sleep: (ms) => sleep(ms, true),
+    until: (condition, delay, timeout) => until(condition, delay, timeout > 0 ? timeout : 0),
+    untilStrict,
+    untilOrGiveUp,
+
     scanFileRows, getFileIconSig,
     isFidDownloaded, isDownloading: () => downloadRunning,
 
@@ -1477,35 +1596,24 @@
     runPreflightCleanup,
     purgeMissingRecords,
     purgeExpiredRecordsWithFiles,
+
+    fixFilenamePlusInUrl,
   };
 
   (async function boot() {
     if (!document.body) await new Promise(r => window.addEventListener('DOMContentLoaded', r, { once: true }));
 
     if (isListPage()) {
-      document.addEventListener('click', (e) => {
-        const a = e.target && e.target.closest && e.target.closest('.listener-link-api');
-        if (!a) return;
-        const original = a.dataset.link || '';
-        const fixed = fixFilenamePlusInUrl(original);
-        if (fixed !== original) {
-          try { a.dataset.link = fixed; } catch {}
-          try { a.setAttribute('data-link', fixed); } catch {}
-          if (a.getAttribute('href') === original) {
-            try { a.setAttribute('href', fixed); } catch {}
-          }
-        }
-      }, true);
       mountPanel();
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v5.7.7`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v5.7.8`);
       setTimeout(() => { tryAutoDownloadOnBoot(); }, 3000);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v5.7.7');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v5.7.8');
     } else {
-      log('平台层就绪（其他页）v5.7.7');
+      log('平台层就绪（其他页）v5.7.8');
     }
 
     startGrayPolling();

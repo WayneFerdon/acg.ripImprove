@@ -1,18 +1,8 @@
-/*
- * @Author: WayneFerdon wayneferdon@hotmail.com
- * @Date: 2026-10-09 03:44:17
- * @LastEditors: WayneFerdon wayneferdon@hotmail.com
- * @LastEditTime: 2026-10-20 23:44:53
- * @FilePath: \acg.ripImprove\acg.ripImprove.Bridge2QuarkPan.user.js
- * ----------------------------------------------------------------
- * Licensed to the .NET Foundation under one or more agreements.
- * The .NET Foundation licenses this file to you under the MIT license.
- */
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.12.0
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；自动子任务前强制等待夸克侧预清理完成；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
+// @version 3.13.1
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -43,8 +33,6 @@
   const GM_TASKS = 'acgrip_bridge_tasks';
   const GM_RESULTS = 'acgrip_bridge_results';
   const BUSY_KEY = 'acgrip_bridge_busy';
-  const GM_DL_RECORDS = 'quark_auto_dl_records';
-  const GM_QRECORDS = 'quark_download_records';
   const GM_FULL_RESAVE_DEBUG = 'acgrip_quark_full_resave_debug';
 
   const TASK_TTL = 3 * 60 * 1000;
@@ -55,9 +43,12 @@
   const AUTO_TTL = 5 * 60 * 1000;
 
   const FULL_RESAVE_DEBUG_MAX = 10;
-  const AUTO_CLOSE_DELAY_MS = 5000;
+  /* 关页延时已移交 QuarkAutoAssistant（CLOSE_DELAY_MS），桥接不再关页 */
   const OBSOLETE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-  const MIN_QA_VERSION = [5, 7, 8];
+  const MIN_QA_VERSION = [6, 0, 0];
+  const GATE_KEY = '__acgripQuarkGate';
+  const ACG_FLAG_KEY = 'acgrip_acg_invoked';
+  const GATE_WAIT_MS = 4 * 60 * 1000;
 
   const _1s = 1000;
   const log = (...a) => console.log('[桥接]', ...a);
@@ -907,6 +898,17 @@
     return null;
   }
 
+  /* ===== 扫描完整性状态 =====
+   * 头部"共 N 个文件"是**整个分享**的口径（含文件夹本身、含各子目录里的文件），
+   * 进子文件夹后数字不变，因此它只能当"上界"，不能用来判当前目录是否扫全。
+   * 真正的判据是：滚动扫描是否走到了底、且没有超时（见 scanAllRowsByScroll 记录）。 */
+  let _lastScan = null;
+  function isLastScanComplete(maxAgeMs = 180000) {
+    if (!_lastScan) return false;
+    if (Date.now() - _lastScan.at > maxAgeMs) return false;
+    return _lastScan.reachedBottom === true && _lastScan.timedOut !== true;
+  }
+
   /* 扫描所有行。返回数组，调用方用 length vs expected 判断完整性。 */
   async function scanAllRowsByScroll(qa, doc = document, opts = {}) {
     const useCache = opts.useCache === true;
@@ -927,16 +929,20 @@
     if (useCache && key) {
       const cached = getAllFilesCache(key);
       if (cached) {
+        /* 缓存只在"扫到底且未超时"时写入，可直接复用；
+         * 不能用头部总数比（它是整个分享口径，进子文件夹后恒大于当前目录行数） */
         const expected0 = getShareFileCount(doc);
         if (expected0 && cached.length < expected0) {
-          warn(` ⚠️ 缓存不完整（${cached.length}/${expected0}），忽略缓存并强制重扫`);
+          log(` ★ 复用缓存：${cached.length} 行（头部 ${expected0}，含文件夹本身/其它目录，属正常差额）`);
         } else {
           log(` ★ 复用缓存：${cached.length} 行`);
-          return cached;
         }
+        return cached;
       }
     }
 
+    /* 这里刻意用"分享总数"（.info-stat）作为上界：它 ≥ 当前目录条数，
+     * 不会因为低估而在 visited.size >= expected 时提前 break 掉真行 */
     const expected = getShareFileCount(doc);
 
     if (isShareTableLoading(doc)) {
@@ -949,12 +955,15 @@
     const needFullScan = !!(expected && visibleRows.length < expected);
 
     if (!body || (!isVirtualScrolling(body) && !needFullScan)) {
+      /* 非虚拟滚动/无表体：可视区就是全部 */
+      _lastScan = { count: visibleRows.length, expected, reachedBottom: true, timedOut: false, at: Date.now() };
       if (useCache && key) setAllFilesCache(key, visibleRows);
       return visibleRows;
     }
 
     if (!body) {
       warn(` ⚠️ 无 .ant-table-body 但需要全扫（可见 ${visibleRows.length}/${expected}），只能返回可见区`);
+      _lastScan = { count: visibleRows.length, expected, reachedBottom: false, timedOut: false, at: Date.now() };
       if (useCache && key) setAllFilesCache(key, visibleRows);
       return visibleRows;
     }
@@ -986,6 +995,8 @@
     let lastScrollH = body.scrollHeight;
     let lastSize = visited.size;
     let stallCount = 0;
+    let reachedBottom = false;
+    let timedOut = false;
     const MAX_STALL_BOTTOM = 5;
     const MAX_STALL_MID = 5;
 
@@ -995,6 +1006,7 @@
       const scrollH = body.scrollHeight;
       const curTop = body.scrollTop;
       const atBottom = curTop + bodyH >= scrollH - 8;
+      reachedBottom = atBottom;   /* 取最后一次观测值：中途停顿 break 时不能算"到底" */
       if (atBottom) {
         if (hasLoadingMore()) {
           await qa.until(() => !hasLoadingMore(), loadingMoreCheck, loadingMoreWait);
@@ -1023,17 +1035,20 @@
       lastScrollH = body.scrollHeight;
     }
 
+    timedOut = (Date.now() - t0) >= maxMs;
+
     await qa.sleep(sleepFinal);
     harvest();
     body.scrollTop = startTop;
     await qa.sleep(sleepRestore);
 
     const result = [...visited.values()];
-    log(` ★ 滚动扫描：收集 ${result.length} 行（期望 ${expected || '?'}）`);
+    _lastScan = { count: result.length, expected, reachedBottom, timedOut, at: Date.now() };
+    log(` ★ 滚动扫描：收集 ${result.length} 行（头部 ${expected || '?'}，到底=${reachedBottom}，超时=${timedOut}）`);
 
     if (useCache && key) {
-      if (!expected || result.length >= expected) setAllFilesCache(key, result);
-      else warn(` ⚠️ 扫描不完整（${result.length}/${expected}），不写缓存`);
+      if (reachedBottom && !timedOut) setAllFilesCache(key, result);
+      else warn(` ⚠️ 扫描未确认完整（${result.length} 行，到底=${reachedBottom}），不写缓存`);
     }
     return result;
   }
@@ -1234,6 +1249,17 @@
     } catch { return false; }
     return true;
   }
+  /* 视口中心最上层的元素是不是 iframe（= 有全屏/居中 iframe 真的盖在页面上） */
+  function isIframeCovering(doc = document) {
+    try {
+      const w = doc.documentElement.clientWidth;
+      const h = doc.documentElement.clientHeight;
+      const top = doc.elementFromPoint(Math.floor(w / 2), Math.floor(h / 2));
+      if (!top) return false;
+      return top.tagName === 'IFRAME' || !!(top.closest && top.closest('iframe'));
+    } catch { return false; }
+  }
+
   function scanIframeErrors(doc = document) {
     let text = '';
     const winW = doc.documentElement.clientWidth;
@@ -1258,16 +1284,25 @@
         } catch {}
         continue;
       }
+      /* 跨域 iframe（收银台）：只能靠"是否真的盖住页面"判断。
+       * 注意 QKVIP_* 收银台 iframe 常驻 DOM（100%×100%、z-index:999），关闭后依然存在，
+       * 只按尺寸判断会把它当成"空间不足"，从而让之后每次保存都误判失败 */
       try {
         const cs = (f.ownerDocument.defaultView || window).getComputedStyle(f);
-        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+        if (cs.display === 'none' || cs.visibility === 'hidden' || cs.opacity === '0') continue;
+        if (cs.pointerEvents === 'none') continue;
         const r = f.getBoundingClientRect();
         const w = r.width || parseFloat(cs.width) || 0;
         const h = r.height || parseFloat(cs.height) || 0;
+        if (!(w >= winW * 0.9 && h >= winH * 0.9)) continue;
         const z = parseInt(cs.zIndex, 10);
-        if (w >= winW * 0.9 && h >= winH * 0.9 && !isNaN(z) && z >= 0) {
-          text += ' 空间不足 扩容';
-        }
+        if (isNaN(z) || z < 0) continue;
+        /* 决定性判据：视口中心命中的就是它（说明它在最上层），否则只是留在 DOM 里的残留 */
+        let top = null;
+        try { top = doc.elementFromPoint(Math.floor(winW / 2), Math.floor(winH / 2)); } catch {}
+        const covered = !!top && (top === f || (f.contains && f.contains(top)));
+        if (!covered) continue;
+        text += ' 空间不足 扩容';
       } catch {}
     }
     return text;
@@ -1459,6 +1494,17 @@
     }, 100, 12000);
     if (!outcome) { warn(' ⚠️ 12s 内无任何结果信号'); return 'unknown'; }
     if (outcome.type === 'success') {
+      /* "保存成功"弹窗可能先于真实结果出现（实测存在"保存成功弹窗 + 容量不足收银台"并存的状态），
+       * 所以再观察一小段：若收银台真的盖到页面上，就把这次判定为失败 */
+      const late = await until(() => {
+        const k = detectResultQuick(doc);
+        return k ? k : null;
+      }, 150, 1200);
+      if (late) {
+        warn(` ⚠️ 成功弹窗后又出现失败信号：${late}，按失败处理`);
+        try { closeDialog(qa, doc); } catch {}
+        return late;
+      }
       log(' → 保存成功');
       try { closeDialog(qa, doc); } catch {}
       return 'success';
@@ -2246,10 +2292,12 @@
     const falseCount = falseEntries.length;
     const totalCount = entries.length;
 
+    /* 头部总数含"文件夹本身/其它目录"，不可能与当前目录行数相等；
+     * 只有在"没扫到底"且行数明显少于头部时才回退逐行勾选 */
     const expected = getShareFileCount(doc);
     const hidden = !!doc.hidden;
-    if (hidden || (expected && totalCount < expected)) {
-      warn(` ⚠️ ${hidden ? '后台标签页' : `扫描不完整 ${totalCount}/${expected}`}，回退逐行勾选`);
+    if (hidden || (expected && totalCount < expected && !isLastScanComplete())) {
+      warn(` ⚠️ ${hidden ? '后台标签页' : `扫描未确认完整 ${totalCount}/头部 ${expected}`}，回退逐行勾选`);
       const cls = await clearAllViaHeader(qa, doc);
       if (!cls.ok) {
         return {
@@ -2329,8 +2377,10 @@
    * 调用方必须检查 .ok，不能直接用 files。 */
   async function waitTableStable(qa, doc = document, maxMs = 20000) {
     const t0 = Date.now();
+    /* 头部总数只作参考：它是整个分享的口径（含文件夹本身/其它目录），
+     * 永远大于等于当前目录行数；拿它当等式会让每次保存都白等满 maxMs */
     const expected = getShareFileCount(doc);
-    log(` 头部显示共 ${expected == null ? '?' : expected} 个；等待表格稳定...`);
+    log(` 头部共 ${expected == null ? '?' : expected} 个（仅参考）；等待首屏行数稳定...`);
 
     await until(() => !isShareTableLoading(doc), 150, maxMs);
     log(` 表格加载层已消失，等待行数稳定...`);
@@ -2338,20 +2388,18 @@
     let lastCount = -1;
     let stableHits = 0;
     let lastWarn = 0;
-    const remain = () => Math.max(0, maxMs - (Date.now() - t0));
+    const remain = () => Math.max(800, maxMs - (Date.now() - t0));
 
     const got = await until(() => {
       if (isShareTableLoading(doc)) { lastCount = -1; stableHits = 0; return null; }
       const rows = qa.scanFileRows(doc);
       const cnt = rows.length;
-      if (expected && cnt >= expected && cnt === lastCount) {
+      if (cnt > 0 && cnt === lastCount) {
         if (++stableHits >= 2) return { ok: true, files: rows, count: cnt, expected };
-      } else if (!expected && cnt > 0 && cnt === lastCount) {
-        if (++stableHits >= 4) return { ok: true, files: rows, count: cnt, expected };
       } else {
-        if (expected && cnt > 0 && cnt < expected && Date.now() - lastWarn > 3000) {
+        if (cnt > 0 && Date.now() - lastWarn > 3000) {
           lastWarn = Date.now();
-          log(`  ⏳ 扫描到 ${cnt} 行 < 头部 ${expected}，继续等待...`);
+          log(`  ⏳ 首屏 ${cnt} 行（头部 ${expected == null ? '?' : expected}），继续等稳定...`);
         }
         stableHits = 0;
       }
@@ -2362,7 +2410,7 @@
     if (got) return got;
 
     const cur = qa.scanFileRows(doc);
-    log(` 等待超时，当前扫描到 ${cur.length} 行（头部 ${expected == null ? '?' : expected}）`);
+    log(` 等待超时，当前扫描到 ${cur.length} 行（期望 ${expected == null ? '?' : expected}）`);
     return { ok: false, files: cur, count: cur.length, expected };
   }
 
@@ -2435,7 +2483,8 @@
       overall = result;
 
       let recorded = false;
-      if (result === 'success' || (result === 'unknown' && isSuccessModalPresent(doc))) {
+      if (result === 'success'
+          || (result === 'unknown' && isSuccessModalPresent(doc) && !isIframeCovering(doc))) {
         const allRows = qa.scanFileRows(doc) || [];
         const actuallySaved = allRows.filter(row => row.checked);
         if (actuallySaved.length) {
@@ -2499,17 +2548,23 @@
     files = (files || []).filter(f => !isFolderFile(f));
     if (!files.length) return { ok: false, kind: 'no-files', files: [] };
 
+    /* 头部总数是整个分享的口径（含文件夹本身、含各子目录的文件），只能当上界；
+     * 是否扫全看 scanAllRowsByScroll 有没有"到底 + 未超时" */
     const expected = getShareFileCount(doc);
     if (expected && files.length < expected) {
-      warn(` ⚠️ 首次扫描不完整（${files.length}/${expected}），强制全表扫描一次...`);
-      await sleep(500, true);
-      files = await scanAllRowsByScroll(qa, doc, { key: cacheKey, useCache: false, maxMs: 40000 });
-      files = (files || []).filter(f => !isFolderFile(f));
-      if (files.length < expected) {
-        warn(` ⚠️ 二次扫描仍不完整（${files.length}/${expected}），中止本轮以避免误转存`);
-        return { ok: false, kind: 'scan-incomplete', files, expected };
+      if (isLastScanComplete()) {
+        warn(` ⚠️ 已扫到底：${files.length} 行 < 头部 ${expected}（头部把文件夹本身/其它目录算进来了），按实际继续`);
+      } else {
+        warn(` ⚠️ 首次扫描未确认完整（${files.length}/头部 ${expected}），强制全表扫描一次...`);
+        await sleep(500, true);
+        files = await scanAllRowsByScroll(qa, doc, { key: cacheKey, useCache: false, maxMs: 40000 });
+        files = (files || []).filter(f => !isFolderFile(f));
+        if (files.length < expected && !isLastScanComplete()) {
+          warn(` ⚠️ 二次扫描仍未到底（${files.length}/头部 ${expected}），中止本轮以避免误转存`);
+          return { ok: false, kind: 'scan-incomplete', files, expected };
+        }
+        log(` ✓ 二次扫描：${files.length} 个（到底=${isLastScanComplete()}）`);
       }
-      log(` ✓ 二次扫描完整：${files.length} 个`);
     }
 
     const shareKey = normalizeShareKey(location.href);
@@ -2920,31 +2975,16 @@
     return out;
   }
 
-  function refreshDlRecordsAfterRename(pairs) {
+  function refreshDlRecordsAfterRename(qa, pairs) {
     if (!Array.isArray(pairs) || !pairs.length) return 0;
-    let n = 0;
-    const byFid = gmGet(GM_DL_RECORDS, {}) || {};
-    let fidDirty = false;
-    for (const p of pairs) {
-      if (!p || !p.fid) continue;
-      const rec = byFid[p.fid];
-      if (!rec || typeof rec !== 'object') continue;
-      byFid[p.fid] = { ...rec, name: p.next };
-      fidDirty = true;
-      n++;
+    /* GM_setValue 是"按脚本"隔离的：桥接直接写 quark_auto_dl_records 对 QuarkAutoAssistant 无效，
+     * 必须走它暴露的 API（否则日志说"已同步"，实际记录里的名字还是旧的） */
+    if (!qa || typeof qa.renameDlRecordNames !== 'function') {
+      warn('⚠️ 夸克助手未提供 renameDlRecordNames，跳过下载记录改名同步');
+      return 0;
     }
-    if (fidDirty) gmSet(GM_DL_RECORDS, byFid);
-    const byName = gmGet(GM_QRECORDS, {}) || {};
-    let nameDirty = false;
-    for (const p of pairs) {
-      if (!p || !p.old || !byName[p.old]) continue;
-      byName[p.next] = { ...byName[p.old], name: p.next };
-      delete byName[p.old];
-      nameDirty = true;
-      n++;
-    }
-    if (nameDirty) gmSet(GM_QRECORDS, byName);
-    return n;
+    try { return qa.renameDlRecordNames(pairs) || 0; }
+    catch (e) { warn('⚠️ 同步下载记录失败', e); return 0; }
   }
 
   /* ===== 全流程 ===== */
@@ -3162,7 +3202,7 @@
             }
             if (wroteCount) log(` ★ 改名：写入曾用名 ${wroteCount} 条`);
             try {
-              const n = refreshDlRecordsAfterRename(renameReport.pairs);
+              const n = refreshDlRecordsAfterRename(qa, renameReport.pairs);
               if (n) log(` ★ 改名：同步 ${n} 条下载记录到新名`);
             } catch (e) { warn('⚠️ 同步下载记录失败', e); }
           }
@@ -3192,16 +3232,9 @@
         await sleep(600, true);
 
         if (renameAllConfirmed) {
+          /* 下载不在桥接里做：交给夸克助手，在挂起门被放行后自己执行 */
           releaseBusy();
-          if (qa.isPaused && qa.isPaused()) {
-            log('⏸ 暂停，跳过自动下载触发');
-          } else if (typeof qa.autoDownloadWorkflow === 'function') {
-            log('★ 触发下载（改名已确认）...');
-            await qa.autoDownloadWorkflow();
-            log('★ 下载流程已结束');
-          } else {
-            warn('⚠️ quarkAssistant.autoDownloadWorkflow 不可用');
-          }
+          log('★ 刷新/改名已确认，准备放行挂起门（自动下载由夸克助手执行）');
         } else {
           const failedNames = (renameReport.failedEntries || []).map(e => e.old);
           const allBad = [...new Set([...failedNames, ...planUnmatched, ...planAmbiguous])];
@@ -3223,13 +3256,6 @@
                 + `可在文件名上手动改名后，重新点「▶️ 转存」。`);
         }
 
-        if (renameAllConfirmed) {
-          if (!refreshRes.ok) {
-            warn('⚠️ 页面内刷新失败，回退整页重载');
-            await sleep(1000, true);
-            location.reload();
-          }
-        }
       } else {
         log('无新转存文件，跳过刷新');
       }
@@ -3256,14 +3282,16 @@
     if (!allFiles.length) { alert('当前页无文件（或仅含文件夹）'); return; }
 
     const expected = getShareFileCount(document);
-    if (expected && allFiles.length < expected) {
-      warn(` ⚠️ 扫描不完整（${allFiles.length}/${expected}），强制重扫一次`);
+    if (expected && allFiles.length < expected && !isLastScanComplete()) {
+      warn(` ⚠️ 扫描未确认完整（${allFiles.length}/头部 ${expected}），强制重扫一次`);
       await sleep(500, true);
       const retry = (await scanAllRowsByScroll(qa, document, { key: cacheKey, useCache: false, maxMs: 40000 }) || []).filter(f => !isFolderFile(f));
       if (retry.length > allFiles.length) allFiles = retry;
-      if (allFiles.length < expected) {
-        if (!confirm(`⚠️ 扫描仍不完整（${allFiles.length}/${expected}），可能导致未转存的文件被跳过。\n\n继续？`)) return;
+      if (allFiles.length < expected && !isLastScanComplete()) {
+        if (!confirm(`⚠️ 扫描仍不完整（${allFiles.length}/头部 ${expected}，可能还没加载完），可能导致漏转存。\n\n继续？`)) return;
       }
+    } else if (expected && allFiles.length < expected) {
+      warn(` ⚠️ 已扫到底：${allFiles.length} 行 < 头部 ${expected}（头部含文件夹本身/其它目录），按实际继续`);
     }
 
     const headerState = getHeaderCheckState(document);
@@ -3634,7 +3662,7 @@
     setInterval(() => { try { sweepObsoleteRecords(); } catch (e) { warn('过期清理失败', e); } }, 6 * 60 * 60 * 1000);
     try {
       unsafeWindow.acgripQuarkBridge = {
-        version: '1.2.7',
+        version: '1.3.1',
         trigger: (opts = {}) => runQuarkAutoTrigger({ force: opts.force !== false }),
         status: () => {
           const state = gmGet(GM_CD, {}) || {};
@@ -3676,44 +3704,52 @@
     return { ok: false, ver, reason: `需要 ≥${ra}.${rb}.${rc}` };
   }
 
-  async function ensurePreflightCleanupDone(qa, opts = {}) {
-    const tag = opts.tag || 'trigger';
-    if (!qa || typeof qa.runPreflightCleanup !== 'function') {
-      warn(`⛔ [${tag}] 预清理不可用：请更新 QuarkAutoAssistant 到 ${MIN_QA_VERSION.join('.')}+`);
-      try { qa && qa.setStatus && qa.setStatus(`请更新夸克助手到 ${MIN_QA_VERSION.join('.')}+`, 'error'); } catch {}
-      return { ok: false, skipped: true, reason: 'api-missing' };
+  /* ===== 挂起门（夸克助手 unsafeWindow 上的内存标记，不落盘） ===== */
+  function getGate() {
+    try {
+      const qa = unsafeWindow.quarkAssistant;
+      const g = (qa && qa.gate) || unsafeWindow[GATE_KEY];
+      if (g && typeof g.waitReady === 'function' && typeof g.release === 'function') return g;
+    } catch {}
+    return null;
+  }
+
+  /* 声明"本次是 acg 唤起"：写 sessionStorage（同标签页共享） + 通知门 */
+  function markAcgInvoked(tag) {
+    try { sessionStorage.setItem(ACG_FLAG_KEY, '1'); } catch {}
+    const g = getGate();
+    if (g) { try { g.attach(tag); } catch (e) { warn('门 attach 失败', e); } }
+    return g;
+  }
+
+  /* 步骤 3：等夸克助手挂起（清理完成）标记 */
+  async function waitGateReady(tag) {
+    const g = getGate();
+    if (!g) {
+      warn(`⛔ [${tag}] 夸克助手未提供挂起门（需要 QuarkAutoAssistant ≥${MIN_QA_VERSION.join('.')}）`);
+      return { ok: false, reason: 'gate-missing', gate: null };
     }
-    const verCheck = isQAVersionOk(qa);
+    const verCheck = isQAVersionOk(unsafeWindow.quarkAssistant);
     if (!verCheck.ok) {
-      warn(`⛔ [${tag}] 版本不满足：当前 ${verCheck.ver}（${verCheck.reason}）`);
-      try { qa.setStatus && qa.setStatus(`助手版本过低(${verCheck.ver})`, 'error'); } catch {}
-      return { ok: false, skipped: true, reason: 'version-too-old', version: verCheck.ver };
+      warn(`⛔ [${tag}] 夸克助手版本过低：${verCheck.ver}（${verCheck.reason}）`);
+      return { ok: false, reason: 'version-too-old', gate: g };
     }
-    warn(`★ [${tag}] 预清理：调用 quarkAssistant.runPreflightCleanup...`);
-    try { qa.setStatus && qa.setStatus('预清理中...', 'running'); } catch {}
-    try { qa.setProgress && qa.setProgress('-'); } catch {}
+    try { g.attach(tag); } catch {}
+    warn(`★ [${tag}] 等待挂起标记（清理完成）...`);
     const t0 = Date.now();
-    let pr;
-    try { pr = await qa.runPreflightCleanup({ tag, listWaitMs: 30000, force: true }); }
-    catch (e) {
-      warn(`⚠️ [${tag}] 预清理异常`, e);
-      pr = { ok: false, skipped: true, reason: 'exception:' + String(e && e.message || e) };
+    const st = await g.waitReady(GATE_WAIT_MS);
+    if (!st) {
+      warn(`⛔ [${tag}] 等待挂起标记超时（${Math.round((Date.now() - t0) / 1000)}s）`);
+      return { ok: false, reason: 'gate-timeout', gate: g };
     }
-    warn(`★ [${tag}] 预清理返回（耗时 ${Date.now() - t0}ms）：${JSON.stringify(pr)}`);
-    if (!pr) { warn(`⛔ [${tag}] 预清理未返回，本轮不打开子任务`); return { ok: false, skipped: true, reason: 'no-result' }; }
-    if (pr.skipped) {
-      if (pr.reason === 'recently-done') { warn(`★ [${tag}] 近期已清理，视为完成`); return pr; }
-      if (pr.reason === 'paused') { warn(`⏸ [${tag}] 暂停中`); return pr; }
-      warn(`⛔ [${tag}] 预清理未完成（reason=${pr.reason || 'unknown'}）`);
-      try { qa.setStatus && qa.setStatus(`预清理未完成(${pr.reason || 'unknown'})`, 'error'); } catch {}
-      return pr;
+    warn(`★ [${tag}] 挂起门：state=${st.state}，round=${st.round}，note=${st.note || '-'}` +
+         `（等待 ${Math.round((Date.now() - t0) / 1000)}s）`);
+    if (st.state !== 'ready') return { ok: false, reason: 'gate-' + st.state, gate: g, snap: st };
+    if (st.cleanup && st.cleanup.ok !== true) {
+      warn(`⛔ [${tag}] 挂起门是"降级放行"（清理未完成：${st.cleanup.reason || '?'}），不打开子任务`);
+      return { ok: false, reason: 'gate-degraded', gate: g, snap: st };
     }
-    if (pr.ok !== true || pr.didRun !== true) {
-      warn(`⛔ [${tag}] 预清理返回异常（ok=${pr.ok}, didRun=${pr.didRun}）`);
-      return { ok: false, skipped: true, reason: 'didrun-false' };
-    }
-    warn(`★ [${tag}] 预清理：完成，继续`);
-    return pr;
+    return { ok: true, gate: g, snap: st };
   }
 
   let _autoRunning = false;
@@ -3726,38 +3762,52 @@
     try {
       const ts2 = Number(GM_getValue(GM_AUTO_TRIGGER, 0) || 0);
       if (ts2 !== autoTs) { log('自动触发：已被其他标签页消费，跳过'); return false; }
+      /* 步骤 2：夸克端开始，清理标识 */
       GM_setValue(GM_AUTO_TRIGGER, 0);
+      markAcgInvoked('auto-trigger');
       warn('★ 自动触发：开始处理（已消费标记）');
+
       if (qa.isPaused && qa.isPaused()) {
         warn('⏸ 自动任务：暂停中，关闭页面');
+        try { const g = getGate(); g && g.abort('paused'); } catch {}
         setTimeout(() => { try { window.close(); } catch {} }, 300);
         return true;
       }
+
       const pack = gmGet(GM_PENDING_URLS, null);
       const urls = (pack && Array.isArray(pack.urls)) ? pack.urls : null;
-      if (!urls || !urls.length) { warn('自动触发但 pending_urls 为空，跳过'); return true; }
-      warn(`★ 自动触发：从 pending_urls 读取 ${urls.length} 个 URL，先执行预清理`);
-      const pr = await ensurePreflightCleanupDone(qa, { tag: 'auto-trigger' });
-      if (pr && pr.skipped) {
-        if (pr.reason === 'paused') setTimeout(() => { try { window.close(); } catch {} }, 300);
-        warn(`⛔ 预清理未通过（reason=${pr.reason || 'skipped'}），本轮不打开子任务`);
+      if (!urls || !urls.length) {
+        warn('自动触发但 pending_urls 为空，跳过');
+        try { const g = getGate(); g && g.abort('no-urls'); } catch {}
         return true;
       }
-      warn('★ 预清理已通过，开始子任务');
-      let autoResult = null;
-      try { autoResult = await runSaveAllFlow(qa, urls); }
+
+      /* 步骤 3：等 QA 挂起标记 */
+      const wg = await waitGateReady('auto-trigger');
+      if (!wg.ok) {
+        warn(`⛔ 挂起门未就绪（${wg.reason}），本轮不打开子任务`);
+        try { qa.setStatus && qa.setStatus(`清理未就绪(${wg.reason})`, 'error'); } catch {}
+        if (wg.gate) { try { wg.gate.abort(wg.reason); } catch {} }
+        return true;
+      }
+
+      /* 步骤 4：依次执行子任务（个人页在此等待） */
+      warn(`★ 开始 ${urls.length} 个链接的子任务`);
+      let flow = null;
+      try { flow = await runSaveAllFlow(qa, urls); }
       catch (e) { warn('自动转存流程异常', e); }
-      if (!autoResult || autoResult.allConfirmed !== true) {
-        warn('⛔ 自动任务：未确认改名全部完成，保持本页');
+
+      /* 步骤 6：移除 QA 挂起标志 */
+      const g = wg.gate;
+      if (flow && flow.allConfirmed === true) {
+        warn('★ 子任务完成（含刷新/改名确认），放行挂起门 → 夸克助手执行自动下载');
+        releaseBusy();
+        try { g.release({ source: 'acg-trigger', urls: urls.length }); } catch (e) { warn('release 失败', e); }
         return true;
       }
-      warn(`★ 自动任务完成：下载已触发，${AUTO_CLOSE_DELAY_MS / 1000}s 后关闭本页`);
-      try { qa.setStatus && qa.setStatus(`下载已触发，${AUTO_CLOSE_DELAY_MS / 1000}s 后关闭`, 'done'); } catch {}
-      try { qa.setProgress && qa.setProgress('-'); } catch {}
-      setTimeout(() => {
-        warn('★ 自动任务：延时结束，关闭本页');
-        try { window.close(); } catch {}
-      }, AUTO_CLOSE_DELAY_MS);
+      warn('⛔ 未确认子任务完成，保持本页（不放行挂起门）');
+      releaseBusy();
+      try { g.abort((flow && flow.reason) || 'flow-unconfirmed'); } catch {}
       return true;
     } finally {
       _autoRunning = false;
@@ -3843,20 +3893,26 @@
       qa.setActions([
         {
           label: '▶️ 转存', color: '#09AAFF',
-          title: '先执行夸克侧预清理，再处理 pending_urls 或 bangumiData 里的分享，逐条转存；刷新后按 acg 名称+原始文件名改名',
+          title: '等夸克助手清理完成（挂起门就绪）后，逐条转存；刷新后按 acg 名称+原始文件名改名；确认后放行挂起门',
           onclick: async () => {
-            warn('★ [manual-trigger] 用户点击「▶️ 转存」，先执行预清理');
-            try {
-              const pr = await ensurePreflightCleanupDone(qa, { tag: 'manual-trigger' });
-              if (pr && pr.skipped) {
-                const reason = pr.reason || '';
-                if (reason !== 'recently-done' && reason !== 'paused') {
-                  alert(`预清理未通过：${reason}\n请检查控制台 [桥接]/[夸克助手] 日志。`);
-                  return;
-                }
-              }
-            } catch (e) { warn('⚠️ [manual-trigger] 预清理异常', e); }
-            return runSaveAllFlow(qa, null);
+            warn('★ [manual-trigger] 用户点击「▶️ 转存」，先等挂起门就绪');
+            markAcgInvoked('manual-trigger');
+            const wg = await waitGateReady('manual-trigger');
+            if (!wg.ok) {
+              alert(`清理未就绪：${wg.reason}\n请检查控制台 [桥接]/[夸克助手] 日志。`);
+              return;
+            }
+            let flow = null;
+            try { flow = await runSaveAllFlow(qa, null); }
+            catch (e) { warn('⚠️ [manual-trigger] 转存异常', e); }
+            const g = wg.gate;
+            if (flow && flow.allConfirmed === true) {
+              releaseBusy();
+              try { g.release({ source: 'manual-trigger' }); } catch {}
+            } else {
+              releaseBusy();
+              try { g.abort((flow && flow.reason) || 'manual-unconfirmed'); } catch {}
+            }
           },
         },
         {

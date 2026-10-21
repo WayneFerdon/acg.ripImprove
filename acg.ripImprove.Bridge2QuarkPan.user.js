@@ -3915,16 +3915,16 @@
             }
           },
         },
-        {
-          label: '🏷️ 测试改名', color: '#da9328',
-          title: '对当前可见的第一个文件试改名（用 acg名称+原始文件名 的新格式）',
-          onclick: () => runRenameSmokeTest(qa),
-        },
-        {
-          label: '🔍 改名诊断', color: '#8c8c8c',
-          title: '只报告改名入口的 DOM/按钮/勾选状态，不改动任何文件',
-          onclick: () => runRenameDiagnose(qa),
-        },
+        // {
+        //   label: '🏷️ 测试改名', color: '#da9328',
+        //   title: '对当前可见的第一个文件试改名（用 acg名称+原始文件名 的新格式）',
+        //   onclick: () => runRenameSmokeTest(qa),
+        // },
+        // {
+        //   label: '🔍 改名诊断', color: '#8c8c8c',
+        //   title: '只报告改名入口的 DOM/按钮/勾选状态，不改动任何文件',
+        //   onclick: () => runRenameDiagnose(qa),
+        // },
       ]);
       qa.setStatus('待机（个人页）');
       try {

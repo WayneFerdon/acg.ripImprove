@@ -1,14 +1,17 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.0.2
-// @description  夸克网盘平台层：个人页清理（等列表就绪 → 删过期文件 → 按删除后的列表清记录）→ unsafeWindow 挂起门 → 恢复后自动下载 → acg 唤起时关页；另含 UI + DOM 工具 + 暂停控制（转存逻辑交给桥接脚本）
+// @version      6.1.1
+// @description  夸克网盘平台层：个人页清理（等列表就绪 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后自动下载 → acg 唤起时等 FDM 下完再删云端并关页；含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
 // @updateURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        unsafeWindow
+// @grant        GM_xmlhttpRequest
+// @connect      127.0.0.1
+// @connect      localhost
 // @run-at       document-idle
 // @noframes
 // ==/UserScript==
@@ -32,6 +35,12 @@
   const SCAN_MS = 25000;           // 全量滚动扫描
   const NOT_ACG_GRACE_MS = 5000;   // 非 acg 唤起时，留给桥接自报身份的时间
   const CLOSE_DELAY_MS = 5000;     // 下载触发后关页延时
+
+  /* FDM（AutoCleanOrMoveFDMCache.pyw）本地桥：拿到"下载已完成"的信号后删云端文件 */
+  const FDM_BRIDGE = 'http://127.0.0.1:8732';
+  const FDM_POLL_MS = 60000;        // 空闲轮询
+  const FDM_WAIT_MS = 10000;        // 等下载完成时的轮询
+  const FDM_KEEPALIVE_MS = 30 * 60 * 1000;   // 等不到就最多留页 30 分钟
 
   const log = (...a) => console.log(PREFIX, ...a);
   const warn = (...a) => console.warn(PREFIX, ...a);
@@ -1174,7 +1183,7 @@
   /* 步骤 2：勾选 → 删除 → 确认 → await until 消失 → 刷新复核 */
   async function deleteFilesByFids(fids, opts = {}) {
     const tag = opts.tag || 'delete';
-    const out = { requested: fids.length, picked: 0, result: 'none', failed: [], still: [] };
+    const out = { requested: fids.length, picked: 0, pickedFids: [], result: 'none', failed: [], still: [] };
     if (!fids || !fids.length) return out;
     if (isAccountLimited()) {
       warn('⛔ 账号受限提示可见，跳过删除');
@@ -1212,6 +1221,7 @@
         break;
       }
       out.picked = picked.length;
+      out.pickedFids = picked.slice();
       if (!picked.length) {
         warn(`  没有勾选到任何目标文件（${remaining.length} 个都不在列表内）`);
         break;
@@ -1251,6 +1261,176 @@
 
     log(`★ [${tag}] 删除汇总：请求 ${out.requested}，勾选 ${out.picked}，剩余 ${out.still.length}（${out.result}）`);
     return out;
+  }
+
+  /* ===== FDM 下载完成 → 删云端文件 =====
+   * 页面看不到本地下载进度，真正的"完成"信号由本机 Python 工具
+   * （AutoCleanOrMoveFDMCache.pyw）提供：它监听 FDM 的 db.sqlite，搬运成功（已校验大小）
+   * 后登记到 quark_pending_delete.json，并通过 http://127.0.0.1:8732 暴露给这里。 */
+  function fdmAvailable() {
+    try { return typeof GM_xmlhttpRequest === 'function'; } catch { return false; }
+  }
+
+  function fdmRequest(path, opts = {}) {
+    return new Promise((resolve, reject) => {
+      if (!fdmAvailable()) { reject(new Error('GM_xmlhttpRequest 不可用')); return; }
+      const data = opts.data ? JSON.stringify(opts.data) : undefined;
+      GM_xmlhttpRequest({
+        method: opts.method || 'GET',
+        url: FDM_BRIDGE + path,
+        headers: data ? { 'Content-Type': 'application/json' } : {},
+        data,
+        timeout: opts.timeout || 4000,
+        onload: (r) => {
+          try { resolve(JSON.parse((r && r.responseText) || '{}')); }
+          catch { resolve(null); }
+        },
+        onerror: () => reject(new Error('bridge-unreachable')),
+        ontimeout: () => reject(new Error('bridge-timeout')),
+        onabort: () => reject(new Error('bridge-abort')),
+      });
+    });
+  }
+
+  function fdmStripDupSuffix(name) {
+    return String(name || '').replace(/\s*\(\d+\)(?=\.[^.]+$)/, '').trim();
+  }
+
+  /* 待删条目 → 下载记录里的 fid：先按签名链接精确比，再按 filename=/文件名 兜底 */
+  function fdmMatchRecord(recs, item) {
+    const url = String(item.url || '').trim();
+    if (url) {
+      for (const fid of Object.keys(recs)) {
+        const r = recs[fid];
+        if (r && r.link && String(r.link).trim() === url) return { fid, how: 'url' };
+      }
+    }
+    const names = new Set();
+    try {
+      const f = new URL(url).searchParams.get('filename');
+      if (f) names.add(f.trim());
+    } catch {}
+    if (item.name) names.add(String(item.name).trim());
+    const keys = new Set([...names].map(fdmStripDupSuffix).filter(Boolean));
+    if (!keys.size) return null;
+    for (const fid of Object.keys(recs)) {
+      const r = recs[fid];
+      if (!r || !r.name) continue;
+      if (keys.has(String(r.name).trim()) || keys.has(fdmStripDupSuffix(r.name))) {
+        return { fid, how: 'name' };
+      }
+    }
+    return null;
+  }
+
+  let _fdmBusy = false;
+  let _fdmFail = 0;
+  let _fdmNextAt = 0;
+
+  /* 纯执行：拉 /pending → 匹配 fid → 删云端 → 复核 → 清记录 + ack。
+   * 不做状态守卫/退避，供清理流程（流程开始）和定时同步共用 */
+  async function purgeFdmConfirmed(opts = {}) {
+    if (_fdmBusy) return { ok: false, reason: 'busy' };
+    if (!isListPage()) return { ok: false, reason: 'not-list-page' };
+    if (!fdmAvailable()) return { ok: false, reason: 'no-api' };
+    const tag = opts.tag || 'fdm';
+    _fdmBusy = true;
+    try {
+      let res;
+      try { res = await fdmRequest('/pending', { timeout: opts.timeout || 4000 }); }
+      catch (e) { return { ok: false, reason: 'bridge-unreachable', message: e.message }; }
+
+      if (!res || res.ok !== true) return { ok: false, reason: 'bad-response' };
+
+      const items = Array.isArray(res.items) ? res.items : [];
+      if (!items.length) return { ok: true, pending: 0, deleted: 0, acked: 0 };
+
+      const recs = loadDlRecords();
+      const plan = [];
+      for (const it of items) {
+        const m = fdmMatchRecord(recs, it);
+        if (m) plan.push({ fid: m.fid, how: m.how, item: it });
+        else log(`☁️ FDM 已完成「${it.name || it.url}」，但没有对应下载记录，先留着`);
+      }
+      if (!plan.length) return { ok: true, pending: items.length, deleted: 0, acked: 0 };
+
+      log(`☁️ [${tag}] 云端待删 ${plan.length} 个：${plan.map(p => p.item.name || p.fid.slice(0, 8)).join('、')}`);
+      const del = await deleteFilesByFids(plan.map(p => p.fid), { tag });
+      const picked = new Set(del.pickedFids || []);
+      const still = new Set(del.still || []);
+      const gone = plan.filter(p => picked.has(p.fid) && !still.has(p.fid));
+
+      let acked = 0;
+      if (gone.length) {
+        clearDlRecordsFids(gone.map(p => p.fid));
+        refreshGray();
+        try {
+          const a = await fdmRequest('/ack', { method: 'POST', data: { urls: gone.map(p => p.item.url) } });
+          acked = (a && a.acked) || 0;
+        } catch (e) { warn('☁️ ack 失败（下轮会重试）', e); }
+      }
+      log(`☁️ [${tag}] 云端删除：确认 ${gone.length} / 计划 ${plan.length}（ack ${acked}）`);
+      return { ok: true, pending: items.length, deleted: gone.length, acked };
+    } catch (e) {
+      warn('☁️ 同步 FDM 完成状态异常', e);
+      return { ok: false, reason: String((e && e.message) || e) };
+    } finally {
+      _fdmBusy = false;
+    }
+  }
+
+  /* 定时/等待用：加状态守卫与失败退避（清理流程内部直接调 purgeFdmConfirmed） */
+  async function syncFdmFinishedDeletes(opts = {}) {
+    if (!isListPage()) return { ok: false, reason: 'not-list-page' };
+    if (isPaused()) return { ok: false, reason: 'paused' };
+    if (!fdmAvailable()) return { ok: false, reason: 'no-api' };
+    if (_fdmBusy) return { ok: false, reason: 'busy' };
+    if (!opts.force && Date.now() < _fdmNextAt) return { ok: false, reason: 'backoff' };
+    if (GATE.state === 'cleanup' || GATE.state === 'downloading' || downloadRunning) {
+      return { ok: false, reason: 'busy-local' };
+    }
+    const r = await purgeFdmConfirmed(opts);
+    if (r.ok) { _fdmFail = 0; _fdmNextAt = 0; return r; }
+    if (r.reason === 'bridge-unreachable') {
+      _fdmFail++;
+      const wait = Math.min(10 * 60 * 1000, 60 * 1000 * _fdmFail);
+      _fdmNextAt = Date.now() + wait;
+      if (_fdmFail === 1) log(`☁️ 本地桥不可用（${r.message || 'unreachable'}），${Math.round(wait / 1000)}s 后再试`);
+    }
+    return r;
+  }
+
+  async function fdmAlive() {
+    if (!fdmAvailable()) return false;
+    try {
+      const r = await fdmRequest('/pending', { timeout: 2500 });
+      return !!(r && r.ok === true);
+    } catch { return false; }
+  }
+
+  /* acg 唤起时：等这些 fid 在云端被删掉（记录消失即成功），最多 FDM_KEEPALIVE_MS */
+  async function waitFdmThenPurge(fids) {
+    const left = new Set(fids.filter(Boolean));
+    const total = left.size;
+    const t0 = Date.now();
+    if (!total) return { total: 0, left: 0 };
+    let unreachable = 0;
+    while (left.size && Date.now() - t0 < FDM_KEEPALIVE_MS) {
+      if (isPaused()) { warn('⏸ 暂停：停止等待 FDM'); break; }
+      await sleep(FDM_WAIT_MS, true);
+      const r = await syncFdmFinishedDeletes({ force: true }).catch(() => null);
+      if (r && r.reason === 'bridge-unreachable') {
+        if (++unreachable >= 2) { warn('☁️ 本地桥断开，停止等待'); break; }
+      } else unreachable = 0;
+      const recs = loadDlRecords();
+      for (const fid of [...left]) if (!recs[fid]) left.delete(fid);   // 记录被清 = 云端已删
+      setStatus(`等 FDM 完成：剩 ${left.size} 个`, 'running');
+      setProgress(`${total - left.size} / ${total}`);
+    }
+    if (left.size) warn(`☁️ ${left.size}/${total} 个没等到 FDM 完成，先关页（下次打开个人页会继续删）`);
+    else log(`☁️ ${total} 个下载完成并已删云端`);
+    setProgress('-');
+    return { total, left: left.size };
   }
 
   function isListLoaded() { return !isLoadingAnimPresent(); }
@@ -1404,7 +1584,32 @@
       log(`★ [${tag}] 重试后：文件 ${scan.count} / 数据行 ${scan.allCount} / 推断 ${scan.total}，可信=${scanTrust(scan)}`);
     }
 
-    /* ---- 2. 删除过期文件 ---- */
+    /* ---- 1.5 先走 FDM 桥：本地已确认下载完成的，立刻删云端 ----
+     * 顺序很重要：先删"确证本地有完整副本"的，再按 24h TTL 兜底删剩下的，
+     * 避免 TTL 先动手把还没下到本地的文件删掉。 */
+    let fdmDeleted = 0;
+    let fdmState = 'skipped';
+    if (fdmAvailable()) {
+      const pg = await purgeFdmConfirmed({ tag: tag + '-fdm' });
+      if (pg.ok) {
+        fdmState = pg.pending ? `确认删除 ${pg.deleted}/${pg.pending}` : '无待删';
+        if (pg.deleted > 0) {
+          fdmDeleted = pg.deleted;
+          log(`★ [${tag}] FDM 已完成并删除云端 ${pg.deleted} 个，重新扫描列表后继续`);
+          const rescan = await scanAllRowsWithScroll({ tag: tag + '-fdm-after', maxMs: opts.scanMs });
+          if (rescan && scanTrust(rescan)) scan = rescan;
+          else warn(`⚠️ [${tag}] FDM 删除后重扫不可信，沿用删除前的扫描结果`);
+        }
+      } else if (pg.reason === 'bridge-unreachable') {
+        fdmState = '桥不可达';
+        log(`★ [${tag}] 本地桥不可达，跳过 FDM 确认（按 24h TTL 兜底）`);
+      } else {
+        fdmState = pg.reason || 'unknown';
+        warn(`⚠️ [${tag}] FDM 确认跳过（${fdmState}）`);
+      }
+    }
+
+    /* ---- 2. 删除过期文件（TTL 兜底） ---- */
     const recs = loadDlRecords();
     const expired = [];
     for (const fid of Object.keys(recs)) {
@@ -1453,13 +1658,14 @@
       cleared = await clearRecordsMissingFromList(scan.byFid, scope);
     }
     const ms = Date.now() - t0;
-    log(`★ [${tag}] 清理完成：过期文件 ${expired.length}（删掉 ${del.deleted}）` +
+    log(`★ [${tag}] 清理完成：FDM 确认 ${fdmDeleted}（${fdmState}），过期文件 ${expired.length}（删掉 ${del.deleted}）` +
         `，清记录 ${cleared.removed.length}（保留 ${cleared.kept}，待复核 ${cleared.unverified}）` +
         `，文件 ${scan.count} / 数据行 ${scan.allCount}，耗时 ${ms}ms`);
     refreshGray();
     return {
       ok: true, scope, rows: scan.count, allRows: scan.allCount, empty: scan.empty,
       expired: expired.length, deleted: del.deleted, still: del.still,
+      fdmDeleted, fdmState,
       records: cleared.removed.length, recordNames: cleared.names,
       kept: cleared.kept, unverified: cleared.unverified,
       noScope: cleared.noScope, ms,
@@ -1625,8 +1831,20 @@
         gateSet('downloading', decision.kind === 'self' ? '非 acg 唤起' : '桥接已放行');
         clearBridgeBusy();
         setStatus('自动下载中...', 'running');
-        try { await autoDownloadWorkflow({ ignoreBusy: true }); }
+        let dlResult = null;
+        try { dlResult = await autoDownloadWorkflow({ ignoreBusy: true }); }
         catch (e) { warn('自动下载异常', e); }
+
+        /* ---- 6.5 等 FDM 真正下载完，再删云端副本 ---- */
+        const dlFids = (dlResult && Array.isArray(dlResult.downloadedFids)) ? dlResult.downloadedFids : [];
+        if (dlFids.length && await fdmAlive()) {
+          gateSet('wait-fdm', `等 FDM 下载完成（${dlFids.length} 个）`);
+          setStatus(`等 FDM 下载完成（${dlFids.length} 个）...`, 'running');
+          await waitFdmThenPurge(dlFids);
+          log('☁️ FDM 等待结束');
+        } else if (dlFids.length) {
+          log(`☁️ 本地桥不可达，跳过"下载完成后删云端"（${dlFids.length} 个），下次打开个人页会补删`);
+        }
 
         /* ---- 7. acg 唤起：执行关闭页面流程 ---- */
         if (GATE.acg) {
@@ -1738,7 +1956,8 @@
         const r = await runCleanupRound({ tag: 'manual', manual: true });
         refreshGray();
         if (r.ok) {
-          alert(`清理完成\n\n过期文件：${r.expired}（删掉 ${r.deleted}）`
+          alert(`清理完成\n\nFDM 已确认完成：${r.fdmDeleted || 0}（${r.fdmState || '-'}）`
+                + `\n过期文件：${r.expired}（删掉 ${r.deleted}）`
                 + (r.still && r.still.length ? `\n删除后仍在：${r.still.join('、')}` : '')
                 + `\n清理记录：${r.records}`
                 + (r.recordNames && r.recordNames.length ? `\n${r.recordNames.slice(0, 10).join('、')}` : '')
@@ -1791,7 +2010,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.0.2',
+    version: '6.1.1',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -1810,6 +2029,7 @@
     /* 新流程 */
     gate: GATE,
     runCleanupRound,
+    syncFdmFinishedDeletes,
     waitListSettled,
     scanAllRowsWithScroll,
     deleteFilesByFids,
@@ -1824,12 +2044,15 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.0.2`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.1.1`);
       runPersonalController();
+      /* 空闲时也定期补删：上次没等到 FDM 完成的、或没开页面时完成的 */
+      setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
+      setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.0.2');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.1.1');
     } else {
-      log('平台层就绪（其他页）v6.0.2');
+      log('平台层就绪（其他页）v6.1.1');
     }
     startGrayPolling();
   })();

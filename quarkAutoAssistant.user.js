@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.1.1
-// @description  夸克网盘平台层：个人页清理（等列表就绪 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后自动下载 → acg 唤起时等 FDM 下完再删云端并关页；含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
+// @version      6.2.0
+// @description  夸克网盘平台层：个人页清理（等列表就绪 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后自动下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
 // @updateURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -38,9 +38,7 @@
 
   /* FDM（AutoCleanOrMoveFDMCache.pyw）本地桥：拿到"下载已完成"的信号后删云端文件 */
   const FDM_BRIDGE = 'http://127.0.0.1:8732';
-  const FDM_POLL_MS = 60000;        // 空闲轮询
-  const FDM_WAIT_MS = 10000;        // 等下载完成时的轮询
-  const FDM_KEEPALIVE_MS = 30 * 60 * 1000;   // 等不到就最多留页 30 分钟
+  const FDM_POLL_MS = 60000;        // 后台轮询间隔（FDM 完成 → 删云端，异步）
 
   const log = (...a) => console.log(PREFIX, ...a);
   const warn = (...a) => console.warn(PREFIX, ...a);
@@ -1400,39 +1398,6 @@
     return r;
   }
 
-  async function fdmAlive() {
-    if (!fdmAvailable()) return false;
-    try {
-      const r = await fdmRequest('/pending', { timeout: 2500 });
-      return !!(r && r.ok === true);
-    } catch { return false; }
-  }
-
-  /* acg 唤起时：等这些 fid 在云端被删掉（记录消失即成功），最多 FDM_KEEPALIVE_MS */
-  async function waitFdmThenPurge(fids) {
-    const left = new Set(fids.filter(Boolean));
-    const total = left.size;
-    const t0 = Date.now();
-    if (!total) return { total: 0, left: 0 };
-    let unreachable = 0;
-    while (left.size && Date.now() - t0 < FDM_KEEPALIVE_MS) {
-      if (isPaused()) { warn('⏸ 暂停：停止等待 FDM'); break; }
-      await sleep(FDM_WAIT_MS, true);
-      const r = await syncFdmFinishedDeletes({ force: true }).catch(() => null);
-      if (r && r.reason === 'bridge-unreachable') {
-        if (++unreachable >= 2) { warn('☁️ 本地桥断开，停止等待'); break; }
-      } else unreachable = 0;
-      const recs = loadDlRecords();
-      for (const fid of [...left]) if (!recs[fid]) left.delete(fid);   // 记录被清 = 云端已删
-      setStatus(`等 FDM 完成：剩 ${left.size} 个`, 'running');
-      setProgress(`${total - left.size} / ${total}`);
-    }
-    if (left.size) warn(`☁️ ${left.size}/${total} 个没等到 FDM 完成，先关页（下次打开个人页会继续删）`);
-    else log(`☁️ ${total} 个下载完成并已删云端`);
-    setProgress('-');
-    return { total, left: left.size };
-  }
-
   function isListLoaded() { return !isLoadingAnimPresent(); }
 
   async function clearAllSelection() {
@@ -1835,15 +1800,16 @@
         try { dlResult = await autoDownloadWorkflow({ ignoreBusy: true }); }
         catch (e) { warn('自动下载异常', e); }
 
-        /* ---- 6.5 等 FDM 真正下载完，再删云端副本 ---- */
+        /* ---- 6.5 FDM 完成后的云端删除：异步，绝不阻塞本页 ----
+         * 大文件可能十几分钟，页面不能等：
+         *  · acg 唤起：走完下载直接进入关页流程；遗留的待删项等下次手动打开个人页时补删；
+         *  · 手动打开：本页常驻，后台轮询（FDM_POLL_MS）发现完成即删，只刷置灰、不打断界面。 */
         const dlFids = (dlResult && Array.isArray(dlResult.downloadedFids)) ? dlResult.downloadedFids : [];
-        if (dlFids.length && await fdmAlive()) {
-          gateSet('wait-fdm', `等 FDM 下载完成（${dlFids.length} 个）`);
-          setStatus(`等 FDM 下载完成（${dlFids.length} 个）...`, 'running');
-          await waitFdmThenPurge(dlFids);
-          log('☁️ FDM 等待结束');
-        } else if (dlFids.length) {
-          log(`☁️ 本地桥不可达，跳过"下载完成后删云端"（${dlFids.length} 个），下次打开个人页会补删`);
+        if (dlFids.length) {
+          log(`☁️ 下载已触发 ${dlFids.length} 个；FDM 完成后的云端删除交给后台轮询（不阻塞）`);
+          if (!GATE.acg) {
+            setTimeout(() => { syncFdmFinishedDeletes({ force: true }).catch(() => {}); }, 5000);
+          }
         }
 
         /* ---- 7. acg 唤起：执行关闭页面流程 ---- */
@@ -2010,7 +1976,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.1.1',
+    version: '6.2.0',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -2044,15 +2010,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.1.1`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.2.0`);
       runPersonalController();
-      /* 空闲时也定期补删：上次没等到 FDM 完成的、或没开页面时完成的 */
+      /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
+       * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.1.1');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.2.0');
     } else {
-      log('平台层就绪（其他页）v6.1.1');
+      log('平台层就绪（其他页）v6.2.0');
     }
     startGrayPolling();
   })();

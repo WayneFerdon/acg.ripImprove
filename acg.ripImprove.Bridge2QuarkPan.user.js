@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.13.1
+// @version 3.14.0
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -376,11 +376,22 @@
     return true;
   }
 
-  function collectShareUrls(bd) {
+  /* “已播出”模式：只看播出时间（_airDate = 下集实际放送时刻），
+   * 不看资源时间（资源列写成 DHHMM 周更时段时，shouldIncludeRow 会优先用那个时段）。
+   * 没有 _airDate 的行退回老规则，避免整行被漏掉。 */
+  function shouldIncludeRowAired(row) {
+    if (!row) return true;
+    const airTs = row._airDate;
+    if (typeof airTs === 'number' && Number.isFinite(airTs) && airTs > 0) return airTs <= Date.now();
+    return shouldIncludeRow(row);
+  }
+
+  function collectShareUrls(bd, opts = {}) {
     if (!bd || !Array.isArray(bd.rows)) return [];
+    const include = opts.onlyAired ? shouldIncludeRowAired : shouldIncludeRow;
     const urls = new Set();
     for (const row of bd.rows) {
-      if (!shouldIncludeRow(row)) continue;
+      if (!include(row)) continue;
       for (const f of ['资源', '规则']) {
         const raw = expandUrl(String(row[f] || '').trim(), row);
         const m = raw.match(/https?:\/\/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)([^\s]*)/);
@@ -3486,12 +3497,12 @@
 
   /* ===== acg.rip 端 ===== */
   function runQuarkAutoTrigger(opts = {}) {
-    const { force = false } = opts;
+    const { force = false, onlyAired = false } = opts;
     const folderId = getFolderId().trim();
     if (!folderId) return { triggered: false, reason: 'no-folder' };
     const bd = loadBangumiData();
     if (!bd || !Array.isArray(bd.rows)) return { triggered: false, reason: 'no-data' };
-    const urls = collectShareUrls(bd);
+    const urls = collectShareUrls(bd, { onlyAired });
     if (!urls.length) return { triggered: false, reason: 'no-urls' };
     const state = gmGet(GM_CD, {}) || {};
     const now = Date.now();
@@ -3503,7 +3514,7 @@
       if (!force && now - s.ts < cd) { skippedByCD++; continue; }
       need.push(u);
     }
-    log(`触发：CD 内跳过 ${skippedByCD}，待检查 ${need.length}（共 ${urls.length} 个 URL）`);
+    log(`触发${onlyAired ? '(已播出)' : ''}：CD 内跳过 ${skippedByCD}，待检查 ${need.length}（共 ${urls.length} 个 URL）`);
     if (!need.length) return { triggered: false, reason: 'all-cd', total: urls.length };
     for (const u of need) {
       const s = state[u] || { ts: 0, attempts: 0 };
@@ -3531,31 +3542,81 @@
     tryInject();
   }
 
-  function injectTriggerQuarkButton() {
-    const airedBtn = document.getElementById('openAiredResourceBtn');
-    if (!airedBtn) return;
-    const bar = airedBtn.parentElement;
-    if (!bar) return;
-    if (bar.querySelector('#acgrip-trigger-quark-btn')) return;
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.id = 'acgrip-trigger-quark-btn';
-    btn.textContent = '立即转存';
-    btn.title = '立即触发夸克转存（忽略 CD）';
-    btn.addEventListener('click', () => {
+  /* “已播出”按钮可能有多个（不同工具条/不同版本），文本恰为“已播出”的都算锚点 */
+  function findAiredButtonAnchors() {
+    const anchors = [];
+    const seen = new Set();
+    const push = (el) => {
+      if (!el || !el.isConnected) return;
+      if (el.id && el.id.indexOf('acgrip-') === 0) return;
+      if (seen.has(el)) return;
+      seen.add(el);
+      anchors.push(el);
+    };
+    push(document.getElementById('openAiredResourceBtn'));
+    for (const el of document.querySelectorAll('button, a')) {
+      const t = (el.textContent || '').replace(/\s+/g, '');
+      if (t === '已播出') push(el);
+    }
+    return anchors;
+  }
+
+  function makeQuarkTriggerHandler(onlyAired) {
+    return () => {
       try {
-        const r = runQuarkAutoTrigger({ force: true });
-        if (r && r.triggered) alert(`已打开夸克处理 ${r.count} 个链接`);
-        else {
+        const r = runQuarkAutoTrigger({ force: true, onlyAired });
+        if (r && r.triggered) {
+          alert(`已打开夸克处理 ${r.count} 个链接${onlyAired ? '（已播出）' : ''}`);
+        } else {
           const reasonMap = {
             'no-folder': '未设置夸克文件夹路径', 'no-data': '无 bangumiData',
-            'no-urls': '清单中没有夸克链接', 'all-cd': '所有链接仍在 CD 内',
+            'no-urls': onlyAired ? '清单中没有“已播出”且含夸克链接的条目' : '清单中没有夸克链接',
+            'all-cd': '所有链接仍在 CD 内',
           };
           alert('未触发：' + (reasonMap[r && r.reason] || (r && r.reason) || '未知原因'));
         }
       } catch (e) { alert('转存触发失败：' + (e && e.message || e)); }
+    };
+  }
+
+  function injectTriggerQuarkButton() {
+    const primary = document.getElementById('openAiredResourceBtn');
+    if (!primary) return;
+    /* 已注入且锚点未被重建 → 直接返回。
+     * 这个方法挂在 MutationObserver 上，编辑表格时 DOM 会高频变动，
+     * 不能每次都对整页 button/a 做 querySelectorAll。 */
+    const mainExists = document.getElementById('acgrip-trigger-quark-btn');
+    const airedExists = document.getElementById('acgrip-trigger-quark-aired-btn');
+    if (mainExists && airedExists && airedExists.previousElementSibling === primary) return;
+
+    const anchors = findAiredButtonAnchors();
+    if (!anchors.length) return;
+
+    /* ① 原有“立即转存”：仍挂在工具条末尾 */
+    const bar = anchors[0].parentElement;
+    if (bar && !bar.querySelector('#acgrip-trigger-quark-btn')) {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.id = 'acgrip-trigger-quark-btn';
+      btn.textContent = '立即转存';
+      btn.title = '立即触发夸克转存（忽略 CD）';
+      btn.addEventListener('click', makeQuarkTriggerHandler(false));
+      bar.appendChild(btn);
+    }
+
+    /* ② 每个“已播出”后面各挂一个“立即转存（已播出）” */
+    anchors.forEach((anchor, i) => {
+      const id = i === 0 ? 'acgrip-trigger-quark-aired-btn' : `acgrip-trigger-quark-aired-btn-${i + 1}`;
+      if (document.getElementById(id)) return;
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.id = id;
+      btn.dataset.acgripAired = '1';
+      btn.textContent = '立即转存（已播出）';
+      btn.title = '立即触发夸克转存：只挑“播出时间已过”的条目（忽略 CD）';
+      btn.addEventListener('click', makeQuarkTriggerHandler(true));
+      anchor.insertAdjacentElement('afterend', btn);
     });
-    bar.appendChild(btn);
   }
 
   function injectQuarkSection(host) {
@@ -3662,7 +3723,7 @@
     setInterval(() => { try { sweepObsoleteRecords(); } catch (e) { warn('过期清理失败', e); } }, 6 * 60 * 60 * 1000);
     try {
       unsafeWindow.acgripQuarkBridge = {
-        version: '1.3.1',
+        version: '1.4.0',
         trigger: (opts = {}) => runQuarkAutoTrigger({ force: opts.force !== false }),
         status: () => {
           const state = gmGet(GM_CD, {}) || {};

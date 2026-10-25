@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.0
+// @version 3.14.3
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -1669,7 +1669,23 @@
           return { ok: false, reason: `clear-incomplete(${getHeaderCheckState(doc)})` };
         }
       }
-      await until(() => getSelectedFids(doc).length === 0, 100, 1500);
+      let noSel = await until(() => getSelectedFids(doc).length === 0, 100, 1500);
+      if (!noSel) {
+        /* 表头清不掉时逐行取消残留勾选。残留的上一行就是"改错文件"的另一大来源 */
+        for (const r of [...doc.querySelectorAll('tr.ant-table-row-selected')]) {
+          try {
+            const lbl = r.querySelector('label.ant-checkbox-wrapper');
+            if (lbl) qa.realClick(lbl);
+            else { const cb = r.querySelector('input.ant-checkbox-input'); if (cb) cb.click(); }
+          } catch {}
+        }
+        noSel = await until(() => getSelectedFids(doc).length === 0, 100, 1500);
+      }
+      if (!noSel) {
+        const n = getSelectedFids(doc).length;
+        if (attempt < 2) { await sleep(500, true); continue; }
+        return { ok: false, reason: `residual-selection(${n})` };
+      }
       let row = (file.row && file.row.isConnected) ? file.row : findRowByFid(file.fid, doc);
       if (!row) {
         try {
@@ -1759,6 +1775,88 @@
       }
     } catch {}
   }
+  /* 关闭残留的行内改名框 / 弹窗。
+   * 上一轮改名若没提交干净，残留的编辑框会让本轮打开的是"上一个文件"的编辑器
+   * —— 这正是"把上一个改名条目当成这一个"的根因之一。 */
+  async function closeStrayRenameEditors(qa, doc = document) {
+    let closedAny = false;
+    try {
+      const inline = [...doc.querySelectorAll('input.input-edit, input.ant-input.input-edit, .filename input.ant-input')]
+      .filter(i => !isRenamePanel(i) && i.isConnected && _isVisible(i));
+      for (const i of inline) {
+        try { pressKeyOn(i, 'Escape'); } catch {}
+        try { i.blur(); } catch {}
+      }
+      if (inline.length) {
+        closedAny = true;
+        await until(() => !inline.some(i => i.isConnected && _isVisible(i)), 120, 1500);
+        log(` 🧹 清理了 ${inline.length} 个残留的行内改名框`);
+      }
+    } catch {}
+    try {
+      const stray = [...doc.querySelectorAll('.ant-modal, [role="dialog"], .ant-drawer-content')]
+      .filter(el => !isRenamePanel(el) && el.isConnected && _isVisible(el));
+      for (const el of stray) {
+        const close = el.querySelector('.ant-modal-close, .ant-drawer-close');
+        if (close) { try { qa.realClick(close); } catch {} }
+      }
+      if (stray.length) {
+        closedAny = true;
+        await until(() => !stray.some(el => el.isConnected && _isVisible(el)), 150, 2000);
+        if (stray.some(el => el.isConnected && _isVisible(el))) { try { pressKeyOn(doc.body, 'Escape'); } catch {} }
+        await sleep(150, true);
+        log(` 🧹 清理了 ${stray.length} 个残留弹窗`);
+      }
+    } catch {}
+    return closedAny;
+  }
+
+  /* 改名弹窗里的值可能不带扩展名（或空格/大小写有差异），这里做宽松比对。
+   * 只剥离"已知扩展名"，避免把 "Show.S02E05" 这类带点的名字误砍掉一段 */
+  const KNOWN_EXT_RE = /\.(mp4|mkv|avi|mov|flv|wmv|webm|m4v|m2ts|ts|rmvb|rm|mpg|mpeg|ogm|strm|iso|ass|ssa|srt|sub|idx|zip|rar|7z|tar|gz|pdf|txt)$/i;
+  function stripKnownExt(s) {
+    let v = String(s ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+    const m = v.match(KNOWN_EXT_RE);
+    if (m) v = v.slice(0, v.length - m[0].length);
+    return getComparableFileName(v.trim());
+  }
+  function sameNameIgnoreExt(a, b) {
+    const x = stripKnownExt(a), y = stripKnownExt(b);
+    return !!x && x === y;
+  }
+
+  /* 改名提交失败时，把弹窗里的报错文字抓出来（重名 / 非法字符 / 超长…） */
+  function readRenameErrorText(scope, doc = document) {
+    const seen = [];
+    const push = t => {
+      const s = String(t ?? '').replace(/[\u200B-\u200D\uFEFF]/g, '').replace(/\s+/g, ' ').trim();
+      if (s && s.length <= 60 && !seen.includes(s)) seen.push(s);
+    };
+    const roots = [];
+    try { if (scope && scope.isConnected) roots.push(scope); } catch {}
+    try { if (doc && doc.body) roots.push(doc.body); } catch {}
+    const sels = [
+      '.ant-form-item-explain-error', '.ant-message-error', '.ant-message-notice-content',
+      '.ant-alert-error', '.ant-typography-danger', '.error-msg', '.ant-modal-body',
+    ];
+    const keys = ['已存在', '重名', '重复', '不能为空', '不能超过', '非法', '不支持', '失败', '错误', '无效'];
+    for (const root of roots) {
+      for (const sel of sels) {
+        let els = [];
+        try { els = [...root.querySelectorAll(sel)]; } catch { continue; }
+        for (const el of els) {
+          try {
+            if (!_isVisible(el)) continue;
+            if (el.closest && el.closest('#quark-auto-panel, #quark-share-progress')) continue;
+            const t = (el.textContent || '').replace(/\s+/g, ' ').trim();
+            if (keys.some(k => t.includes(k))) push(t);
+          } catch {}
+        }
+      }
+    }
+    return seen.length ? seen[0] : '';
+  }
+
   async function openRenameViaToolbar(qa, file, originalName, doc = document) {
     if (!file || !file.fid) return null;
     const sel = await resetSelectionToRow(qa, file, doc);
@@ -1788,19 +1886,43 @@
     await dismissStrayModals(qa, before, doc);
     return null;
   }
-  async function openRenameDialog(qa, row, nameCell, originalName, doc = document) {
+  /* fid 是唯一权威：按名字重新找行可能命中"上一个改名条目"（同名/排序变化） */
+  async function openRenameDialog(qa, row, nameCell, originalName, doc = document, fid = '') {
+    let rowFid = String(fid || '').trim();
+    if (rowFid) {
+      const byFid = findRowByFid(rowFid, doc);
+      if (byFid && byFid.isConnected) {
+        if (row !== byFid) log(`   ↳ 改名：按 fid 定位行（${rowFid}）`);
+        row = byFid;
+        nameCell = getNameElInRow(row);
+      }
+    }
     if (!row || !row.isConnected) {
       const fresh = findListRowByName(qa, originalName, doc);
       row = fresh && fresh.row;
       if (!nameCell || !nameCell.isConnected) nameCell = getNameElInRow(row);
     }
     if (!row || !row.isConnected) { warn(` ⚠️ 改名：找不到该行 —— ${originalName}`); return null; }
-    const file = findListRowByName(qa, originalName, doc);
+    if (!rowFid && row.getAttribute) rowFid = String(row.getAttribute('data-row-key') || '');
+
+    let file = rowFid ? { fid: rowFid, row, name: originalName } : null;
+    if (!file || !file.fid) file = findListRowByName(qa, originalName, doc);
     if (!file || !file.fid) {
       warn(` ⚠️ 改名：找不到带 fid 的行 —— ${originalName}`);
       return null;
     }
-    return await openRenameViaToolbar(qa, file, originalName, doc);
+
+    /* 防错行：fid 行的真实名与计划名不一致时，以 fid 行的真实名为准并告警
+     * （绝不反过来按名字去匹配别的行，那正是"用成上一个条目"的来源） */
+    if (rowFid) {
+      const rowName = readRowRealName(rowFid, doc);
+      if (rowName && getComparableFileName(rowName) !== getComparableFileName(originalName)) {
+        warn(` ⚠️ 改名：fid ${rowFid} 的行名是「${rowName}」，与计划名「${originalName}」不一致 —— 以行内真实名为准`);
+        file = { fid: rowFid, row, name: rowName };
+        originalName = rowName;
+      }
+    }
+    return await openRenameViaToolbar(qa, file, file.name || originalName, doc);
   }
   function findInlineRenameInput(originalName = '', doc = document) {
     const want = getComparableFileName(originalName);
@@ -1810,7 +1932,8 @@
     if (!originalName) return inputs[0];
     const exact = inputs.find(i => String(i.value ?? '') === originalName);
     if (exact) return exact;
-    return inputs.find(i => getComparableFileName(i.value) === want) || null;
+    return inputs.find(i => getComparableFileName(i.value) === want)
+        || inputs.find(i => sameNameIgnoreExt(i.value, originalName)) || null;
   }
   function isEditorOpen(input) {
     return !!(input && input.isConnected && _isVisible(input));
@@ -1972,10 +2095,11 @@
       }
     }
     if (!closed) {
+      const errText = readRenameErrorText(input.closest('.filename, .file-click-wrap, td') || doc.body, doc);
       pressKeyOn(input, 'Escape');
       await until(() => editorClosed(), 120, 1500);
-      warn(' ⚠️ 改名：行内编辑未提交，已按 Esc 放弃');
-      return 'fail';
+      warn(` ⚠️ 改名：行内编辑未提交${errText ? `，提示「${errText}」` : ''}，已按 Esc 放弃`);
+      return errText ? `submit-failed(${errText})` : 'submit-failed';
     }
     log(' ⏳ 改名：已提交，等待列表确认新名…');
     return 'submitted';
@@ -2003,13 +2127,31 @@
     const collect = () => (typeof scope.querySelectorAll === 'function' && !(scope.tagName === 'INPUT'))
       ? [...scope.querySelectorAll(inpSel)].filter(i => !isRenamePanel(i))
       : [scope];
-    const inputs = collect();
     const want = getComparableFileName(originalName);
-    const input = inputs.find(i => {
-      const v = String(i.value ?? '');
-      return v && (v === originalName || getComparableFileName(v) === want);
-    }) || inputs[0];
-    if (!input) { warn(' ⚠️ 改名：找不到改名输入框'); return false; }
+    /* 必须找到"值为待改名文件当前名"的输入框才允许提交。
+     * 以前兜底用 inputs[0]，一旦弹窗里是上一个文件／预填值不同，就会把别的文件改掉。
+     * 弹窗刚打开时值可能还没渲染，所以这里要等一等再判定。 */
+    let input = null;
+    let matches = [];
+    let vals = [];
+    const t0 = Date.now();
+    while (Date.now() - t0 < 1500) {
+      const ins = collect();
+      matches = ins.filter(i => {
+        const v = String(i.value ?? '');
+        return v && (v === originalName || getComparableFileName(v) === want || sameNameIgnoreExt(v, originalName));
+      });
+      if (matches.length) break;
+      vals = ins.map(i => String(i.value ?? ''));
+      await sleep(150, true);
+    }
+    if (!matches.length) {
+      warn(` ⚠️ 改名：改名框里的名字不是「${originalName}」—— 拒绝提交，避免改错文件。`
+           + (vals.filter(Boolean).length ? `（框内实际为：${vals.filter(Boolean).join(' | ')}）` : '（框内为空）'));
+      return 'wrong-row';
+    }
+    if (matches.length > 1) log(`   ↳ 改名框内有 ${matches.length} 个同名输入框，取第一个`);
+    input = matches[0];
     const setInputValue = v => {
       try { input.focus(); } catch {}
       const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
@@ -2048,10 +2190,17 @@
       150, 6000
     );
     if (!closed) {
-      warn(' ⚠️ 改名：确认后弹窗未关闭，已按 Esc 收尾');
+      /* 弹窗不关通常是服务端拒绝：重名 / 非法字符 / 超长。把报错文字带出去 */
+      const errText = readRenameErrorText(modalEl || scope, doc);
+      const dup = await findExactNameAnywhere(qa, newName, doc, 4000);
+      const dupFid = dup.found && dup.hit ? dup.hit.fid : '';
+      const looksDup = !!dupFid && (!fid || dupFid !== fid);
+      warn(` ⚠️ 改名：确认后弹窗未关闭${errText ? `，提示「${errText}」` : ''}`
+           + `${looksDup ? `；目标名已被占用（fid ${dupFid}）` : ''}`);
       try { pressKeyOn(doc.body, 'Escape'); } catch {}
       await sleep(200, true);
-      return 'fail';
+      if (looksDup) return `target-name-exists${errText ? `(${errText})` : ''}`;
+      return errText ? `submit-failed(${errText})` : 'submit-failed';
     }
     log(' ⏳ 改名：弹窗已提交，等待列表确认新名…');
     return 'submitted';
@@ -2081,16 +2230,18 @@
    *   ok=false → 明确失败（改名没成功 / 扫描不完整无法确认 / 旧名仍在） */
   async function renameOneRow(qa, m, doc = document) {
     const row = (m.row && m.row.isConnected) ? m.row : ((findListRowByName(qa, m.old, doc) || {}).row || null);
-    const editor = await openRenameDialog(qa, row, m.nameEl || getNameElInRow(row), m.old, doc);
+    const editor = await openRenameDialog(qa, row, m.nameEl || getNameElInRow(row), m.old, doc, m.fid || '');
     if (!editor) { warn(` ⚠️ 改名：打不开改名编辑器 —— ${m.old}`); return { ok: false, reason: 'no-editor' }; }
     const r = await applyRenameInDialog(qa, editor, m.old, m.next, doc, m.fid || '');
-    if (r === 'fail' || r === false) {
+    if (r !== 'submitted' && r !== true) {
       try {
         const close = editor.querySelector && editor.querySelector('.ant-modal-close, .ant-drawer-close');
         if (close) qa.realClick(close);
         else if (editor.blur) editor.blur();
       } catch {}
-      return { ok: false, reason: 'submit-failed' };
+      /* 只有 'fail' / false 属于提交类失败；其余是带原因的明确失败 */
+      const reason = (typeof r === 'string' && r && r !== 'fail') ? r : 'submit-failed';
+      return { ok: false, reason };
     }
 
     const verdict = await confirmRenamedInList(qa, {
@@ -2135,9 +2286,20 @@
     log(`★ 改名：待改名 ${entries.length} 个`);
     for (const e of entries) log(` - ${e.old}  →  ${e.next}`);
 
+    /* 计划里若有重复目标名，必然只有第一个能成功，剩下的会撞重名 —— 提前点名 */
+    const nameCount = new Map();
+    for (const e of entries) {
+      const k = normExactName(e.next);
+      nameCount.set(k, (nameCount.get(k) || 0) + 1);
+    }
+    const dupPlanned = [...nameCount.entries()].filter(([, n]) => n > 1).map(([k]) => k);
+    if (dupPlanned.length) {
+      warn(` ⚠️ 改名：计划里有 ${dupPlanned.length} 个目标名重复（同名的只能成功一个）：${dupPlanned.join('、')}`);
+    }
+
     let renamed = 0, failed = 0, skipped = 0;
     const confirmed = [];
-    const failedEntries = [];
+    const takenNames = new Set();   /* 本次已占用的目标名，用于零开销判重 */
 
     const doOne = async (e, label) => {
       await until(() => !isShareTableLoading(doc), 150, 10000);
@@ -2146,6 +2308,8 @@
         await clearAllViaHeader(qa, doc);
         await until(() => getHeaderCheckState(doc) === 'none', 100, 2000);
       } catch {}
+      /* 上一轮若留下没提交干净的改名框／弹窗，本轮会打开"上一个文件"的编辑器 */
+      try { await closeStrayRenameEditors(qa, doc); } catch {}
 
       let loaded = null;
       if (e.fid) {
@@ -2161,15 +2325,41 @@
       if (!loaded) loaded = findListRowByName(qa, e.old, doc);
       if (!loaded) loaded = await until(() => findListRowByName(qa, e.old, doc), 200, waitMs);
       if (!loaded) loaded = await scrollToRowByName(qa, doc, e.old, { cacheKey: currentCacheKey(), maxMs: 6000 });
+
+      /* ① 已经是目标名（可能上一趟改成功了只是没确认到）→ 直接算成功 */
+      let curReal = '';
+      try {
+        const nc = loaded && loaded.row && loaded.row.querySelector
+          && loaded.row.querySelector('.filename-text, [class*="filename-text"], .file-name, [class*="file-name"]');
+        curReal = nc ? String(nc.getAttribute('title') || nc.textContent || '').replace(/[\u200B-\u200D\uFEFF]/g, '').trim() : '';
+      } catch {}
+      if (curReal && normExactName(curReal) === normExactName(e.next)) {
+        log(` ↺ 改名：${label} 已是目标名，跳过`);
+        return { ok: true, missing: false, alreadyDone: true, reason: 'already-target',
+                 confirmedEntry: { old: e.old, next: e.next, fid: e.fid || (loaded && loaded.fid) || '' } };
+      }
       if (!loaded) {
-        const alreadyNew = findListRowByName(qa, e.next, doc);
-        if (alreadyNew) {
-          log(` ↺ 改名：${label} 已是目标名，跳过`);
-          return { ok: true, missing: false, alreadyDone: true, confirmedEntry: { old: e.old, next: e.next, fid: alreadyNew.fid || e.fid } };
+        /* 可见区找不到：全表滚动再找一次目标名，避免"其实改好了但不在可见区"被判失败 */
+        let alreadyNew = { found: false, hit: null };
+        try { alreadyNew = await findExactNameAnywhere(qa, e.next, doc, 5000); } catch {}
+        if (alreadyNew.found && alreadyNew.hit) {
+          log(` ↺ 改名：${label} 全表已是目标名，跳过 —— ${e.next}`);
+          return { ok: true, missing: false, alreadyDone: true, reason: 'already-target-scan',
+                   confirmedEntry: { old: e.old, next: e.next, fid: alreadyNew.hit.fid || e.fid || '' } };
         }
         warn(` ⚠️ 改名：${label} 列表里找不到该文件 —— ${e.old}`);
-        return { ok: false, missing: true };
+        return { ok: false, missing: true, reason: 'missing' };
       }
+
+      /* ② 该行仍在转存/处理中时改名不会生效，先等它结束 */
+      try {
+        if (rowLooksBusy(loaded.row)) {
+          log(` ⏳ 改名：${label} 该行仍在转存/处理中，等待结束…`);
+          await until(() => !rowLooksBusy(loaded.row), 400, 20000);
+          await sleep(300, true);
+        }
+      } catch {}
+
       const fid = e.fid || loaded.fid || (loaded.row && loaded.row.getAttribute && loaded.row.getAttribute('data-row-key')) || '';
       let realName = '';
       try {
@@ -2181,6 +2371,23 @@
       } catch {}
       const oldName = realName || e.old;
       if (oldName !== e.old) log(`   ↳ 列表真实名：${oldName}（计划名 ${e.old}）`);
+
+      /* 提交前查目标名是否已被占用 —— 重名会让弹窗卡住并报 submit-failed */
+      if (takenNames.has(normExactName(e.next))) {
+        warn(` ✗ 改名 ${label}：目标名与本次已改好的另一个文件重复 → ${e.next}`);
+        return { ok: false, missing: false, reason: 'target-name-exists(与本次另一个条目重名)' };
+      }
+      try {
+        const dup = await findExactNameAnywhere(qa, e.next, doc, 4000);
+        if (dup.found && dup.hit && !dup.timedOut) {
+          const dupFid = dup.hit.fid || '';
+          if (!dupFid || !fid || dupFid !== fid) {
+            warn(` ✗ 改名 ${label}：目标名已被列表中另一个文件占用 → ${e.next}`
+                 + (dupFid ? `（占用者 fid ${dupFid}）` : ''));
+            return { ok: false, missing: false, reason: 'target-name-exists' };
+          }
+        }
+      } catch {}
 
       const r = await renameOneRow(qa, { row: loaded.row, nameEl: getNameElInRow(loaded.row), old: oldName, next: e.next, fid }, doc);
       if (r.ok) {
@@ -2196,41 +2403,91 @@
         await until(() => getHeaderCheckState(doc) === 'none', 100, 2000);
       } catch {}
       await sleep(250, true);
-      return { ok: !!r.ok, missing: false };
+      return { ok: !!r.ok, missing: false, reason: r.ok ? 'renamed' : (r.reason || 'unknown') };
     };
 
-    for (let i = 0; i < entries.length; i++) {
-      const e = entries[i];
-      const res = await doOne(e, `[${i + 1}/${entries.length}]`);
-      if (res.ok) { renamed++; if (res.confirmedEntry) confirmed.push(res.confirmedEntry); }
-      else if (res.missing) { skipped++; failedEntries.push(e); }
-      else { failed++; failedEntries.push(e); }
-    }
-
-    if (failedEntries.length) {
-      log(`★ 改名：第一趟后仍有 ${failedEntries.length} 个没成功，等待列表稳定后重试…`);
-      await sleep(2500, true);
-      await until(() => !isShareTableLoading(doc), 150, 10000);
-      await sleep(500, true);
-      const retry = failedEntries.slice();
-      failedEntries.length = 0;
-      failed = 0; skipped = 0;
-      for (let i = 0; i < retry.length; i++) {
-        const e = retry[i];
-        const res = await doOne(e, `[重试 ${i + 1}/${retry.length}]`);
-        if (res.ok) { renamed++; if (res.confirmedEntry) confirmed.push(res.confirmedEntry); }
-        else if (res.missing) { skipped++; failedEntries.push(e); }
-        else { failed++; failedEntries.push(e); }
+    /* 第一趟 + 最多 2 趟补做：每趟之前等列表稳定并重建行缓存 */
+    let queue = entries.map(e => ({ ...e }));
+    for (let round = 0; round < 3 && queue.length; round++) {
+      if (round > 0) {
+        log(`★ 改名：第 ${round} 趟补做 ${queue.length} 个（等待列表稳定并重建行缓存）`);
+        await sleep(round === 1 ? 2500 : 5000, true);
+        await until(() => !isShareTableLoading(doc), 150, 10000);
+        try { await scanAllRowsByScroll(qa, doc, { key: currentCacheKey(), useCache: false }); } catch {}
+        await sleep(500, true);
       }
+      const nextQueue = [];
+      for (let i = 0; i < queue.length; i++) {
+        const e = queue[i];
+        const res = await doOne(e, round === 0 ? `[${i + 1}/${queue.length}]` : `[补做${round} ${i + 1}/${queue.length}]`);
+        if (res.ok) {
+          renamed++;
+          takenNames.add(normExactName(e.next));
+          if (res.confirmedEntry) confirmed.push(res.confirmedEntry);
+        }
+        else nextQueue.push({ ...e, reason: res.reason || 'unknown' });
+      }
+      queue = nextQueue;
     }
 
+    /* 收尾复核：补做仍失败的，再全表确认一次新名是否已经生效
+     * （改名常常其实成功了，只是当时列表扫描不完整没能确认） */
+    if (queue.length) {
+      log(`★ 改名：${queue.length} 个未成功，做最后一次全表复核`);
+      await sleep(1500, true);
+      await until(() => !isShareTableLoading(doc), 150, 10000);
+      const still = [];
+      for (const e of queue) {
+        let r = { found: false, hit: null, timedOut: true };
+        try { r = await findExactNameAnywhere(qa, e.next, doc, 6000); } catch {}
+        if (r.found && r.hit) {
+          renamed++;
+          confirmed.push({ old: e.old, next: e.next, fid: r.hit.fid || e.fid || '' });
+          log(` ✓ 改名：复核确认「${e.next}」已生效（此前未确认到）`);
+          continue;
+        }
+        still.push({ ...e, reason: (r.timedOut && e.reason === 'scan-incomplete') ? 'scan-incomplete' : (e.reason || 'not-found') });
+      }
+      queue = still;
+    }
+
+    const failedEntries = queue;
+    failed = failedEntries.filter(e => e.reason !== 'missing').length;
+    skipped = failedEntries.filter(e => e.reason === 'missing').length;
     if (failedEntries.length) {
       warn(` ⚠️ 改名：${failedEntries.length} 个文件最终未确认改名成功：`
-           + failedEntries.map(e => e.old).join('、'));
+           + failedEntries.map(e => `${e.old}（${renameReasonText(e.reason)}）`).join('、'));
     }
     try { qa.refreshGray(); } catch {}
     log(`★ 改名完成：成功 ${renamed}，失败 ${failed}，跳过 ${skipped}`);
     return { renamed, failed, skipped, confirmed, failedEntries, pairs: [] };
+  }
+
+  /* 改名失败原因 → 人话（用于弹窗与日志） */
+  function renameReasonText(reason) {
+    const r = String(reason || '').trim();
+    const i = r.indexOf('(');
+    const base = i > 0 ? r.slice(0, i) : r;
+    const extra = i > 0 ? r.slice(i).replace(/[()]/g, '') : '';
+    const tail = extra ? `：${extra}` : '';
+    switch (base) {
+      case 'missing': return '列表里找不到该行' + tail;
+      case 'no-editor': return '打不开改名编辑器（单选未通过/顶栏按钮不可用）' + tail;
+      case 'submit-failed': return '改名提交未成功（服务端拒绝：重名/非法字符/超长）' + tail;
+      case 'wrong-row': return '改名框里的名字不是该文件 —— 已拒绝提交，避免改错行';
+      case 'target-name-exists': return '目标名已被列表中另一个文件占用（重名）' + tail;
+      case 'residual-selection': return '上一次的勾选没清干净，单选复核未通过';
+      case 'scan-incomplete': return '扫描不完整，无法确认' + tail;
+      case 'old-still-exists': return '旧名仍在，改名未生效' + tail;
+      case 'not-found': return '新名始终未出现' + tail;
+      case 'row-busy': return '该行仍在转存/处理中';
+      default: return r ? `原因：${r}` : '未知原因';
+    }
+  }
+  /* 行是否还在转存/处理中（此时改名不会生效） */
+  function rowLooksBusy(row) {
+    if (!row || typeof row.textContent !== 'string') return false;
+    return /转存中|上传中|保存中|正在转存|处理中|离线下载中|等待中/.test(row.textContent);
   }
 
   async function runRenameSmokeTest(qa, doc = document) {
@@ -3247,6 +3504,7 @@
           releaseBusy();
           log('★ 刷新/改名已确认，准备放行挂起门（自动下载由夸克助手执行）');
         } else {
+          const failedList = (renameReport.failedEntries || []).map(e => `${e.old}（${renameReasonText(e.reason)}）`);
           const failedNames = (renameReport.failedEntries || []).map(e => e.old);
           const allBad = [...new Set([...failedNames, ...planUnmatched, ...planAmbiguous])];
           const reasonLines = [];
@@ -3254,12 +3512,16 @@
           if (!waitRes.ok) reasonLines.push(`列表行数未达预期（${waitRes.count}/${waitRes.expectedMin}）`);
           if (!listScanComplete) reasonLines.push('改名期间列表扫描不完整');
           if (!planBuildOk) reasonLines.push('改名计划构建失败');
+          if (renameReport.failed) reasonLines.push(`改名步骤失败 ${renameReport.failed} 个`);
+          if (renameReport.skipped) reasonLines.push(`列表里找不到 ${renameReport.skipped} 个`);
           warn(`⛔ 改名未全部确认（已确认 ${confirmedCount} / 计划 ${plan.length}，未匹配 ${planUnmatched.length}）`);
+          if (failedList.length) warn(`   未确认明细：${failedList.join('；')}`);
           if (reasonLines.length) warn(`   附加原因：${reasonLines.join('；')}`);
           qa.setStatus('改名未确认，已暂停下载', 'error');
           alert(`⚠️ 改名未全部确认，已跳过下载并保持本页。\n\n`
                 + `已按完整名（含曾用名）确认：${confirmedCount} / 计划 ${plan.length}\n`
                 + (reasonLines.length ? `附加原因：${reasonLines.join('；')}\n` : '')
+                + (failedList.length ? `未确认：\n  ${failedList.join('\n  ')}\n` : '')
                 + (planUnmatched.length ? `列表里没找到对应行（未改名）：${planUnmatched.join('、')}\n` : '')
                 + (planAmbiguous.length ? `无法唯一判定是哪一行：${planAmbiguous.join('、')}\n` : '')
                 + (planNoName.length ? `清单里没有最终名称（将按原名下载）：${planNoName.join('、')}\n` : '')
@@ -3538,7 +3800,13 @@
       }
       injectTriggerQuarkButton();
     };
-    new MutationObserver(tryInject).observe(document.body, { childList: true, subtree: true });
+    /* acg.rip 用 Turbolinks 做页内跳转：document.body 会被整体替换，
+     * 挂在 body 上的观察器会随旧 body 一起失效，导致重建后的面板里没有夸克区/转存按钮。
+     * 改挂 documentElement（跨跳转稳定）即可跟上主脚本恢复出来的面板。 */
+    new MutationObserver(tryInject).observe(document.documentElement || document.body, { childList: true, subtree: true });
+    for (const ev of ['turbolinks:load', 'turbolinks:render', 'popstate', 'pageshow']) {
+      document.addEventListener(ev, () => { try { tryInject(); } catch (e) { console.error('[Bridge] tryInject', e); } }, true);
+    }
     tryInject();
   }
 

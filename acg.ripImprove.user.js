@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.3.3
+// @version      1.3.4
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -47,23 +47,67 @@ const PANEL_OPEN_KEY = 'acgrip_panel_open';
 const $ajax = initAjax();
 onHandle();
 new MutationObserver(muts => muts.forEach(onHandle)).observe(document.documentElement, { childList: true });
-/* 页面加载后恢复上次的面板打开状态（仅 acg.rip 页面；其他页面只能通过按钮打开） */
-(function restorePanelOpenState() {
-  if (!IS_ACGRIP_PAGE) return;
-  const tryRestore = () => {
-    try {
-      if (localStorage.getItem(PANEL_OPEN_KEY) === '1') {
-        showEditDialog();
-      }
-    } catch (e) {
-      console.error('[restorePanelOpenState]', e);
-    }
-  };
-  if (document.readyState === 'complete' || document.readyState === 'interactive') {
-    setTimeout(tryRestore, 400);
-  } else {
-    window.addEventListener('DOMContentLoaded', () => setTimeout(tryRestore, 400), { once: true });
+/* ===== 页面内跳转（Turbolinks / SPA）后的 UI 状态恢复 =====
+ * acg.rip 用 Turbolinks 做页内跳转（/page/N、index 等），不会重新触发 DOMContentLoaded，
+ * 脚本也不会重跑，但 document.body 会被整体替换 → 挂在 body 上的编辑面板、时间浮标会失联。
+ * 因此沿用「页面链接着色」（onHandle + MutationObserver）的触发时机来检测导航并恢复：
+ *   - URL 变化 或 document.body 被替换 → 判定发生了一次页内跳转
+ *   - 防抖 300ms 后统一恢复，避免 Turbolinks 分阶段替换 DOM 时重复重建
+ * 同时监听 turbolinks:* / popstate / pageshow，覆盖前进后退与 bfcache。 */
+var _spaLastUrl = null, _spaLastBody = null, _spaTimer = null;
+var SPA_NAV_EVENTS = ['turbolinks:load', 'turbolinks:render', 'turbolinks:visit', 'popstate', 'hashchange', 'pageshow'];
+/** 面板是否需要重建（恢复"打开"状态） */
+function spaUiPanelShouldReopen() {
+  if (_gmEditOverlay) {
+    if (_gmEditOverlay.isConnected) return false;   // 还在 DOM 里，无需恢复
+    return _gmEditOverlay.style.display !== 'none'; // 被换掉之前是打开的
   }
+  try { return localStorage.getItem(PANEL_OPEN_KEY) === '1'; } catch (e) { return false; }
+}
+function spaUiScheduleRestore(delay) {
+  if (_spaTimer) clearTimeout(_spaTimer);
+  _spaTimer = setTimeout(() => { _spaTimer = null; spaUiRestoreNow(); }, delay > 0 ? delay : 300);
+}
+function spaUiRestoreNow() {
+  if (_spaTimer) { clearTimeout(_spaTimer); _spaTimer = null; }
+  if (!IS_ACGRIP_PAGE) return;
+  if (!document.body) { spaUiScheduleRestore(200); return; }
+  try {
+    /* 时间浮标：挂在 header > .container 上，body 被替换后会失联 */
+    if (display && !display.isConnected) {
+      const host = getDisplayHost();
+      if (host) host.appendChild(display);
+    }
+    if (display) positionDisplay(display);
+    /* 编辑面板：旧实例已随旧 body 一起被丢弃，整体重建（重建时会恢复选中行/焦点格） */
+    if (spaUiPanelShouldReopen()) {
+      if (_gmEditOverlay && _gmEditOverlay.parentNode) _gmEditOverlay.parentNode.removeChild(_gmEditOverlay);
+      _gmEditShow = null; _gmEditOverlay = null; _gmEditHide = null; _gmEditRelayout = null;
+      showEditDialog();
+    }
+  } catch (e) {
+    console.error('[spaUiRestore]', e);
+  }
+}
+/** 由 onHandle（MutationObserver）与导航事件调用；force=true 表示外部已知发生了跳转 */
+function spaUiRestoreTick(force) {
+  if (!IS_ACGRIP_PAGE) return;
+  let navigated = false;
+  if (!_spaLastUrl) {
+    _spaLastUrl = location.href; _spaLastBody = document.body;
+  } else if (location.href !== _spaLastUrl || document.body !== _spaLastBody) {
+    _spaLastUrl = location.href; _spaLastBody = document.body;
+    navigated = true;
+  }
+  if (force || navigated) spaUiScheduleRestore(force && !navigated ? 400 : 300);
+}
+(function setupSpaUiRestore() {
+  if (!IS_ACGRIP_PAGE) return;
+  for (const ev of SPA_NAV_EVENTS) {
+    document.addEventListener(ev, () => { try { spaUiRestoreTick(true); } catch (e) { console.error('[spaUiRestore]', e); } }, true);
+  }
+  /* 首次（等同页面加载完）也走同一条恢复路径 */
+  spaUiRestoreTick(true);
 })();
 /* ===== 非 acg.rip 页面：注入打开编辑面板的按钮 ===== */
 (function setupExternalPanelButton() {
@@ -426,6 +470,8 @@ function onHandle() {
   try { autoReload().catch(e => console.error('autoReload error:', e)); } catch (e) { console.error(e); }
   onHandleItems(setDisplayHighlight);
   setTimeHover();
+  /* 页内跳转（Turbolinks，无 onload）检测：与链接着色同一触发时机 */
+  try { spaUiRestoreTick(); } catch (e) { console.error('[spaUiRestore] tick', e); }
   if (/^https?:\/\/(bangumi\.tv|bgm\.tv)\/subject\/\d+/.test(window.location.href)) {
     updateFromBangumiSubjectPage().catch(e => console.error('[SubjectPage] error:', e));
     return;
@@ -641,8 +687,9 @@ async function asyncDownloadTorrents() {
         let list = getDownloadedList(found);
         if (!list) { list = []; downloaded[found] = list; }
         list.push(href); saveBangumiData();
-        if (url2num(href) <= url2num(latest)) return;
-        latest = href; lastDownload = found; saveLastData();
+        /* 先同步业务状态（下集 / 资源时间），再更新 latest：
+         * 旧写法里 latest 一旦被第 1 页最新条刷新，后续 fetch 到的第 2 页及以后
+         * （条目 id 更小）就会命中 `<= latest` 提前 return，导致下集永远不同步。 */
         if (found) {
           console.log('[自动下载] 尝试同步下集', { key, title });
           syncNextEpisode(key, title);
@@ -656,6 +703,9 @@ async function asyncDownloadTorrents() {
               if (dhhmm) { trackingItems[key] = dhhmm; saveBangumiData(); }
             }
           }
+        }
+        if (url2num(href) > url2num(latest)) {
+          latest = href; lastDownload = found; saveLastData();
         }
       }, $doc(html));
       onHandleItems(setDisplayHighlight);

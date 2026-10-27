@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.2.0
+// @version      6.2.1
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后自动下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -39,6 +39,10 @@
   /* FDM（AutoCleanOrMoveFDMCache.pyw）本地桥：拿到"下载已完成"的信号后删云端文件 */
   const FDM_BRIDGE = 'http://127.0.0.1:8732';
   const FDM_POLL_MS = 60000;        // 后台轮询间隔（FDM 完成 → 删云端，异步）
+  /* FDM 已完成、但本地没有对应下载记录、列表里也确实没有的项：
+   * 不立刻 ack（怕误删），先记账，满 7 天且列表确认干净后才 ack 掉，避免永远挂着。 */
+  const GM_FDM_UNMATCHED = 'quark_fdm_unmatched';
+  const FDM_UNMATCHED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
   const log = (...a) => console.log(PREFIX, ...a);
   const warn = (...a) => console.warn(PREFIX, ...a);
@@ -898,8 +902,24 @@
       if (h > 0) { sum += h; n++; }
     }
     const rowHeight = n ? sum / n : 0;
-    const dataCount = rowHeight > 0 && vtHeight > 0 ? Math.floor(vtHeight / rowHeight) : null;
-    return { vtHeight, renderedCount: renderedRows.length, rowHeight, dataCount, isVirtual: true };
+    /* vt 高度里还含"非数据行"：底部 拖拽/粘贴 灰框（tr.drag-bottom）、分批加载行等。
+     * 不扣掉会把总数抬高（典型：2 个文件 + 1 个灰框 → 推断 3，误报"列表没加载完"） */
+    let extraH = 0, extraN = 0;
+    try {
+      for (const tr of body.querySelectorAll('tr:not(.ant-table-row)')) {
+        if (tr.closest && tr.closest('.ant-table-measure-row')) continue;
+        const stl = tr.style || {};
+        if (stl.display === 'none' || stl.visibility === 'hidden') continue;
+        const h = tr.offsetHeight || (tr.getBoundingClientRect ? tr.getBoundingClientRect().height : 0) || 0;
+        if (h > 0) { extraH += h; extraN++; }
+      }
+    } catch {}
+    const dataH = Math.max(0, vtHeight - extraH);
+    const dataCount = rowHeight > 0 && dataH > 0 ? Math.floor(dataH / rowHeight) : null;
+    return {
+      vtHeight, extraHeight: extraH, extraRows: extraN,
+      renderedCount: renderedRows.length, rowHeight, dataCount, isVirtual: true,
+    };
   }
 
   /* 当前目录列表总条数：优先用虚拟滚动容器高度/行高推断
@@ -944,7 +964,8 @@
       return { ok: false, reason: 'timeout' };
     }
     log(`★ [${tag}] 列表就绪：${g.empty ? '空目录' : `${g.rows} 行渲染`}` +
-        `（vt=${g.info ? g.info.vtHeight : '-'}，推断总数=${g.info ? g.info.dataCount : '-'}）`);
+        `（vt=${g.info ? g.info.vtHeight : '-'}，尾行 ${g.info ? (g.info.extraRows || 0) : 0} 行/${g.info ? Math.round(g.info.extraHeight || 0) : 0}px，` +
+        `推断数据行=${g.info ? g.info.dataCount : '-'}）`);
     return { ok: true, empty: g.empty, rows: g.rows, info: g.info, total: getExpectedRowTotal() };
   }
 
@@ -1324,6 +1345,86 @@
   let _fdmBusy = false;
   let _fdmFail = 0;
   let _fdmNextAt = 0;
+  let _fdmStaleScanAt = 0;
+
+  function fdmUnmatchedKey(it) {
+    const url = String((it && it.url) || '').trim();
+    if (url) return url;
+    return 'name:' + String((it && it.name) || '').trim();
+  }
+
+  /* FDM 已完成但没有下载记录的项：先记账（首次见到的时间），
+   * 满 7 天 + 列表已加载完 + 列表里确实找不到同名文件 → ack 掉，别让它永远挂在 /pending。 */
+  async function reclaimStaleFdmItems(unmatched) {
+    const out = { tracked: 0, acked: 0, expired: 0, skipped: 0 };
+    if (!unmatched || !unmatched.length) return out;
+    const store = gmGet(GM_FDM_UNMATCHED, {}) || {};
+    const now = Date.now();
+    for (const it of unmatched) {
+      const k = fdmUnmatchedKey(it);
+      if (!k) continue;
+      if (!store[k]) { store[k] = now; out.tracked++; }
+    }
+    /* 清掉已经不在 /pending 里的跟踪项 */
+    const liveKeys = new Set(unmatched.map(fdmUnmatchedKey));
+    for (const k of Object.keys(store)) if (!liveKeys.has(k)) delete store[k];
+
+    const aged = unmatched.filter(it => {
+      const ts = store[fdmUnmatchedKey(it)] || now;
+      return now - ts >= FDM_UNMATCHED_TTL_MS;
+    });
+    if (out.tracked) {
+      const names = unmatched.slice(0, 5).map(it => it.name || it.url).join('、');
+      log(`☁️ FDM 残留项：新增跟踪 ${out.tracked} 个（无下载记录，${Math.round(FDM_UNMATCHED_TTL_MS / 86400000)} 天后若列表仍无此文件才清理）：`
+          + names + (unmatched.length > 5 ? '…' : ''));
+    }
+    if (!aged.length) { gmSet(GM_FDM_UNMATCHED, store); return out; }
+
+    out.expired = aged.length;
+    if (!isListLoaded()) { out.skipped = aged.length; gmSet(GM_FDM_UNMATCHED, store); return out; }
+    /* 全表扫描比较重，限制频率 */
+    if (now - _fdmStaleScanAt < 10 * 60 * 1000) { out.skipped = aged.length; gmSet(GM_FDM_UNMATCHED, store); return out; }
+    _fdmStaleScanAt = now;
+
+    let scan = null;
+    try { scan = await scanAllRowsWithScroll({ tag: 'fdm-stale', maxMs: 20000 }); } catch (e) { warn('☁️ 残留项扫描异常', e); }
+    if (!scan || scan.complete !== true) {
+      log('☁️ FDM 残留项：列表未确认完整，本轮不清理');
+      out.skipped = aged.length;
+      gmSet(GM_FDM_UNMATCHED, store);
+      return out;
+    }
+    const present = new Set();
+    try {
+      for (const f of scan.byFid.values()) {
+        const n = String((f && f.name) || '').trim();
+        if (!n) continue;
+        present.add(n);
+        present.add(fdmStripDupSuffix(n));
+      }
+    } catch {}
+
+    const gone = aged.filter(it => {
+      const n = String(it.name || '').trim();
+      if (!n) return false;
+      return !present.has(n) && !present.has(fdmStripDupSuffix(n));
+    });
+    if (!gone.length) {
+      log(`☁️ FDM 残留项：${aged.length} 个已超期，但文件仍在列表中 → 保留跟踪`);
+      gmSet(GM_FDM_UNMATCHED, store);
+      return out;
+    }
+    log(`☁️ FDM 残留项：${gone.length} 个超过 7 天且列表中已不存在 → ack 清理（不删任何文件）`);
+    try {
+      const a = await fdmRequest('/ack', { method: 'POST', data: { urls: gone.map(it => it.url) } });
+      out.acked = (a && a.acked) || 0;
+    } catch (e) { warn('☁️ 残留项 ack 失败（下轮重试）', e); }
+    if (out.acked > 0) {
+      for (const it of gone) delete store[fdmUnmatchedKey(it)];
+    }
+    gmSet(GM_FDM_UNMATCHED, store);
+    return out;
+  }
 
   /* 纯执行：拉 /pending → 匹配 fid → 删云端 → 复核 → 清记录 + ack。
    * 不做状态守卫/退避，供清理流程（流程开始）和定时同步共用 */
@@ -1345,12 +1446,21 @@
 
       const recs = loadDlRecords();
       const plan = [];
+      const unmatched = [];
       for (const it of items) {
         const m = fdmMatchRecord(recs, it);
         if (m) plan.push({ fid: m.fid, how: m.how, item: it });
-        else log(`☁️ FDM 已完成「${it.name || it.url}」，但没有对应下载记录，先留着`);
+        else unmatched.push(it);
       }
-      if (!plan.length) return { ok: true, pending: items.length, deleted: 0, acked: 0 };
+      /* 没有下载记录的：不删任何文件，只按"超期 + 列表里确实没有"去做 ack 清理 */
+      let stale = null;
+      if (unmatched.length) {
+        try { stale = await reclaimStaleFdmItems(unmatched); }
+        catch (e) { warn('☁️ 处理 FDM 残留项异常', e); }
+      }
+      if (!plan.length) {
+        return { ok: true, pending: items.length, deleted: 0, acked: (stale && stale.acked) || 0, unmatched: unmatched.length };
+      }
 
       log(`☁️ [${tag}] 云端待删 ${plan.length} 个：${plan.map(p => p.item.name || p.fid.slice(0, 8)).join('、')}`);
       const del = await deleteFilesByFids(plan.map(p => p.fid), { tag });
@@ -2010,16 +2120,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.2.0`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.2.1`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.2.0');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.2.1');
     } else {
-      log('平台层就绪（其他页）v6.2.0');
+      log('平台层就绪（其他页）v6.2.1');
     }
     startGrayPolling();
   })();

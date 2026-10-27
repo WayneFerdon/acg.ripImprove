@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.2.1
+// @version      6.2.2
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后自动下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -1315,6 +1315,81 @@
     return String(name || '').replace(/\s*\(\d+\)(?=\.[^.]+$)/, '').trim();
   }
 
+  function fdmNormName(v) {
+    return String(v ?? '')
+      .replace(/[\u200B-\u200D\uFEFF]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /* 待删条目可能用到的名字键：自身名字 / 链接里的 filename，以及各自去掉 (1) 副本后缀的形式 */
+  function fdmItemNameKeys(it) {
+    const keys = new Set();
+    const add = (v) => {
+      const s = fdmNormName(v);
+      if (!s) return;
+      keys.add(s);
+      const d = fdmStripDupSuffix(s);
+      if (d) keys.add(d);
+    };
+    add(it && it.name);
+    try { add(new URL(String((it && it.url) || '')).searchParams.get('filename')); } catch {}
+    return [...keys];
+  }
+
+  /* FDM 已完成但**没有下载记录**的项：如果当前列表里确实有同名文件，
+   * 说明本地那份已经下完/已搬走，云端留着的正是要删的副本 —— 按名字认领后删除。
+   * 以前这种情况只会打一句"先留着"，于是文件永远留在云端，还会挡住下一轮转存。
+   * 安全约束：必须全表滚动扫到**唯一一个**同名行才认领；多个同名或扫不到都不动。 */
+  async function fdmAdoptByName(items, opts = {}) {
+    const out = { plan: [], ambiguous: [], scanned: false, count: 0 };
+    const list = (items || []).filter(it => fdmItemNameKeys(it).length > 0);
+    if (!list.length) return out;
+
+    let scan = null;
+    try { scan = await scanAllRowsWithScroll({ tag: 'fdm-adopt', maxMs: opts.scanMs || 20000 }); }
+    catch (e) { warn('☁️ 认领扫描异常', e); }
+    if (!scan) return out;
+    out.scanned = true;
+    out.count = scan.count || 0;
+    if (!scan.complete) {
+      warn(`☁️ FDM 认领：列表扫描未确认完整（到底=${scan.reachedBottom} 超时=${scan.timedOut}）` +
+           `，只认领本轮确实看到的行`);
+    }
+
+    const byName = new Map();
+    try {
+      for (const f of scan.byFid.values()) {
+        const n = fdmNormName((f && f.name) || '');
+        if (!n || !f.fid) continue;
+        if (!byName.has(n)) byName.set(n, []);
+        const arr = byName.get(n);
+        if (!arr.some(x => x.fid === f.fid)) arr.push(f);
+      }
+    } catch {}
+
+    for (const it of list) {
+      const keys = fdmItemNameKeys(it);
+      let hit = null;
+      let multi = false;
+      for (const k of keys) {
+        const arr = byName.get(k);
+        if (!arr || !arr.length) continue;
+        if (arr.length > 1) { multi = true; continue; }
+        hit = arr[0];
+        break;
+      }
+      if (hit) {
+        out.plan.push({ fid: hit.fid, how: 'adopted-name', item: it, adopted: it.name || '' });
+        log(`⚕ FDM 已完成「${it.name || it.url}」：无下载记录，但列表里有同名文件 → 认领后删除`);
+      } else if (multi) {
+        out.ambiguous.push(it.name || it.url);
+        warn(`☁️ FDM 认领：「${it.name || it.url}」在列表里有多个同名文件，无法唯一定位 → 不删`);
+      }
+    }
+    return out;
+  }
+
   /* 待删条目 → 下载记录里的 fid：先按签名链接精确比，再按 filename=/文件名 兜底 */
   function fdmMatchRecord(recs, item) {
     const url = String(item.url || '').trim();
@@ -1446,13 +1521,32 @@
 
       const recs = loadDlRecords();
       const plan = [];
-      const unmatched = [];
+      let unmatched = [];
       for (const it of items) {
         const m = fdmMatchRecord(recs, it);
         if (m) plan.push({ fid: m.fid, how: m.how, item: it });
         else unmatched.push(it);
       }
-      /* 没有下载记录的：不删任何文件，只按"超期 + 列表里确实没有"去做 ack 清理 */
+
+      /* 没有下载记录的两种情况：
+       *  ① 列表里还有同名文件 → 本地已下完，云端这份就是待删的 → 认领后删除（本轮就清掉，
+       *     否则会一直留在云端、并且挡住下一轮转存）；
+       *  ② 列表里确实没有了 → 记时间戳，7 天后 ack 掉，避免永远挂在 /pending。 */
+      if (unmatched.length) {
+        try {
+          const adopt = await fdmAdoptByName(unmatched, { scanMs: opts.scanMs || 20000 });
+          if (adopt.plan.length) {
+            for (const p of adopt.plan) plan.push(p);
+            const taken = new Set(adopt.plan.map(p => p.item.url || p.item.name));
+            unmatched = unmatched.filter(it => !taken.has(it.url || it.name));
+            log(`☁️ [${tag}] 无记录认领 ${adopt.plan.length} 个（列表同名）→ 合并到删除计划`);
+          }
+          if (adopt.ambiguous.length) {
+            warn(`☁️ [${tag}] ${adopt.ambiguous.length} 个无法唯一定位：${adopt.ambiguous.join('、')}`);
+          }
+        } catch (e) { warn('☁️ FDM 认领异常（继续按残留项处理）', e); }
+      }
+
       let stale = null;
       if (unmatched.length) {
         try { stale = await reclaimStaleFdmItems(unmatched); }
@@ -1478,7 +1572,7 @@
         } catch (e) { warn('☁️ ack 失败（下轮会重试）', e); }
       }
       log(`☁️ [${tag}] 云端删除：确认 ${gone.length} / 计划 ${plan.length}（ack ${acked}）`);
-      return { ok: true, pending: items.length, deleted: gone.length, acked };
+      return { ok: true, pending: items.length, deleted: gone.length, acked: acked + ((stale && stale.acked) || 0) };
     } catch (e) {
       warn('☁️ 同步 FDM 完成状态异常', e);
       return { ok: false, reason: String((e && e.message) || e) };
@@ -1687,14 +1781,29 @@
     /* ---- 2. 删除过期文件（TTL 兜底） ---- */
     const recs = loadDlRecords();
     const expired = [];
+    const crossScope = [];       /* 记录的 scope 与当前目录不一致，但文件确实在当前列表里 */
+    const otherScope = new Set(); /* 记录属于别的目录、当前列表里也看不到 —— 不删，只做诊断 */
     for (const fid of Object.keys(recs)) {
       const r = recs[fid];
       if (!r) continue;
-      if (String(r.scope || '') !== scope) continue;
+      const inList = scan.byFid.has(fid);
+      const sameScope = String(r.scope || '') === scope;
+      if (!sameScope) {
+        if (inList) crossScope.push({ fid, from: String(r.scope || '(空)'), name: String((scan.byFid.get(fid) || {}).name || '') });
+        else otherScope.add(String(r.scope || '(空)'));
+      }
+      if (!sameScope && !inList) continue;   /* 别的目录的记录，且当前列表里没有 → 不动 */
       const ts = recordTs(r);
       if (!(ts > 0) || Date.now() - ts <= DL_TTL) continue;
-      if (!scan.byFid.has(fid)) continue;   /* 文件已不在列表：交给第 3 步清记录 */
-      expired.push({ fid, name: String((scan.byFid.get(fid) || {}).name || '') });
+      if (!inList) continue;   /* 文件已不在列表：交给第 3 步清记录 */
+      expired.push({ fid, name: String((scan.byFid.get(fid) || {}).name || ''), crossScope: !sameScope });
+    }
+    if (crossScope.length) {
+      log(`★ [${tag}] ${crossScope.length} 条记录的目录标记与当前不符但文件就在本列表（可能搬过目录/旧记录）：`
+          + crossScope.map(c => `${c.name || c.fid.slice(0, 8)}（原 ${c.from}）`).join('、'));
+    }
+    if (otherScope.size) {
+      log(`★ [${tag}] 另有下载记录属于其它目录（本次不动）：${[...otherScope].join('、')}`);
     }
 
     let del = { requested: 0, picked: 0, result: 'none', failed: [], still: [], deleted: 0 };
@@ -1721,6 +1830,24 @@
       del.deleted = expired.length - del.still.length;
       if (del.still.length) warn(`⚠️ [${tag}] 删除后仍在列表：${del.still.join('、')}（其记录保留）`);
     }
+
+    /* ---- 2.5 诊断：清理后仍然留在列表里的文件，逐个说明"为什么没删" ---- */
+    try {
+      const left = [];
+      for (const [fid, f] of scan.byFid) {
+        const nm = String((f && f.name) || fid.slice(0, 8));
+        const r = recs[fid];
+        if (!r) { left.push(`${nm}（无下载记录：只能靠本地下载器上报才会删）`); continue; }
+        const ts = recordTs(r);
+        if (!(ts > 0)) { left.push(`${nm}（下载记录无时间戳）`); continue; }
+        const age = Date.now() - ts;
+        if (age > DL_TTL) left.push(`${nm}（已超保留期却仍在列表：删除未生效？）`);
+        else left.push(`${nm}（已下载 ${(age / 3600000).toFixed(1)}h，${Math.ceil((DL_TTL - age) / 3600000)}h 后清理）`);
+      }
+      if (left.length) {
+        log(`★ [${tag}] 清理后仍在列表 ${left.length} 个：` + left.slice(0, 10).join('；') + (left.length > 10 ? '…' : ''));
+      }
+    } catch (e) { warn('诊断列表失败', e); }
 
     /* ---- 3. 根据删除后的列表清理记录 ---- */
     /* 兜底：一条文件都没扫到却没能确认"真空目录"时，绝不清记录（但也不中止整轮） */
@@ -2120,16 +2247,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.2.1`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.2.2`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.2.1');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.2.2');
     } else {
-      log('平台层就绪（其他页）v6.2.1');
+      log('平台层就绪（其他页）v6.2.2');
     }
     startGrayPolling();
   })();

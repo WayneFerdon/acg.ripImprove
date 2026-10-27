@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.3
+// @version 3.14.4
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -138,6 +138,24 @@
 
   function acquireBusy() { try { sessionStorage.setItem(BUSY_KEY, '1'); } catch {} }
   function releaseBusy() { try { sessionStorage.removeItem(BUSY_KEY); } catch {} }
+
+  /* 失败收尾时保留的忙碌标志只在"本页生命周期"内有效。
+   * 用户刷新/跳转后不该继续被当成"失败中的 acg 自动任务"（否则要关掉页面重开才能恢复）。 */
+  let _busyKeptForFailure = false;
+  function markBusyKeptForFailure() { _busyKeptForFailure = true; }
+  function installUnloadStateCleanup() {
+    const clear = () => {
+      if (!_busyKeptForFailure) return;
+      _busyKeptForFailure = false;
+      try { sessionStorage.removeItem(BUSY_KEY); } catch {}
+      try { sessionStorage.removeItem(ACG_FLAG_KEY); } catch {}
+    };
+    try { window.addEventListener('pagehide', clear, true); } catch {}
+    try { window.addEventListener('beforeunload', clear, true); } catch {}
+    /* Turbolinks 页内跳转不触发 unload，兜一层 */
+    try { document.addEventListener('turbolinks:before-visit', clear, true); } catch {}
+  }
+  installUnloadStateCleanup();
 
   function gmGet(key, def) {
     try {
@@ -3243,6 +3261,69 @@
     return out;
   }
 
+  /* 改名前的同名旧文件清理
+   * 场景：转存前没被清掉的旧文件正好占着本次的目标名 → 改名必然撞重名（以前表现为 submit-failed，
+   *      手动改也失败；但删掉旧文件后就能改）。这里在改名之前把这类旧文件删掉。
+   * 只删同时满足三个条件的行，宁可不删也不误删：
+   *   ① 名字与某个改名目标名完全一致（去零宽字符后逐字相等）
+   *   ② 该 fid 出现在"转存前快照"里（即转存前就已经存在）
+   *   ③ 该 fid 不是本次转存得到的行（不在 plan[].fid 里）
+   * 单次最多 20 个，超过就只提示不执行。 */
+  async function purgeConflictingOldRows(qa, plan, preRows, doc = document) {
+    const out = { deleted: 0, fids: [], names: [], skipped: 0 };
+    if (!Array.isArray(plan) || !plan.length) return out;
+    if (!Array.isArray(preRows) || !preRows.length) return out;
+    if (!qa || typeof qa.deleteFilesByFids !== 'function') return out;
+
+    const preFidSet = new Set(preRows.map(r => String((r && r.fid) || '')).filter(Boolean));
+    const newFidSet = new Set(plan.map(p => String((p && p.fid) || '')).filter(Boolean));
+    const targetByKey = new Map();
+    for (const p of plan) {
+      const k = normExactName(p.next);
+      if (k) targetByKey.set(k, p);
+    }
+    if (!targetByKey.size) return out;
+
+    const victims = [];
+    for (const r of preRows) {
+      const fid = String((r && r.fid) || '');
+      if (!fid || !preFidSet.has(fid) || newFidSet.has(fid)) continue;
+      const hit = targetByKey.get(normExactName(r.name));
+      if (!hit) continue;
+      victims.push({ fid, name: String(r.name || ''), target: hit.next, old: hit.old });
+    }
+    if (!victims.length) return out;
+
+    if (victims.length > 20) {
+      warn(` ⚠️ 改名：检测到 ${victims.length} 个同名旧文件（超过 20 个上限），本轮不自动删除，请人工确认`);
+      out.skipped = victims.length;
+      return out;
+    }
+
+    warn(` 🧹 改名：${victims.length} 个目标名已被转存前的旧文件占用，先删旧文件再改名（否则必然撞重名）`);
+    for (const v of victims) log(`    - 旧文件：${v.name}（fid ${v.fid.slice(0, 8)}）占用了目标名「${v.target}」`);
+
+    let del = null;
+    try { del = await qa.deleteFilesByFids(victims.map(v => v.fid), { tag: 'rename-dup' }); }
+    catch (e) { warn(' ⚠️ 改名：删除同名旧文件异常', e); return out; }
+
+    const gone = new Set(victims.map(v => v.fid));
+    const still = new Set((del && del.still) || []);
+    const removed = victims.filter(v => gone.has(v.fid) && !still.has(v.fid));
+    if (removed.length) {
+      out.deleted = removed.length;
+      out.fids = removed.map(v => v.fid);
+      out.names = removed.map(v => v.name);
+      log(` 🧹 改名：已删除 ${removed.length} 个同名旧文件`);
+      try { await until(() => !isShareTableLoading(doc), 150, 8000); } catch {}
+      await sleep(500, true);
+    }
+    if (still.size) {
+      warn(` ⚠️ 改名：${still.size} 个同名旧文件删除后仍在列表（可能删除被拒），改名可能仍会撞重名`);
+    }
+    return out;
+  }
+
   function refreshDlRecordsAfterRename(qa, pairs) {
     if (!Array.isArray(pairs) || !pairs.length) return 0;
     /* GM_setValue 是"按脚本"隔离的：桥接直接写 quark_auto_dl_records 对 QuarkAutoAssistant 无效，
@@ -3412,7 +3493,10 @@
             listRows = qa.scanFileRows(document) || [];
           }
           const listHint = getShareFileCount(document);
-          listScanComplete = !listHint || listRows.length >= listHint;
+          /* 「共 N 个文件」是整个分享的口径（含各子目录），只能当上界；
+           * 真正的判据是"滚到底且未超时"（scanAllRowsByScroll 记录的 _lastScan） */
+          const scrolledToBottom = isLastScanComplete();
+          listScanComplete = scrolledToBottom || !listHint || listRows.length >= listHint;
           if (!listScanComplete) {
             warn(` ⚠️ 改名：列表扫描不完整（${listRows.length}/${listHint}），改名计划可能不可靠`);
           }
@@ -3432,6 +3516,18 @@
           planUnmatched = plan.unmatched || [];
           planAmbiguous = plan.ambiguous || [];
           planNoName = plan.noName || [];
+
+          /* 目标名被"转存前就存在的旧文件"占着时，改名一定撞重名 → 先删旧文件 */
+          if (plan.length) {
+            try {
+              const purged = await purgeConflictingOldRows(qa, plan, preRows, document);
+              if (purged.deleted) {
+                log(` 🧹 改名：删除 ${purged.deleted} 个同名旧文件后重建行缓存`);
+                try { await scanAllRowsByScroll(qa, document, { key: currentCacheKey(), useCache: false, maxMs: 12000 }); } catch {}
+                await sleep(300, true);
+              }
+            } catch (e) { warn(' ⚠️ 改名：清理同名旧文件失败（继续改名）', e); }
+          }
         } catch (e) {
           warn('⚠️ 改名计划构建失败', e);
           planBuildOk = false;
@@ -3485,17 +3581,25 @@
         }
         if (planNoName.length) qa.setStatus('注意：有文件清单里没有名称，按原名下载', 'running');
 
-        /* 全部确认条件：刷新成功 + 计划构建成功 + 改名步骤成功 + 无未匹配/歧义 + 全部确认 + 列表扫描完整 + 行数稳定达标 */
+        /* 全部确认条件只看"改名结果本身"：
+         *   刷新成功 + 计划构建成功 + 改名步骤成功 + 无未匹配/歧义 + 计划内全部按完整名确认。
+         * 行数（waitRes）与列表扫描完整性不再当硬闸门 —— preRows 基线会被"转存前没清掉的旧文件"
+         * 污染，虚拟滚动下 count 也不准，拿它们卡关会频繁误报"改名未全部确认"
+         * （典型：已确认 1/计划 1，却因 列表行数未达预期 1/2 而中止）。 */
         const renameAllConfirmed = planBuildOk && renameStepOk
         && refreshRes.ok
-        && waitRes.ok
-        && listScanComplete
         && planUnmatched.length === 0
         && planAmbiguous.length === 0
         && (renameReport.failedEntries || []).length === 0
         && confirmedCount >= plan.length;
         renameAllConfirmedOut = renameAllConfirmed;
         hadRenamePlan = plan.length > 0 || planUnmatched.length > 0 || planAmbiguous.length > 0;
+
+        /* 行数/扫描完整性只作提示：不阻塞，但要让人看见 */
+        if (renameAllConfirmed && (!waitRes.ok || !listScanComplete)) {
+          warn(` ℹ️ 行数校验未通过（${waitRes.count}/${waitRes.expectedMin}，扫描完整=${listScanComplete}），`
+               + `但计划内 ${confirmedCount} 个已全部按完整名确认 → 继续下载`);
+        }
 
         await sleep(600, true);
 
@@ -3541,7 +3645,10 @@
       throw e;
     } finally {
       if (renameAllConfirmedOut || !hadRenamePlan) releaseBusy();
-      else warn('⛔ 改名未全部确认：保持忙碌标志');
+      else {
+        warn('⛔ 改名未全部确认：保持忙碌标志（本页刷新/跳转后自动解除）');
+        markBusyKeptForFailure();
+      }
     }
   }
 

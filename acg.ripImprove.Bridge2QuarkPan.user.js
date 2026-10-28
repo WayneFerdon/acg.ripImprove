@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.5
+// @version 3.14.6
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -1258,7 +1258,10 @@
       qa.setProgress(`${_shareFullCounts.num} / ${_shareFullCounts.total}`);
     }
   }
+  let _sharePollingStarted = false;
   function startSharePolling(qa) {
+    if (_sharePollingStarted) return;      /* 待机期间补做子任务时会二次进入，避免重复轮询 */
+    _sharePollingStarted = true;
     const tick = () => { try { refreshShareUI(qa); } catch {} };
     setInterval(tick, 800);
     let moTimer = null;
@@ -3061,6 +3064,40 @@
     return true;
   }
 
+  /* 只读地看一眼有没有属于自己的任务（不消费，用于待机期间轮询） */
+  function peekTask(shareId) {
+    if (!shareId) return null;
+    let t = null;
+    try { t = GM_getValue(GM_TASK_PREFIX + shareId, null); } catch {}
+    if (!t) {
+      const m = gmGet(GM_TASKS, {}) || {};
+      if (m[shareId]) t = m[shareId];
+    }
+    if (!t || !(t.ts > 0)) return null;
+    if (Date.now() - t.ts > TASK_TTL) return null;
+    return t;
+  }
+
+  /* 分享页进入待机后仍继续等一小段时间的子任务。
+   * 场景：后台标签页脚本执行被浏览器推迟 / 父页分批补开，任务可能写得比本页就绪晚。 */
+  function watchChildTaskWhileIdle(qa, ms = 60000) {
+    const shareId = extractShareId(location.href);
+    if (!shareId) return;
+    const t0 = Date.now();
+    let handled = false;
+    const tick = async () => {
+      if (handled) return;
+      if (Date.now() - t0 > ms) return;
+      let task = null;
+      try { task = peekTask(shareId); } catch {}
+      if (!task) { setTimeout(tick, 1500); return; }
+      handled = true;
+      log(`★ [子任务] 待机期间检测到任务 ${shareId}，立即接管`);
+      try { await tryHandleChildTask(qa); } catch (e) { warn('待机期间子任务处理异常', e); }
+    };
+    setTimeout(tick, 1500);
+  }
+
   async function saveShareUrlViaTab(qa, url) {
     const shareId = extractShareId(url);
     if (!shareId) return { kind: 'fail', message: 'bad-url' };
@@ -3088,19 +3125,35 @@
       ? Number(opts.timeout)
       : (TAB_RESULT_TIMEOUT + PARALLEL_GRACE_MS);
 
+    /* 同一 shareId 只开一次：重复链接会争抢同一个任务键，导致第二个页面永远拿不到任务 */
+    const seenSid = new Set();
     const jobs = (urls || []).map(url => ({
       url, shareId: extractShareId(url) || '', result: null, done: false, opened: false,
     }));
     for (const j of jobs) {
-      if (j.shareId) continue;
-      j.result = { kind: 'fail', message: 'bad-url' };
-      j.done = true;
+      if (!j.shareId) { j.result = { kind: 'fail', message: 'bad-url' }; j.done = true; continue; }
+      if (seenSid.has(j.shareId)) {
+        j.result = { kind: 'fail', message: 'duplicate-url' };
+        j.done = true;
+        continue;
+      }
+      seenSid.add(j.shareId);
     }
     const todo = jobs.filter(j => !j.done);
     log(`★ 并行转存：${todo.length} 个链接，${cap ? `并发上限 ${cap}` : '同时打开全部'}，` +
         `开页间隔 ${stagger}ms，总超时 ${Math.round(timeout / 1000)}s`);
 
     const openOne = async (j) => {
+      /* 必须先写任务再开页：子页脚本一就绪就会 consumeTask，晚写会让它直接进"待机" */
+      try {
+        clearResult(j.shareId);
+        setTask(j.shareId, j.url);
+      } catch (e) {
+        warn(' 写入子任务失败', e);
+        j.result = { kind: 'fail', message: 'set-task-failed' };
+        j.done = true;
+        return false;
+      }
       try {
         GM_openInTab(j.url, { active: false, insert: true, setParent: true });
         j.opened = true;
@@ -4474,6 +4527,7 @@
         log(`★ 分享页初始化（可见区）：扫描 ${qa.scanFileRows(document).length}`);
       })();
       log(`★ 分享页初始化（等待用户操作 / 子任务触发）`);
+      watchChildTaskWhileIdle(qa);
     } else if (isList) {
       qa.setActions([
         {

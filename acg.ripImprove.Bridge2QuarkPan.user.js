@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.4
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
+// @version 3.14.5
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -32,11 +32,20 @@
   const GM_CLEAR_FLAG = 'acgrip_quark_clear_records_flag';
   const GM_TASKS = 'acgrip_bridge_tasks';
   const GM_RESULTS = 'acgrip_bridge_results';
+  /* 并行转存时多个子标签页会同时读-改-写上面的共享 map（后写的会覆盖先写的，结果会丢）。
+   * 因此任务/结果改为按 shareId 单独存键；GM_COMM_INDEX 仅用于回收旧键，写丢了也不影响正确性。 */
+  const GM_TASK_PREFIX = 'acgrip_bridge_task_';
+  const GM_RESULT_PREFIX = 'acgrip_bridge_result_';
+  const GM_COMM_INDEX = 'acgrip_bridge_comm_index';
   const BUSY_KEY = 'acgrip_bridge_busy';
   const GM_FULL_RESAVE_DEBUG = 'acgrip_quark_full_resave_debug';
 
   const TASK_TTL = 3 * 60 * 1000;
   const TAB_RESULT_TIMEOUT = 90 * 1000;
+  /* 并行转存：0 = 同时打开全部（默认）；改成 2/3/4 可限制同时打开的分享页数量 */
+  const PARALLEL_SAVE_LIMIT = 0;
+  const PARALLEL_GRACE_MS = 60 * 1000;      /* 并行总超时 = 单页超时 + 宽限 */
+  const RESULT_STALE_MS = TAB_RESULT_TIMEOUT + PARALLEL_GRACE_MS;
 
   const BASE_CD = 30 * 60 * 1000;
   const MAX_CD = 7 * 24 * 60 * 60 * 1000;
@@ -179,47 +188,85 @@
     return dirty;
   }
 
+  function _commIndexAdd(shareId) {
+    if (!shareId) return;
+    try {
+      const idx = gmGet(GM_COMM_INDEX, {}) || {};
+      idx[shareId] = Date.now();
+      gmSet(GM_COMM_INDEX, idx);
+    } catch {}
+  }
   function setTask(shareId, url) {
-    const m = gmGet(GM_TASKS, {}) || {};
-    _pruneByTTL(m, TASK_TTL);
-    m[shareId] = { url, ts: Date.now() };
-    gmSet(GM_TASKS, m);
+    if (!shareId) return;
+    try { GM_setValue(GM_TASK_PREFIX + shareId, { url, ts: Date.now() }); } catch {}
+    _commIndexAdd(shareId);
   }
   function consumeTask(shareId) {
-    const m = gmGet(GM_TASKS, {}) || {};
-    _pruneByTTL(m, TASK_TTL);
-    const t = m[shareId] || null;
-    if (t) delete m[shareId];
-    gmSet(GM_TASKS, m);
+    if (!shareId) return null;
+    let t = null;
+    try { t = GM_getValue(GM_TASK_PREFIX + shareId, null); } catch {}
+    if (!t) {
+      /* 兼容旧版共享 map（升级时可能有残留） */
+      const m = gmGet(GM_TASKS, {}) || {};
+      if (m[shareId]) { t = m[shareId]; delete m[shareId]; gmSet(GM_TASKS, m); }
+    }
+    try { GM_setValue(GM_TASK_PREFIX + shareId, null); } catch {}
+    if (!t || !(t.ts > 0)) return null;
+    if (Date.now() - t.ts > TASK_TTL) return null;
     return t;
   }
   function clearTask(shareId) {
+    if (!shareId) return;
+    try { GM_setValue(GM_TASK_PREFIX + shareId, null); } catch {}
     const m = gmGet(GM_TASKS, {}) || {};
     if (m[shareId]) { delete m[shareId]; gmSet(GM_TASKS, m); }
   }
   function setResult(shareId, obj) {
-    const m = gmGet(GM_RESULTS, {}) || {};
-    _pruneByTTL(m, TAB_RESULT_TIMEOUT);
-    m[shareId] = { ...obj, ts: Date.now() };
-    gmSet(GM_RESULTS, m);
+    if (!shareId) return;
+    try { GM_setValue(GM_RESULT_PREFIX + shareId, { ...(obj || {}), ts: Date.now() }); } catch {}
+    _commIndexAdd(shareId);
   }
   function consumeResult(shareId) {
-    const m = gmGet(GM_RESULTS, {}) || {};
-    _pruneByTTL(m, TAB_RESULT_TIMEOUT);
-    const r = m[shareId] || null;
-    if (r) delete m[shareId];
-    gmSet(GM_RESULTS, m);
+    if (!shareId) return null;
+    let r = null;
+    try { r = GM_getValue(GM_RESULT_PREFIX + shareId, null); } catch {}
+    if (!r) {
+      const m = gmGet(GM_RESULTS, {}) || {};
+      _pruneByTTL(m, TAB_RESULT_TIMEOUT);
+      if (m[shareId]) { r = m[shareId]; delete m[shareId]; gmSet(GM_RESULTS, m); }
+    }
+    try { GM_setValue(GM_RESULT_PREFIX + shareId, null); } catch {}
+    if (!r) return null;
+    /* 上一轮遗留的陈旧结果不能当作本轮结果 */
+    if (!(r.ts > 0) || Date.now() - r.ts > RESULT_STALE_MS) return null;
     return r;
   }
   function clearResult(shareId) {
+    if (!shareId) return;
+    try { GM_setValue(GM_RESULT_PREFIX + shareId, null); } catch {}
     const m = gmGet(GM_RESULTS, {}) || {};
     if (m[shareId]) { delete m[shareId]; gmSet(GM_RESULTS, m); }
   }
   function cleanupBridgeComm() {
+    const now = Date.now();
     const tasks = gmGet(GM_TASKS, {}) || {};
     if (_pruneByTTL(tasks, TASK_TTL)) gmSet(GM_TASKS, tasks);
     const results = gmGet(GM_RESULTS, {}) || {};
     if (_pruneByTTL(results, TAB_RESULT_TIMEOUT)) gmSet(GM_RESULTS, results);
+    /* 独立键的旧数据：按索引回收（索引是尽力而为，写丢了最多残留一个小键） */
+    const idx = gmGet(GM_COMM_INDEX, {}) || {};
+    const keep = Math.max(TASK_TTL, RESULT_STALE_MS) + 3600000;
+    let changed = false;
+    for (const sid of Object.keys(idx)) {
+      if (now - (idx[sid] || 0) <= keep) continue;
+      delete idx[sid];
+      changed = true;
+      try {
+        GM_setValue(GM_TASK_PREFIX + sid, null);
+        GM_setValue(GM_RESULT_PREFIX + sid, null);
+      } catch {}
+    }
+    if (changed) gmSet(GM_COMM_INDEX, idx);
   }
 
   function getFolderId() {
@@ -436,6 +483,38 @@
     return gmGet(GM_RECORDS, {}) || {};
   }
   function saveRecords(recs) { gmSet(GM_RECORDS, recs); }
+
+  /* 并行转存时多个子标签页会同时改 GM_RECORDS（共享 map：后写的会覆盖先写的）。
+   * 写完回读校验，发现本次写入被覆盖就重试，保证最终生效。 */
+  async function mergeShareRecord(key, files, extra = {}) {
+    if (!key) return null;
+    const wanted = (files || []).map(f => normalizeFileName(f && f.name)).filter(Boolean);
+    for (let attempt = 1; attempt <= 4; attempt++) {
+      const recs = loadRecords();
+      const prev = recs[key] || {};
+      const merged = Array.isArray(prev.fileInfos) ? prev.fileInfos.slice() : [];
+      for (const f of (files || [])) {
+        upsertFileInfo(merged, {
+          name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig,
+          fid: f.fid || '', mtime: f.mtime || '',
+        });
+      }
+      recs[key] = {
+        ...prev, ts: Date.now(),
+        shareId: extra.shareId || prev.shareId || extractShareId(key),
+        fileInfos: merged, names: merged.map(x => x.name),
+      };
+      saveRecords(recs);
+      if (!wanted.length) return recs[key];
+      const cur = (loadRecords()[key]) || null;
+      const has = new Set(((cur && cur.fileInfos) || []).map(x => normalizeFileName(x && x.name)));
+      if (wanted.every(w => has.has(w))) return cur;
+      warn(` ⚠️ 记录写入被并发覆盖，重试 ${attempt}/4：${key}`);
+      await sleep(120 * attempt, true);
+    }
+    warn(` ⚠️ 记录写入多次被并发覆盖，放弃重试：${key}`);
+    return null;
+  }
 
   function collectSavedInfos(records) {
     return Object.values(records || {}).flatMap(r => Array.isArray(r.fileInfos) ? r.fileInfos : []);
@@ -2956,21 +3035,8 @@
       const savedFiles = exec.savedFiles || [];
       if (savedFiles.length) {
         const key = normalizeShareKey(location.href);
-        const recs = loadRecords();
-        const prev = recs[key] || {};
-        const merged = Array.isArray(prev.fileInfos) ? prev.fileInfos.slice() : [];
-        for (const f of savedFiles) {
-          upsertFileInfo(merged, {
-            name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig,
-            fid: f.fid || '', mtime: f.mtime || '',
-          });
-        }
-        recs[key] = {
-          ...prev, ts: Date.now(), shareId,
-          fileInfos: merged, names: merged.map(x => x.name),
-        };
-        saveRecords(recs);
-        log(` 记录已更新：${key} → ${merged.length} 条`);
+        const rec = await mergeShareRecord(key, savedFiles, { shareId });
+        log(` 记录已更新：${key} → ${((rec && rec.fileInfos) || []).length} 条`);
       }
       const summary = describeExec(exec);
       const savedBrief = savedFiles.map(f => ({
@@ -3011,6 +3077,106 @@
     if (r) return r;
     clearTask(shareId);
     return { kind: 'timeout', message: 'tab-timeout' };
+  }
+
+  /* 并行转存：一次性（或按 maxConcurrent 分批）打开所有需要的分享页，再统一收结果。
+   * 返回 [{url, shareId, result}]，顺序与入参一致；任务/结果按 shareId 独立存键，互不覆盖。 */
+  async function saveShareUrlsInParallel(qa, urls, opts = {}) {
+    const stagger = Number(opts.stagger) > 0 ? Number(opts.stagger) : 250;
+    const cap = Number(opts.maxConcurrent) > 0 ? Number(opts.maxConcurrent) : 0;   /* 0 = 不限 */
+    const timeout = Number(opts.timeout) > 0
+      ? Number(opts.timeout)
+      : (TAB_RESULT_TIMEOUT + PARALLEL_GRACE_MS);
+
+    const jobs = (urls || []).map(url => ({
+      url, shareId: extractShareId(url) || '', result: null, done: false, opened: false,
+    }));
+    for (const j of jobs) {
+      if (j.shareId) continue;
+      j.result = { kind: 'fail', message: 'bad-url' };
+      j.done = true;
+    }
+    const todo = jobs.filter(j => !j.done);
+    log(`★ 并行转存：${todo.length} 个链接，${cap ? `并发上限 ${cap}` : '同时打开全部'}，` +
+        `开页间隔 ${stagger}ms，总超时 ${Math.round(timeout / 1000)}s`);
+
+    const openOne = async (j) => {
+      try {
+        GM_openInTab(j.url, { active: false, insert: true, setParent: true });
+        j.opened = true;
+        return true;
+      } catch (e) {
+        clearTask(j.shareId);
+        j.result = { kind: 'fail', message: 'open-tab-failed' };
+        j.done = true;
+        return false;
+      }
+    };
+    const collect = () => {
+      for (const j of jobs) {
+        if (j.done || !j.opened || !j.shareId) continue;
+        const r = consumeResult(j.shareId);
+        if (r) { j.result = r; j.done = true; log(` ← 收到结果 ${j.shareId}：${r.kind}`); }
+      }
+    };
+    const pausedNow = () => !!(qa && qa.isPaused && qa.isPaused());
+
+    const t0 = Date.now();
+    let openedCount = 0;
+    /* 首批：不限并发时就是全部 */
+    for (const j of todo) {
+      if (cap && openedCount >= cap) break;
+      if (pausedNow()) break;
+      if (await openOne(j)) {
+        openedCount++;
+        log(` → 打开标签页（${openedCount}/${todo.length}）：${j.url}`);
+        await sleep(stagger, true);
+      }
+    }
+
+    for (;;) {
+      collect();
+      const notOpened = jobs.filter(j => !j.done && !j.opened);
+      if (notOpened.length) {
+        if (pausedNow()) {
+          for (const x of notOpened) { clearTask(x.shareId); x.result = { kind: 'paused' }; x.done = true; }
+          log(`⏸ 暂停，剩余 ${notOpened.length} 个不再打开`);
+        } else if (!cap || jobs.filter(j => j.opened && !j.done).length < cap) {
+          const j = notOpened[0];
+          if (await openOne(j)) {
+            openedCount++;
+            log(` → 补开标签页（${openedCount}/${todo.length}）：${j.url}`);
+            await sleep(stagger, true);
+            continue;
+          }
+        }
+      }
+      if (jobs.every(j => j.done)) break;
+      if (Date.now() - t0 > timeout) {
+        const lost = jobs.filter(j => !j.done);
+        for (const j of lost) {
+          clearTask(j.shareId);
+          j.result = j.opened ? { kind: 'timeout', message: 'tab-timeout' } : { kind: 'fail', message: 'not-opened' };
+          j.done = true;
+        }
+        warn(` ⚠️ 并行转存超时（${Math.round((Date.now() - t0) / 1000)}s），${lost.length} 个未收到结果`);
+        break;
+      }
+      try {
+        const doneN = jobs.filter(j => j.done).length;
+        if (qa && qa.setProgress) qa.setProgress(`${doneN} / ${jobs.length}`);
+      } catch {}
+      await sleep(500, true);
+    }
+
+    const kinds = jobs.reduce((m, j) => {
+      const k = (j.result && j.result.kind) || 'none';
+      m[k] = (m[k] || 0) + 1;
+      return m;
+    }, {});
+    log(`★ 并行转存结束：${Object.entries(kinds).map(([k, n]) => `${k}×${n}`).join('，')}` +
+        `（耗时 ${Math.round((Date.now() - t0) / 1000)}s）`);
+    return jobs;
   }
 
   /* ===== 页面内刷新 ===== */
@@ -3390,38 +3556,22 @@
       let scanIncompleteCount = 0;
       const savedByUrl = [];
 
-      for (let i = 0; i < pending.length; i++) {
-        if (qa.isPaused && qa.isPaused()) {
-          warn(`⏸ 暂停，停止后续 ${pending.length - i} 个子任务`);
-          qa.setStatus('已暂停', 'running');
-          break;
-        }
-        const url = pending[i];
-        qa.setProgress(`${i + 1} / ${pending.length}`);
-        log(`--- [${i + 1}/${pending.length}] ${url}`);
+      /* 并行：一次性打开全部（或按上限分批）分享页，再统一收结果 */
+      let jobs;
+      try { jobs = await saveShareUrlsInParallel(qa, pending, { maxConcurrent: PARALLEL_SAVE_LIMIT }); }
+      catch (e) { warn('并行转存异常', e); jobs = pending.map(u => ({ url: u, result: { kind: 'fail', message: String(e && e.message || e) } })); }
 
-        let r;
-        try { r = await saveShareUrlViaTab(qa, url); }
-        catch (e) { warn(`处理失败：${url}`, e); continue; }
+      for (let i = 0; i < jobs.length; i++) {
+        const url = jobs[i].url;
+        const r = jobs[i].result || { kind: 'fail', message: 'no-result' };
+        log(`--- [${i + 1}/${jobs.length}] ${url} → ${r.kind}`);
 
         const key = normalizeShareKey(url);
         if (r.kind === 'success' || r.kind === 'partial') {
           if (r.kind === 'success') successCount++;
           else partialCount++;
-          const recs = loadRecords();
-          const prev = recs[key] || {};
-          const merged = Array.isArray(prev.fileInfos) ? prev.fileInfos.slice() : [];
-          for (const f of (r.savedFiles || [])) {
-            upsertFileInfo(merged, {
-              name: f.name, sizeStr: f.sizeStr, iconSig: f.iconSig,
-              fid: f.fid || '', mtime: f.mtime || '',
-            });
-          }
-          recs[key] = {
-            ...prev, ts: Date.now(), shareId: extractShareId(key),
-            fileInfos: merged, names: merged.map(x => x.name),
-          };
-          saveRecords(recs);
+          const rec = await mergeShareRecord(key, r.savedFiles || [], { shareId: extractShareId(key) });
+          const merged = (rec && rec.fileInfos) || [];
           if (r.kind === 'partial') warn(`⚠️ 部分成功（${(r.savedFiles || []).length}/${r.totalPlanned}）：${url}`);
           else log(`✅ 已记录 ${merged.length} 条到 ${key}`);
           if (Array.isArray(r.savedFiles) && r.savedFiles.length) {
@@ -3450,7 +3600,6 @@
         } else {
           warn(`⚠️ 结果 ${r.kind}: ${url}`);
         }
-        if (i < pending.length - 1) await sleep(1000, true);
       }
 
       qa.setStatus('转存完成', 'done');

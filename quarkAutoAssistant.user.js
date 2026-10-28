@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.2.2
+// @version      6.2.3
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后自动下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -950,6 +950,12 @@
       const empty = isEmptyUiVisible();
       const rows = document.querySelectorAll('tr.ant-table-row[data-row-key]').length;
       const info = getVirtualScrollInfo(tableBody());
+      /* UI 直证：底部"拖拽/粘贴"灰框已渲染 ⇒ 列表已渲染完（短列表一屏到底也走这条），
+       * 不必再等"签名连续 2 次不变"，更不该等到超时 */
+      if (!empty && isListAtBottom()) {
+        last = { empty, rows, info, uiBottom: true };
+        return last;
+      }
       if (!empty && rows === 0) { lastSig = ''; stable = 0; return null; }
       if (!empty && info && !(info.vtHeight > 0)) { lastSig = ''; stable = 0; return null; }
       const sig = `${empty ? 'E' : 'R'}|${rows}|${info ? Math.round(info.vtHeight) : '-'}`;
@@ -975,6 +981,40 @@
       return !!document.querySelector(
         '.recent-loading-tr .ant-spin-spinning, tr[data-row-config-type="more"] .ant-spin-spinning'
       );
+    } catch { return false; }
+  }
+
+  /* ===== "已到底"的 UI 判据（不再靠超时/几何推算） =====
+   * 依据快照实测：
+   *   初始加载   → 无 tr.drag-bottom、无 more 行
+   *   分批加载中 → 无 tr.drag-bottom、有 tr[data-row-config-type="more"]
+   *   已到底部   → 有 tr.drag-bottom（拖拽/粘贴灰框）、无 more 行
+   * 即灰框是虚拟滚动的**最后一行**，只在渲染窗口覆盖到末尾时才存在，是最直接的证据。 */
+  function hasBottomDropRow(doc = document) {
+    try {
+      const list = doc.querySelectorAll('tr.drag-bottom');
+      for (const tr of list) {
+        if (!tr || !tr.isConnected) continue;
+        if (tr.closest && tr.closest('.ant-table-measure-row')) continue;
+        return true;
+      }
+      return false;
+    } catch { return false; }
+  }
+  /* 是否还存在"加载更多"行（不管转圈有没有在转）：有它说明后面还有批次没来 */
+  function hasMoreRow(doc = document) {
+    try {
+      return !!doc.querySelector(
+        'tr[data-row-config-type="more"], tr.recent-loading-tr'
+      );
+    } catch { return false; }
+  }
+  /* 列表是否已经真正到最后一行：见到灰框且没有更多批次 */
+  function isListAtBottom(doc = document) {
+    try {
+      if (hasMoreRow(doc)) return false;
+      if (hasBottomDropRow(doc)) return true;
+      return false;
     } catch { return false; }
   }
 
@@ -1023,25 +1063,40 @@
     let lastScrollH = body.scrollHeight;
     let stable = 0;
     let reachedBottom = false;
+    let geomBottom = false;   /* 几何到底（分享页没有拖拽灰框，只能靠它兜底） */
     let timedOut = false;
     const t0 = Date.now();
 
     while (Date.now() - t0 < maxMs) {
       if (isLoadingAnimPresent()) { await sleep(200, true); continue; }
       addAll();
+
+      /* 判据一（首选，直接看 UI）：底部"拖拽/粘贴"灰框已渲染且没有更多批次 → 已到最后一行 */
+      if (isListAtBottom()) {
+        reachedBottom = true;
+        /* 灰框出现即代表渲染窗口已覆盖末尾；再确认数据行不再增长即可收工 */
+        if (allKeys.size === last) { if (++stable >= 2) break; }
+        else stable = 0;
+        last = allKeys.size;
+        lastScrollH = body.scrollHeight;
+        await sleep(sleepStep, true);
+        continue;
+      }
+
       const scrollH = body.scrollHeight;
       const atBottom = body.scrollTop + body.clientHeight >= scrollH - 2;
+      geomBottom = atBottom;   /* 只反映这一轮：后面若又加载出更多行会被覆盖回 false */
       if (atBottom) {
-        reachedBottom = true;
-        if (hasLoadingMore()) {
-          /* 到底了但还有下一批在加载：等它加载完，再重新计稳定 */
-          await until(() => !hasLoadingMore(), 150, 4000);
+        if (hasMoreRow() || hasLoadingMore()) {
+          /* 到底了但还有下一批：等它加载完（有没有 more 行就是判据，不看时间） */
+          await until(() => !hasMoreRow() && !hasLoadingMore(), 150, 8000);
           stable = 0;
           await sleep(120, true);
           continue;
         }
+        /* 几何到底但灰框还没渲染（过渡帧/行高极端）：保持旧稳定判定兜底 */
         if (allKeys.size === last && scrollH === lastScrollH) {
-          if (++stable >= 3) break;
+          if (++stable >= 3) { reachedBottom = true; break; }
         } else stable = 0;
       } else stable = 0;
       last = allKeys.size;
@@ -1051,6 +1106,7 @@
       }
       await sleep(sleepStep, true);
     }
+    /* timedOut 只表示"循环用完了时间预算"，**不再作为列表是否加载完的判据** */
     timedOut = (Date.now() - t0) >= maxMs;
 
     addAll();
@@ -1058,9 +1114,14 @@
     await sleep(120, true);
 
     const empty = isEmptyUiVisible();
-    const complete = reachedBottom && !timedOut;
+    /* 完整性只看 UI 证据：渲染出底部灰框（个人页硬证据）或"几何到底且无更多批次"（分享页/兜底），
+     * 与耗时/超时无关 */
+    const uiBottom = isListAtBottom();
+    reachedBottom = uiBottom || reachedBottom || (geomBottom && !hasMoreRow());
+    const complete = reachedBottom || empty;
     log(`★ [${tag}] 全量扫描：文件 ${byFid.size} / 数据行 ${allKeys.size} / 推断 ${total == null ? '?' : total}` +
-        `${empty ? '（空目录）' : ''} → 到底=${reachedBottom} 超时=${timedOut} → ${complete ? '可用' : '未确认'}`);
+        `${empty ? '（空目录）' : ''} → 底部灰框=${hasBottomDropRow()} 更多批次=${hasMoreRow()} 几何到底=${geomBottom} ` +
+        `到底=${reachedBottom}${timedOut ? '（循环用满预算）' : ''} → ${complete ? '可用' : '未确认'}`);
     if (total != null && allKeys.size < total) {
       warn(`  ⚠️ 数据行 ${allKeys.size} < 推断 ${total}：列表可能仍有未渲染的行（清理会逐条复核，不会误清）`);
     }
@@ -1353,7 +1414,7 @@
     out.scanned = true;
     out.count = scan.count || 0;
     if (!scan.complete) {
-      warn(`☁️ FDM 认领：列表扫描未确认完整（到底=${scan.reachedBottom} 超时=${scan.timedOut}）` +
+      warn(`☁️ FDM 认领：列表扫描未到末尾（底部灰框=${hasBottomDropRow()} 更多批次=${hasMoreRow()}）` +
            `，只认领本轮确实看到的行`);
     }
 
@@ -1670,13 +1731,9 @@
 
   /* 步骤 3：只按"删除后的列表"清记录 —— 不看时间，只看文件是否还在列表里 */
   /* 扫描结果是否可用来清记录：
-   *   1) 必须滚到底且没超时；
-   *   2) 见过的数据行数不能明显少于 vt 高度推算的条数（差 1 容忍，行高不一时会有偏差）。
-   * 注：第 2 条只是"安全护栏"，不满足时**不清记录**，但不会拦截整轮流程。 */
+   *   只认 UI 证据 —— 已渲染出底部灰框（complete），不再看条数推算，也不看耗时。 */
   function scanTrust(s) {
-    if (!s || s.complete !== true) return false;
-    if (s.total == null) return true;
-    return s.allCount >= s.total - 1;
+    return !!(s && s.complete === true);
   }
 
   /* 步骤 3：只清"文件确实不在列表里"的记录。
@@ -2247,16 +2304,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.2.2`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.2.3`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.2.2');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.2.3');
     } else {
-      log('平台层就绪（其他页）v6.2.2');
+      log('平台层就绪（其他页）v6.2.3');
     }
     startGrayPolling();
   })();

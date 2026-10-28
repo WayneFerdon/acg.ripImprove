@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.6
+// @version 3.14.7
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -1014,7 +1014,34 @@
   function isLastScanComplete(maxAgeMs = 180000) {
     if (!_lastScan) return false;
     if (Date.now() - _lastScan.at > maxAgeMs) return false;
-    return _lastScan.reachedBottom === true && _lastScan.timedOut !== true;
+    /* 只认 UI 证据（已渲染到底部灰框），不再看"有没有超时" */
+    return _lastScan.reachedBottom === true;
+  }
+
+  /* ===== "已到底"的 UI 判据 =====
+   * 快照实测：初始加载无 tr.drag-bottom；分批加载中有 tr[data-row-config-type="more"]；
+   * 已到底部才有 tr.drag-bottom（拖拽/粘贴灰框，虚拟滚动的最后一行）。 */
+  function hasBottomDropRow(doc = document) {
+    try {
+      const list = doc.querySelectorAll('tr.drag-bottom');
+      for (const tr of list) {
+        if (!tr || !tr.isConnected) continue;
+        if (tr.closest && tr.closest('.ant-table-measure-row')) continue;
+        return true;
+      }
+      return false;
+    } catch { return false; }
+  }
+  function hasMoreRow(doc = document) {
+    try {
+      return !!doc.querySelector('tr[data-row-config-type="more"], tr.recent-loading-tr');
+    } catch { return false; }
+  }
+  function isListAtBottom(doc = document) {
+    try {
+      if (hasMoreRow(doc)) return false;
+      return hasBottomDropRow(doc);
+    } catch { return false; }
   }
 
   /* 扫描所有行。返回数组，调用方用 length vs expected 判断完整性。 */
@@ -1104,20 +1131,31 @@
     let lastSize = visited.size;
     let stallCount = 0;
     let reachedBottom = false;
+    let geomBottom = false;    /* 几何到底（分享页没有拖拽灰框，只能靠它兜底） */
     let timedOut = false;
     const MAX_STALL_BOTTOM = 5;
     const MAX_STALL_MID = 5;
 
     while (Date.now() - t0 < maxMs) {
-      if (expected && visited.size >= expected) break;
+      /* 首选判据（直接看 UI）：底部灰框已渲染且无更多批次 → 已到最后一行 */
+      if (isListAtBottom(doc)) {
+        reachedBottom = true;
+        const added0 = harvest();
+        if (added0 === 0 && visited.size === lastSize) {
+          if (++stallCount >= 2) break;
+        } else stallCount = 0;
+        lastSize = visited.size;
+        await qa.sleep(sleepStep);
+        continue;
+      }
       const bodyH = body.clientHeight;
       const scrollH = body.scrollHeight;
       const curTop = body.scrollTop;
       const atBottom = curTop + bodyH >= scrollH - 8;
-      reachedBottom = atBottom;   /* 取最后一次观测值：中途停顿 break 时不能算"到底" */
+      geomBottom = atBottom;   /* 只反映"这一轮"是否到底：后续若又加载出更多行，会被覆盖回 false */
       if (atBottom) {
-        if (hasLoadingMore()) {
-          await qa.until(() => !hasLoadingMore(), loadingMoreCheck, loadingMoreWait);
+        if (hasMoreRow(doc) || hasLoadingMore()) {
+          await qa.until(() => !hasMoreRow(doc) && !hasLoadingMore(), loadingMoreCheck, loadingMoreWait);
         } else {
           await qa.sleep(sleepStep);
         }
@@ -1151,12 +1189,20 @@
     await qa.sleep(sleepRestore);
 
     const result = [...visited.values()];
-    _lastScan = { count: result.length, expected, reachedBottom, timedOut, at: Date.now() };
-    log(` ★ 滚动扫描：收集 ${result.length} 行（头部 ${expected || '?'}，到底=${reachedBottom}，超时=${timedOut}）`);
+    /* 收尾再核一次：
+     *   个人页 → 底部拖拽灰框已渲染 = 到底（硬证据）
+     *   分享页 → 没有灰框，只能用"这一轮几何到底 且 无更多批次"兜底
+     * timedOut 仅记录"循环用满预算"，不参与完整性判定 */
+    const uiBottom = isListAtBottom(doc);
+    reachedBottom = uiBottom || (geomBottom && !hasMoreRow(doc));
+    _lastScan = { count: result.length, expected, reachedBottom, timedOut, uiBottom, geomBottom, at: Date.now() };
+    log(` ★ 滚动扫描：收集 ${result.length} 行（头部 ${expected || '?'}，` +
+        `底部灰框=${hasBottomDropRow(doc)} 更多批次=${hasMoreRow(doc)} 几何到底=${geomBottom} 到底=${reachedBottom}` +
+        `${timedOut ? '，循环用满预算' : ''}）`);
 
     if (useCache && key) {
-      if (reachedBottom && !timedOut) setAllFilesCache(key, result);
-      else warn(` ⚠️ 扫描未确认完整（${result.length} 行，到底=${reachedBottom}），不写缓存`);
+      if (reachedBottom) setAllFilesCache(key, result);
+      else warn(` ⚠️ 扫描未到末尾（${result.length} 行，未见底部灰框），不写缓存`);
     }
     return result;
   }

@@ -2567,18 +2567,6 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     btn.style.cursor = enabled ? '' : 'not-allowed';
   }
 
-  function normalizeRow(r) {
-    const out = {};
-    for (const k of Object.keys(r).sort()) {
-      if (k === '已下载') {
-        out[k] = parseDownloadedToList(r[k]);
-      } else {
-        const v = String(r[k] ?? '').trim();
-        if (v !== '') out[k] = v;
-      }
-    }
-    return out;
-  }
 
   function rowCompareKey(r) {
     const src = r || {};
@@ -2612,7 +2600,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     .join('\u0002');
   }
 
-  function hasAnyChange(panelRows, panelDelay, panelLast) {
+  function hasAnyChange(panelRows, panelDelay, _panelLast) {
     try {
       for (const tr of tbody.children) {
         if (!tr._row) continue;
@@ -3013,17 +3001,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     return [...tbody.children].filter(tr => tr._row);
   }
 
-  function indexOfTr(tr) {
-    return getMainTrs().indexOf(tr);
-  }
 
-  function getFocusTr() {
-    const ae = document.activeElement;
-    const tr = ae?.closest?.('tr');
-    if (tr && tr._row) return tr;
-    if (selAnchorTr && selAnchorTr.isConnected) return selAnchorTr;
-    return null;
-  }
 
   function selectSingle(tr) {
     for (const t of tbody.children) if (t._row) t.classList.remove('row-selected');
@@ -3064,10 +3042,6 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     const targetCells = getRowCells(trs[newIdx]);
     const target = targetCells[Math.min(colIdx, targetCells.length - 1)] || targetCells[0];
     if (target) try { target.host.focus({ preventScroll: true }); } catch {}
-  }
-  function toggleRowSelect(tr, add) {
-    if (add) tr.classList.toggle('row-selected'); else tr.classList.add('row-selected');
-    updateSelectionBorders();
   }
   function selectRange(from, to) {
     clearRowSelection();
@@ -3348,7 +3322,6 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
         input.style.width = '';
         input.style.maxWidth = '';
 
-        const stillFocused = document.activeElement === input || td.contains(document.activeElement);
         td.classList.remove('u-focus-expand');
 
         if (commit) {
@@ -5217,7 +5190,6 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     }
     const max = Number(effective(row, '最大', parsed)) || 0;
     const next = Number(row.下集) || 0;
-    const kai = normalizeKai(Number(effective(row, '开播', parsed))) || 0;
     const hou = Number(effective(row, '放送', parsed)) || 0;
     const init = Number(effective(row, '初始', parsed)) || 0;
     const isEnd = max > 1 && next + 1 > max;
@@ -5344,7 +5316,6 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   }
 
   function autoResizeInput(input) {
-    const cls = input.classList;
 
     if (input.classList && input.classList.contains('u-bgmid')) {
       /* 保持原逻辑（历史遗留，可能已不触发，因为 BGMID 已改复合单元格） */
@@ -5808,11 +5779,6 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   function layoutOverlay() {
     const vw = window.innerWidth || document.documentElement.clientWidth;
     const vh = window.innerHeight || document.documentElement.clientHeight;
-    const origTable =
-          document.querySelector('body > .container > table') ||
-          document.querySelector('.container > table') ||
-          document.querySelector('.container table') ||
-          document.querySelector('table');
 
     const prevMaxW = dialog.style.maxWidth;
     dialog.style.maxWidth = 'none';

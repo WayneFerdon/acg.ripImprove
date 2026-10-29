@@ -1,3 +1,13 @@
+/*
+ * @Author: WayneFerdon wayneferdon@hotmail.com
+ * @Date: 2026-10-30 00:20:19
+ * @LastEditors: WayneFerdon wayneferdon@hotmail.com
+ * @LastEditTime: 2026-10-30 00:27:09
+ * @FilePath: \acg.ripImprove\quarkAutoAssistant.user.js
+ * ----------------------------------------------------------------
+ * Licensed to the .NET Foundation under one or more agreements.
+ * The .NET Foundation licenses this file to you under the MIT license.
+ */
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
@@ -593,35 +603,6 @@
     }
   }
 
-  async function handleApiDialog() {
-    const g = await untilOrGiveUp(() => document.querySelector('.swal2-popup'), 250, 5000);
-    if (!g.ok) throw new Error('未弹出 API 下载对话框');
-    const popup = g.result;
-    const link = await until(() => {
-      const el = document.querySelector('.listener-link-api');
-      if (el) return el;
-      const err = document.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning');
-      if (err) throw new Error('弹窗返回错误');
-      return null;
-    }, 250, 8000, { throwOnTimeout: true });
-    const dlink = link.dataset.link || '';
-    const fname = link.dataset.filename || '';
-    if (!dlink || /失败|提示|请先|异常/.test(dlink)) {
-      const closeBtn = document.querySelector('.swal2-close');
-      if (closeBtn && isVisible(closeBtn)) realClick(closeBtn);
-      await until(() => !document.querySelector('.swal2-popup'), 100, 1500);
-      throw new Error('链接无效: ' + dlink.slice(0, 80));
-    }
-    log(`  触发下载: ${fname}`);
-    realClick(link);
-    await until(() => {
-      if (!document.querySelector('.swal2-popup')) return true;
-      const btn = document.querySelector('.swal2-close');
-      if (btn && isVisible(btn)) realClick(btn);
-      return false;
-    }, 100, 2000);
-    await until(() => !document.querySelector('.swal2-popup'), 150, 3000);
-  }
 
   async function collectApiLinks(timeout = 15000) {
     const g = await untilOrGiveUp(() => {
@@ -658,14 +639,6 @@
     return until(() => document.querySelector('.quark-button.pl-button'), 500, 20000);
   }
 
-  function clickRefresh() {
-    const sels = ['.fl-refresh', '.fl-refresh img', '[class*="fl-refresh"]', '[class*="refresh"]'];
-    for (const sel of sels) {
-      const el = document.querySelector(sel);
-      if (el) { realClick(el); return true; }
-    }
-    return false;
-  }
 
   async function clearRowSelection() {
     const rows = document.querySelectorAll('tr.ant-table-row, [data-row-key]');

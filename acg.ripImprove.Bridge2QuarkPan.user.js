@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.7
+// @version 3.14.10
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -102,38 +102,43 @@
     }
   }
 
-  async function sleep(ms, isForBattle) {
-    if (!ms || ms <= 0) return;
-    if (!isForBattle || ms >= _1s) {
-      return new Promise((resolve) => setTimeout(resolve, ms));
+  /* allowZero=true 时，ms<=0 也会 setTimeout(0) 真正让出一次事件循环。
+   * 默认（false）仍是"<=0 立即返回"，保持旧调用点语义不变。
+   * 轮询必须走这条路：宏任务让出控制权，不会像微任务忙等那样卡死页面。 */
+  async function sleep(ms, isForBattle, allowZero = false) {
+    const n = Number(ms) || 0;
+    if (n <= 0) {
+      if (!allowZero) return;
+      return new Promise((resolve) => setTimeout(resolve, 0));
     }
-    ms = Math.max(ms, 50);
-    return _getTimerWorker()(ms);
+    if (!isForBattle || n >= _1s) {
+      return new Promise((resolve) => setTimeout(resolve, n));
+    }
+    return _getTimerWorker()(Math.max(n, 50));
   }
 
-  /* 兼容旧签名 until(fn, delay, timeout)：超时返回 null（大量旧调用点依赖此语义） */
-  async function until(fn, delay = 200, timeout = 10000) {
-    const pollMs = delay === 0 ? 0 : Math.max(50, delay ?? 50);
-    const waitMs = Number(timeout) > 0 ? Number(timeout) : 0;
-    const t0 = Date.now();
+  /* 一直等到 fn 返回真值。
+   * delay/timeout 形参仅为兼容旧调用点保留，**实际一律忽略**：
+   *   ① 轮询间隔固定 setTimeout(0)——宏任务会让出事件循环，不会像微任务忙等那样卡死页面；
+   *   ② 不设时间上限——异步结果没到就继续等，等的对象是 UI，不是计时器。 */
+  async function until(fn, _delay = 0, _timeout = 0) {
     for (;;) {
       const result = await fn();
       if (result) return result;
-      if (waitMs > 0 && Date.now() - t0 >= waitMs) return null;
-      await sleep(pollMs, true);
+      await sleep(0, true, true);
     }
   }
 
-  /* 严格版本：超时抛异常 */
-  async function untilStrict(fn, delay, maxWaitMs) {
-    const pollMs = delay === 0 ? 0 : Math.max(50, delay ?? 50);
+  /* 严格版本：可显式给"放弃"上限并抛异常（仅 untilOrGiveUp 这类"给了就放弃"的场景使用）；
+   * 轮询间隔同样固定 setTimeout(0)。 */
+  async function untilStrict(fn, _delay, maxWaitMs) {
     const waitMs = Number(maxWaitMs) > 0 ? Number(maxWaitMs) : 0;
     const t0 = Date.now();
     for (;;) {
       const result = await fn();
       if (result) return result;
       if (waitMs > 0 && Date.now() - t0 >= waitMs) throw new Error(`untilStrict 超时：${waitMs}ms`);
-      await sleep(pollMs, true);
+      await sleep(0, true, true);
     }
   }
 
@@ -210,8 +215,10 @@
       const m = gmGet(GM_TASKS, {}) || {};
       if (m[shareId]) { t = m[shareId]; delete m[shareId]; gmSet(GM_TASKS, m); }
     }
+    /* 没有任务就不要写存储：轮询已改为 0ms，无谓的写会被放大成每秒数百次 */
+    if (!t) return null;
     try { GM_setValue(GM_TASK_PREFIX + shareId, null); } catch {}
-    if (!t || !(t.ts > 0)) return null;
+    if (!(t.ts > 0)) return null;
     if (Date.now() - t.ts > TASK_TTL) return null;
     return t;
   }
@@ -235,8 +242,9 @@
       _pruneByTTL(m, TAB_RESULT_TIMEOUT);
       if (m[shareId]) { r = m[shareId]; delete m[shareId]; gmSet(GM_RESULTS, m); }
     }
-    try { GM_setValue(GM_RESULT_PREFIX + shareId, null); } catch {}
+    /* 没有结果就不要写存储：0ms 轮询下每次写 null 会被放大成每秒数百次 */
     if (!r) return null;
+    try { GM_setValue(GM_RESULT_PREFIX + shareId, null); } catch {}
     /* 上一轮遗留的陈旧结果不能当作本轮结果 */
     if (!(r.ts > 0) || Date.now() - r.ts > RESULT_STALE_MS) return null;
     return r;
@@ -1346,21 +1354,14 @@
     if (el.classList.contains('order-asc')) return 'asc';
     return 'none';
   }
-  async function ensureTimeDescSort(qa, doc = document, opts = {}) {
-    const interval = opts.interval ?? 200;
-    const headerTimeout = opts.headerTimeout ?? 15000;
-    const settleTimeout = opts.settleTimeout ?? 6000;
-    const maxTries = opts.maxTries ?? 4;
-    const th0 = await until(() => findTimeSortHeader(doc), interval, headerTimeout);
-    if (!th0) {
-      warn(` 排序：${headerTimeout}ms 内未找到"修改日期"表头，跳过`);
-      return { ok: false, reason: 'no-th' };
-    }
+  async function ensureTimeDescSort(qa, doc = document) {
+    const th0 = await until(() => findTimeSortHeader(doc));
     if (getThSortState(th0) === 'desc') {
       log(' 排序：已是"修改日期"降序');
       return { ok: true, method: 'already' };
     }
-    for (let i = 0; i < maxTries; i++) {
+    /* 一直点到降序为止（不设次数上限）：每次点击后等"状态真的变了"，等不到就继续等，不放弃 */
+    for (let i = 0; ; i++) {
       const th = findTimeSortHeader(doc);
       if (!th) { warn(' 排序：点击过程中表头消失，跳过'); return { ok: false, reason: 'no-th-midway' }; }
       if (getThSortState(th) === 'desc') return { ok: true, method: i === 0 ? 'already' : 'clicked', tries: i };
@@ -1377,11 +1378,9 @@
         if (st === 'desc') return { done: true, st };
         if (st !== before) return { done: false, st };
         return null;
-      }, interval, settleTimeout);
+      });
       if (got && got.done) return { ok: true, method: 'clicked', tries: i + 1 };
     }
-    warn(` 排序：${maxTries} 次点击后仍未切到降序，放弃`);
-    return { ok: false, reason: 'cannot-desc' };
   }
 
   /* ===== 转存原语 ===== */
@@ -2636,42 +2635,7 @@
     return /转存中|上传中|保存中|正在转存|处理中|离线下载中|等待中/.test(row.textContent);
   }
 
-  async function runRenameSmokeTest(qa, doc = document) {
-    const files = (qa.scanFileRows(doc) || []).filter(f => f.fid && f.row && !isFolderFile(f));
-    if (!files.length) { alert('当前可见区没有可改名的文件行'); return; }
-    const f = files[0];
-    const base = normalizeFileName(f.name);
-    const next = buildRenamedFileName('测试改名', base);
-    if (!next) { alert('难以构造测试文件名'); return; }
-    log('=== 改名自检 ===');
-    const rep = await applyListRenames(qa, [{ old: f.name, next, fid: f.fid }]);
-    if (rep.renamed) alert(`✅ 改名成功\n\n${f.name}\n→ ${next}`);
-    else alert(`❌ 改名未确认成功（成功 ${rep.renamed} / 失败 ${rep.failed} / 跳过 ${rep.skipped}）`);
-  }
 
-  function runRenameDiagnose(qa, doc = document) {
-    const lines = [];
-    const files = (qa.scanFileRows(doc) || []).filter(f => f.fid && f.row && !isFolderFile(f));
-    lines.push(`可见文件行：${files.length}`);
-    const f = files[0];
-    if (!f) { alert(lines.join('\n') + '\n\n当前可见区没有文件行'); return; }
-    const cell = getNameCellOnly(f.row);
-    lines.push(`首个文件：${f.name}`);
-    lines.push(`fid：${f.fid}`);
-    lines.push(`mtime：${f.mtime || '（无）'}`);
-    lines.push(`行 class：${f.row.className}`);
-    lines.push(`名字单元格：${cell ? `<${cell.tagName.toLowerCase()} class="${cell.className}">` : '未找到 .filename-text'}`);
-    if (cell) {
-      lines.push(`title：${cell.getAttribute('title')}`);
-    }
-    const fit = fitAcgName('测试改名', f.name);
-    lines.push(`改名目标名示例：${fit.name || '（构不出）'}${fit.truncated ? '（会被截短）' : ''}`);
-    lines.push(`needRename(当前名, '测试改名') = ${needRename(f.name, '测试改名')}`);
-    lines.push(`顶栏「重命名」按钮：${findToolbarRenameButton(doc) ? '已找到' : '未找到'}`);
-    lines.push(`表头全选状态：${getHeaderCheckState(doc)}`);
-    lines.push(`可见选中行：${getSelectedFids(doc).length}`);
-    alert(lines.join('\n'));
-  }
 
   /* ===== 逐行勾选 ===== */
   async function applyTargetChecks(qa, doc, targets, opts = {}) {
@@ -2828,33 +2792,85 @@
     return { ok: false, files: cur, count: cur.length, expected };
   }
 
-  /* 返回 {ok, count, expectedMin}：ok=true 表示行数达到 expectedMin 并稳定 */
-  async function waitForListRowsStable(qa, doc, expectedMin, timeout = 10000) {
-    const t0 = Date.now();
+  /* 空目录 UI（"暂无文件"态）：QA 有实现就复用，避免两套判据不一致 */
+  function isEmptyListUi(qa, doc = document) {
+    try {
+      if (qa && typeof qa.isEmptyUiVisible === 'function') return !!qa.isEmptyUiVisible();
+    } catch {}
+    try {
+      const w = doc.querySelector('.table-empty-wrap');
+      if (!w) return false;
+      const op = getComputedStyle(w).opacity;
+      return Number(op) > 0.01;
+    } catch { return false; }
+  }
+
+  /* 分享页保存弹窗里的"转存至"路径（如「全部文件/来自：分享」） */
+  function readSaveTargetPath(doc = document) {
+    try {
+      const el = doc.querySelector('.share-path .path-name');
+      if (!el) return '';
+      return String(el.getAttribute('title') || el.textContent || '').replace(/\s+/g, ' ').trim();
+    } catch { return ''; }
+  }
+
+  /* 个人页面包屑（如「全部文件/来自：分享」），用于和子任务的转存路径比对 */
+  function readListBreadcrumb(doc = document) {
+    try {
+      const wrap = doc.querySelector('.file-list-breadcrumb .primary')
+        || doc.querySelector('.file-list-breadcrumb');
+      if (!wrap) return '';
+      const parts = [...wrap.querySelectorAll('.bcrumb-filename')]
+        .map(el => String(el.getAttribute('title') || el.textContent || '').trim())
+        .filter(Boolean);
+      return parts.join('/');
+    } catch { return ''; }
+  }
+
+  /* 判断"刷新后的列表已到位"——只看 UI 事实，一直等到条件成立为止：
+   *   ① 表格 spin 已消失（刷新动作结束）
+   *   ② 行数/空态连续两次采样一致（列表稳定）
+   * 不设时间上限：异步结果没到就继续等，等的对象是 UI，不是计时器。 */
+  async function waitForListRowsStable(qa, doc, expectedMin) {
     const expMin = Math.max(1, Number(expectedMin) || 1);
-    let last = -1, stable = 0;
-    while (Date.now() - t0 < timeout) {
-      if (isShareTableLoading(doc)) { last = -1; stable = 0; await sleep(200, true); continue; }
-      const cnt = (qa.scanFileRows(doc) || []).length;
-      if (cnt === last && cnt > 0) {
-        stable++;
-        if (cnt >= expMin && stable >= 2) {
-          log(` ★ 刷新后列表稳定：${cnt} 行（期望 ≥${expMin}）`);
-          return { ok: true, count: cnt, expectedMin: expMin };
-        }
-        if (cnt < expMin && stable >= 6) {
-          log(` ⏱ 刷新后行数稳定但少于预期：${cnt} < ${expMin}，等待超时视作不完整`);
-          return { ok: false, count: cnt, expectedMin: expMin };
-        }
-      } else {
-        stable = 0;
+    let lastSig = '', stable = 0;
+    let prev = null;
+    for (;;) {
+      const loading = isShareTableLoading(doc);
+      const rows = qa.scanFileRows(doc) || [];
+      const empty = loading ? false : isEmptyListUi(qa, doc);
+      const sig = `${loading ? 'L' : 'I'}|${empty ? 'E' : 'R'}|${rows.length}`;
+      if (sig === lastSig) stable++; else { lastSig = sig; stable = 1; }
+      /* 连续 3 拍（600ms）一致才算稳定：避开"刷新请求还没应用、读到旧 DOM"的那一两拍 */
+      if (!loading && stable >= 3) {
+        const ok = rows.length >= expMin;
+        log(ok
+          ? ` ★ 刷新后列表到位：${rows.length} 行（期望 ≥${expMin}）`
+          : ` ★ 刷新后列表已稳定：${rows.length} 行 < 期望 ${expMin}${empty ? '（UI 显示空目录）' : ''}`);
+        return { ok, count: rows.length, expectedMin: expMin, empty, settled: true };
       }
-      last = cnt;
+      if (prev !== sig) log(` … 等待列表稳定：${loading ? '加载中' : `${rows.length} 行`}${empty ? '（空目录）' : ''}`);
+      prev = sig;
       await sleep(200, true);
     }
-    const finalCnt = (qa.scanFileRows(doc) || []).length;
-    log(` ⏱ 刷新后等待超时：当前 ${finalCnt} 行（期望 ≥${expMin}）`);
-    return { ok: finalCnt >= expMin, count: finalCnt, expectedMin: expMin };
+  }
+
+  /* 页面内刷新对当前目录有时不生效（尤其空目录/「来自：分享」）。
+   * 用 hash 先切到别的路由再切回来，强制 Quark 重新拉一次列表。 */
+  async function hardReloadCurrentDir(qa, doc = document) {
+    const hash = String(location.hash || '');
+    const m = hash.match(/#\/list\/all\/([^/?#]+)/);
+    if (!m) { warn(' ↻ 当前 URL 不像目录路由，跳过强制重载'); return false; }
+    const fid = m[1];
+    log(` ↻ 页面内刷新没带来新行，改用"路由切走再切回"强制重载目录 ${fid}`);
+    try { location.hash = '#/list/recent'; } catch { return false; }
+    await sleep(900, true);
+    try { location.hash = `#/list/all/${fid}/`; } catch { return false; }
+    /* 等路由渲染 + 列表 loading 结束（UI 判据，一直等） */
+    await until(() => !isShareTableLoading(doc), 150, 0);
+    await sleep(400, true);
+    log(' ↻ 已切回当前目录');
+    return true;
   }
 
   /* ===== 批次执行器 ===== */
@@ -3047,9 +3063,11 @@
     qa.setProgress('-');
     startSharePolling(qa);
 
+    /* 保存弹窗关闭后读不到"转存至"，所以在准备阶段就抓一份，随结果回传给父页 */
+    let savePath = '';
     const finish = (kind, extra = {}) => {
-      setResult(shareId, { kind, ...extra });
-      log(`★ [子任务] 结果已写入：${kind}`);
+      setResult(shareId, { kind, savePath: savePath || readSaveTargetPath(document), ...extra });
+      log(`★ [子任务] 结果已写入：${kind}${savePath ? `（转存至 ${savePath}）` : ''}`);
       setTimeout(() => { try { window.close(); } catch {} }, 800);
     };
 
@@ -3078,6 +3096,13 @@
       });
       return true;
     }
+
+    /* 保存前抓"转存至"（保存成功后弹窗会关，之后读不到） */
+    try {
+      savePath = await until(() => readSaveTargetPath(document), 150, 3000) || readSaveTargetPath(document);
+      if (savePath) log(` 转存至：${savePath}`);
+      else warn(' ⚠️ 未读到"转存至"路径（.share-path .path-name）');
+    } catch {}
 
     try {
       const exec = await executeBatches(qa, document, prep, { useSelectAll: true });
@@ -3144,23 +3169,6 @@
     setTimeout(tick, 1500);
   }
 
-  async function saveShareUrlViaTab(qa, url) {
-    const shareId = extractShareId(url);
-    if (!shareId) return { kind: 'fail', message: 'bad-url' };
-    clearResult(shareId);
-    setTask(shareId, url);
-    log(` → 打开标签页：${url}`);
-    try {
-      GM_openInTab(url, { active: false, insert: true, setParent: true });
-    } catch (e) {
-      clearTask(shareId);
-      return { kind: 'fail', message: 'open-tab-failed' };
-    }
-    const r = await until(() => consumeResult(shareId), 1000, TAB_RESULT_TIMEOUT);
-    if (r) return r;
-    clearTask(shareId);
-    return { kind: 'timeout', message: 'tab-timeout' };
-  }
 
   /* 并行转存：一次性（或按 maxConcurrent 分批）打开所有需要的分享页，再统一收结果。
    * 返回 [{url, shareId, result}]，顺序与入参一致；任务/结果按 shareId 独立存键，互不覆盖。 */
@@ -3300,20 +3308,15 @@
   /* 返回 {ok, refreshed}：
    *   ok=true,  refreshed=true  → 点到了刷新按钮，loading 已结束（或本无 loading）
    *   ok=false, refreshed=false → 没找到刷新按钮，或刷新后 loading 一直不消失 */
-  async function clickListRefreshAndWait(qa, doc = document, opts = {}) {
-    const appearedTimeout = opts.appearedTimeout ?? 3000;
-    const settleTimeout = opts.settleTimeout ?? 15000;
+  async function clickListRefreshAndWait(qa, doc = document) {
     const ok = await clickListRefresh(qa, doc);
     if (!ok) return { ok: false, refreshed: false };
     const tableWrap = doc.querySelector('.ant-table-wrapper');
-    if (!tableWrap) { await sleep(800, true); return { ok: true, refreshed: true }; }
-    const appeared = await until(() => !!tableWrap.querySelector('.ant-spin-spinning'), 100, appearedTimeout);
-    if (appeared) {
-      const gone = await until(() => !tableWrap.querySelector('.ant-spin-spinning'), 150, settleTimeout);
-      if (!gone) return { ok: false, refreshed: true };
-      return { ok: true, refreshed: true };
-    }
-    await sleep(800, true);
+    if (!tableWrap) return { ok: true, refreshed: true };
+    /* 点完刷新：先等 spin 出现（证明请求真的发出去了），再等它消失（结果已应用到 UI）。
+     * 两段都不设上限 —— 刷新是异步的，等的对象是 UI。 */
+    await until(() => !!tableWrap.querySelector('.ant-spin-spinning'));
+    await until(() => !tableWrap.querySelector('.ant-spin-spinning'));
     return { ok: true, refreshed: true };
   }
 
@@ -3448,7 +3451,7 @@
   }
 
   function buildRenamePlan(savedByUrl, bd, listRows = [], alreadySaved = [], beforeFids = null) {
-    const { map: nameByShare, conflict } = collectShareNameMap(bd);
+    const { map: nameByShare } = collectShareNameMap(bd);
     const items = [];
     const usedFids = new Set();
     const usedRows = new Set();
@@ -3712,18 +3715,42 @@
         log('★ 有新转存，点击页面内刷新按钮触发列表更新...');
         await sleep(500, true);
 
-        const refreshRes = await clickListRefreshAndWait(qa, document, {
-          appearedTimeout: 3000, settleTimeout: 15000,
-        });
+        const refreshRes = await clickListRefreshAndWait(qa, document);
         if (refreshRes.ok) log('✓ 已点击刷新并等到列表恢复');
-        else if (refreshRes.refreshed) warn('⚠️ 已点刷新但 loading 超时未结束');
         else warn('⚠️ 未找到页面内刷新按钮');
 
-        let waitRes = { ok: false, count: preRows.length };
-        if (refreshRes.ok) {
-          const savedTotalForSnap0 = savedByUrl.reduce((n, en) => n + ((en && en.files) || []).length, 0);
-          const expectedMin = preRows.length + savedTotalForSnap0;
-          waitRes = await waitForListRowsStable(qa, document, expectedMin, 15000);
+        const savedTotalForSnap0 = savedByUrl.reduce((n, en) => n + ((en && en.files) || []).length, 0);
+        const expectedMin = preRows.length + savedTotalForSnap0;
+        /* 本轮实际没有新增文件（如全部命中记录缓存）时，不该要求行数增长 */
+        let waitRes = savedTotalForSnap0
+          ? await waitForListRowsStable(qa, document, expectedMin)
+          : { ok: true, count: preRows.length, expectedMin: preRows.length, skipped: true };
+        if (!savedTotalForSnap0) log(' ★ 本轮无新增文件（全部已转存），跳过行数等待');
+
+        /* 只有"UI 明确空目录"才值得强制重载：行数不足但非空，多半只是渲染慢，别打断它。
+         * 重载后仍用同一套 UI 判据复核，不靠干等。 */
+        if (!waitRes.ok && waitRes.count === 0 && waitRes.empty) {
+          const reloaded = await hardReloadCurrentDir(qa, document);
+          if (reloaded) waitRes = await waitForListRowsStable(qa, document, expectedMin);
+        }
+
+        /* 仍无新行 → 把"文件到底存到哪儿去了"讲清楚，别让用户干瞪眼 */
+        if (!waitRes.ok) {
+          const crumb = readListBreadcrumb(document);
+          const savePaths = [...new Set((jobs || [])
+            .map(j => (j.result && j.result.savePath) || '')
+            .filter(Boolean))];
+          warn(` ⚠️ 转存后当前目录仍无新增行：目录「${crumb || '?'}」现有 ${waitRes.count} 行` +
+               `${waitRes.empty ? '（UI 显示空目录）' : ''}`);
+          if (savePaths.length) {
+            const same = savePaths.some(p => crumb && (p === crumb || p.endsWith(crumb) || crumb.endsWith(p)));
+            warn(`   子任务保存时显示「转存至：${savePaths.join(' / ')}」` +
+                 (same
+                   ? '（与当前目录一致 → 说明列表没反映真实结果，或保存并未真正落盘）'
+                   : '（与当前目录不一致 → 文件被存到了别处，这就是找不到行的原因）'));
+          } else {
+            warn('   子任务未回传"转存至"路径（旧版本子页或未读到 .share-path）');
+          }
         }
 
         let plan = [];
@@ -4499,38 +4526,6 @@
   }
 
   /* 桥接端 collectApiLinks：修复 filename=+（复用 QA 的修复函数） */
-  async function collectApiLinksBridge(qa, timeout = 15000) {
-    const fix = (qa && typeof qa.fixFilenamePlusInUrl === 'function')
-      ? qa.fixFilenamePlusInUrl
-      : (u => u);
-    const g = await untilOrGiveUp(() => {
-      const p = document.querySelector('.swal2-popup');
-      if (!p) return null;
-      if (p.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning')) return p;
-      if (p.querySelector('.listener-link-api')) return p;
-      return null;
-    }, 200, timeout);
-    if (!g.ok) return null;
-    const popup = g.result;
-    if (popup.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning')) return null;
-    return [...popup.querySelectorAll('.listener-link-api')].map(a => {
-      const original = a.dataset.link || '';
-      const fixed = fix(original);
-      if (fixed !== original) {
-        try { a.dataset.link = fixed; } catch {}
-        try { a.setAttribute('data-link', fixed); } catch {}
-        if (a.getAttribute('href') === original) {
-          try { a.setAttribute('href', fixed); } catch {}
-        }
-      }
-      return {
-        el: a,
-        fid: a.dataset.fid || '',
-        filename: a.dataset.filename || '',
-        link: fixed,
-      };
-    });
-  }
 
   async function initQuarkSide() {
     cleanupBridgeComm();

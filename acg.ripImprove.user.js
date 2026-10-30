@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.3.4
+// @version      1.3.5
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -6252,53 +6252,52 @@ async function bgHomeHoverAndClickWatchedTill(a, subjectId = '', subjName = '') 
   return { ok: true, epId };
 }
 
-async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
+/* ===== 阶段 1：集中判断（同步读取，不 hover、不点击、不 sleep） =====
+ * 只回答一个问题：这一行"要不要更新"。
+ * 以前判断和执行揉在每行里（每行都可能等 5s 列表 + 行间 400ms 延时），
+ * 批量时大量时间耗在"早就看过、本该直接跳过"的行上。 */
+function bgHomeCollectGrid(grid, idx = -1, total = -1) {
   const tag = `[grid ${idx + 1}/${total}]`;
 
   const subjLink =
         grid.querySelector('a[data-subject-id][href^="/subject/"]') ||
         grid.querySelector('.tinyHeader a[href^="/subject/"]') ||
         grid.querySelector('a.textTip[href^="/subject/"]');
-  if (!subjLink) { bgWarn(tag, '未找到 subject 链接，跳过'); return { status: 'skip', reason: 'no-subject-link' }; }
+  if (!subjLink) { bgWarn(tag, '未找到 subject 链接，跳过'); return { need: false, status: 'skip', reason: 'no-subject-link', tag }; }
 
   const subjectId =
         (subjLink.dataset && subjLink.dataset.subjectId) ||
         ((subjLink.getAttribute('href') || '').match(/\/subject\/(\d+)/) || [])[1];
-  if (!subjectId) { bgWarn(tag, '无法解析 subjectId，跳过'); return { status: 'skip', reason: 'no-subject-id' }; }
+  if (!subjectId) { bgWarn(tag, '无法解析 subjectId，跳过'); return { need: false, status: 'skip', reason: 'no-subject-id', tag }; }
 
   const subjName =
         (subjLink.dataset && (subjLink.dataset.subjectNameCn || subjLink.dataset.subjectName)) ||
         (subjLink.textContent || '').trim() || '';
 
   const row = bgHomeFindRow(subjectId);
-  if (!row) { bgLog(tag, `id=${subjectId} 名称="${subjName}" → 表格中无匹配，跳过`); return { status: 'skip', reason: 'not-in-table', subjectId, subjName }; }
+  if (!row) { bgLog(tag, `id=${subjectId} 名称="${subjName}" → 表格中无匹配，跳过`); return { need: false, status: 'skip', reason: 'not-in-table', subjectId, subjName, tag }; }
 
   const nextEp = Number(row.下集) || 0;
   const prevEp = Number(row.前季) || 0;
   const { rel, abs } = bgHomeWatchedCandidates(row);
   if (!rel.length && !abs.length) {
     bgLog(tag, `id=${subjectId} 名称="${subjName}" 下集=${nextEp} 前季=${prevEp} → 无有效目标集数，跳过`);
-    return { status: 'skip', reason: 'no-valid-target', subjectId, nextEp, prevEp };
+    return { need: false, status: 'skip', reason: 'no-valid-target', subjectId, subjName, nextEp, prevEp, tag };
   }
   const baseInfo = `id=${subjectId} 名称="${subjName}" 下集=${nextEp} 前季=${prevEp} 目标(相对)=${rel.join('/') || '-'} 目标(绝对)=${abs.join('/') || '-'}`;
 
-  bgLog(tag, baseInfo, `→ 并发等待 prg_list / prgText…`);
-  const { listEl, prgInput: prgInputInitial } = await bgHomeWaitListAndPrgText(
-    () => grid.querySelector('ul.prg_list'),
-    () => grid.querySelector('form[name="merge"] .prgText input[name="watchedeps"]') ||
-    grid.querySelector('form[name="merge"] input[name="watchedeps"]'),
-    5000, 150, 800
-  );
-  let prgInput = prgInputInitial;
+  /* 同步读取：列表/输入框由页面渲染（调用方在收集前整页统一等过一次，不按行各等一遍） */
+  const listEl = grid.querySelector('ul.prg_list');
+  const prgInput =
+        grid.querySelector('form[name="merge"] .prgText input[name="watchedeps"]') ||
+        grid.querySelector('form[name="merge"] input[name="watchedeps"]');
 
   let hit = null;
   if (listEl && abs.length) {
     hit = bgHomeFindEpisodeLink(listEl, abs);
-    if (hit) {
-      if (hit.el.classList.contains('epBtnWatched')) {
-        bgLog(tag, baseInfo, `→ prg_list 中目标集数 ${hit.ep} 已是 epBtnWatched 状态，跳过`);
-        return { status: 'skip', reason: 'already-watched', subjectId, ep: hit.ep };
-      }
+    if (hit && hit.el.classList.contains('epBtnWatched')) {
+      bgLog(tag, baseInfo, `→ prg_list 中目标集数 ${hit.ep} 已是 epBtnWatched 状态，跳过`);
+      return { need: false, status: 'skip', reason: 'already-watched', subjectId, subjName, ep: hit.ep, tag, baseInfo };
     }
   }
   if (!hit) {
@@ -6311,27 +6310,53 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
       const target = rel[0] ?? 0;
       if (Number.isFinite(cur) && cur >= target) {
         bgLog(tag, baseInfo, `→ prg_list 未命中，回退 prgText 判定：已为 ${cur}，跳过`);
-        return { status: 'skip', reason: 'already-synced', subjectId, cur, target };
+        return { need: false, status: 'skip', reason: 'already-synced', subjectId, subjName, cur, target, tag, baseInfo };
       }
     }
   }
 
   bgLog(tag, baseInfo,
-        `→ 等待完成：prg_list=${listEl ? `有（${listEl.querySelectorAll('li > a').length} 项）` : '无'}，prgText=${prgInput ? '有' : '无'}`);
+        `→ 需更新：prg_list=${listEl ? `有（${listEl.querySelectorAll('li > a').length} 项）` : '无'}，prgText=${prgInput ? '有' : '无'}`);
+  return { need: true, grid, tag, subjectId, subjName, nextEp, prevEp, rel, abs, listEl, prgInput, hit, baseInfo };
+}
 
-  if (listEl && abs.length) {
-    const hit = bgHomeFindEpisodeLink(listEl, abs);
-    if (hit) {
-      bgLog(tag, baseInfo, `→ prg_list 命中绝对集数 ${hit.ep}，尝试 hover 并点击「看到」`);
-      const res = await bgHomeHoverAndClickWatchedTill(hit.el, subjectId, subjName);
-      if (res.ok) {
-        bgLog(tag, baseInfo, `→ ✅ 成功（方式=hover，绝对集数=${hit.ep}，epid=${res.epId}）`);
-        return { status: 'ok', method: 'hover', subjectId, ep: hit.ep, epId: res.epId };
-      }
-      bgWarn(tag, baseInfo, `→ ❌ hover 方式失败（绝对集数=${hit.ep}，原因=${res.reason}），转 prgText 兜底`);
-    } else {
-      bgLog(tag, baseInfo, `→ prg_list 中未找到目标绝对集数（${abs.join('/')}），转 prgText 兜底`);
+/* ===== 阶段 2：执行更新 =====
+ * 只对 need=true 的项调用；调用方负责在两次执行之间加延时。 */
+async function bgHomeExecuteGrid(item) {
+  const { grid, tag, subjectId, subjName, rel, abs, baseInfo } = item;
+
+  /* 收集到执行之间页面可能又渲染了一点：以执行时的 DOM 为准补一次 */
+  let listEl = item.listEl || grid.querySelector('ul.prg_list');
+  let prgInput = item.prgInput ||
+        grid.querySelector('form[name="merge"] .prgText input[name="watchedeps"]') ||
+        grid.querySelector('form[name="merge"] input[name="watchedeps"]');
+  /* 两个都没读到：说明收集时该行还没渲染，这里等一次（只发生在确实要更新的项上） */
+  if (!listEl && !prgInput) {
+    const w = await bgHomeWaitListAndPrgText(
+      () => grid.querySelector('ul.prg_list'),
+      () => grid.querySelector('form[name="merge"] .prgText input[name="watchedeps"]') ||
+            grid.querySelector('form[name="merge"] input[name="watchedeps"]'),
+      5000, 150, 800
+    );
+    listEl = w.listEl;
+    prgInput = w.prgInput;
+  }
+  const hit = item.hit || (listEl && abs.length ? bgHomeFindEpisodeLink(listEl, abs) : null);
+
+  if (hit) {
+    if (hit.el.classList.contains('epBtnWatched')) {
+      bgLog(tag, baseInfo, `→ 目标集数 ${hit.ep} 现已是 epBtnWatched，跳过`);
+      return { status: 'skip', reason: 'already-watched', subjectId };
     }
+    bgLog(tag, baseInfo, `→ prg_list 命中绝对集数 ${hit.ep}，尝试 hover 并点击「看到」`);
+    const res = await bgHomeHoverAndClickWatchedTill(hit.el, subjectId, subjName);
+    if (res.ok) {
+      bgLog(tag, baseInfo, `→ ✅ 成功（方式=hover，绝对集数=${hit.ep}，epid=${res.epId}）`);
+      return { status: 'ok', method: 'hover', subjectId, ep: hit.ep, epId: res.epId };
+    }
+    bgWarn(tag, baseInfo, `→ ❌ hover 方式失败（绝对集数=${hit.ep}，原因=${res.reason}），转 prgText 兜底`);
+  } else if (listEl && abs.length) {
+    bgLog(tag, baseInfo, `→ prg_list 中未找到目标绝对集数（${abs.join('/')}），转 prgText 兜底`);
   } else if (listEl) {
     bgLog(tag, baseInfo, `→ prg_list 存在但无目标绝对集数，转 prgText 兜底`);
   } else {
@@ -6344,12 +6369,18 @@ async function bgHomeProcessGrid(grid, idx = -1, total = -1) {
     bgLog(tag, baseInfo, `→ prgText 尚未出现，额外等待 2s…`);
     prgInput = await bgHomeWaitForEl(() =>
                                      grid.querySelector('form[name="merge"] .prgText input[name="watchedeps"]') ||
-                                     grid.querySelector('form[name="merge"] input[name="watchedeps"]'),
+                                     grid.querySelector('form[name="merge"] input[name="watchedeps"]') ||
+                                     document.querySelector('.panelProgress .prgText input[name="watchedeps"]') ||
+                                     document.querySelector('.panelProgress input[name="watchedeps"]'),
                                      2000, 150);
   }
   if (!prgInput) { bgWarn(tag, baseInfo, `→ ❌ 兜底失败：prgText 输入框始终未出现`); return { status: 'fail', reason: 'no-prgtext-input', subjectId }; }
 
-  const submitBtn = grid.querySelector('form[name="merge"] input[name="submit"], form[name="merge"] button[type="submit"]');
+  const submitBtn =
+        grid.querySelector('form[name="merge"] input[name="submit"], form[name="merge"] button[type="submit"]') ||
+        document.querySelector('.panelProgress form[name="merge"] input[name="submit"], ' +
+                              '.panelProgress form[name="merge"] button[type="submit"], ' +
+                              'form[name="merge"] input[name="submit"]');
   if (!submitBtn) { bgWarn(tag, baseInfo, `→ ❌ 兜底失败：未找到「更新」按钮`); return { status: 'fail', reason: 'no-submit-btn', subjectId }; }
 
   const target = rel[0];
@@ -6479,9 +6510,10 @@ async function runBangumiHomeAutoMark() {
     bgWarn('等待 #cloumnSubjectInfo 超时（12s），放弃');
     return;
   }
-  bgLog('已找到 #cloumnSubjectInfo，等待侧栏内容渲染…');
+  bgLog('已找到 #cloumnSubjectInfo，等侧栏渲染…');
 
-  await sleep(800);
+  /* 列表是异步渲染的：整页统一等一次，之后同步收集，避免"每行各等一遍" */
+  await bgHomeWaitForEl(() => col.querySelector('.epGird'), 12000, 150);
 
   loadDatas();
   {
@@ -6496,14 +6528,41 @@ async function runBangumiHomeAutoMark() {
     return;
   }
 
-  bgLog(`共发现 ${grids.length} 个 .epGird，开始逐个处理`);
+  bgLog(`共发现 ${grids.length} 个 .epGird`);
 
-  const stats = { total: grids.length, ok: 0, skip: 0, fail: 0, hover: 0, prgText: 0 };
+  /* 等一次 prg_list / prgText 就绪（整页一次；之后逐行同步读，不再按行等待） */
+  await bgHomeWaitForEl(
+    () => col.querySelector('.epGird ul.prg_list') ||
+          col.querySelector('.epGird form[name="merge"] input[name="watchedeps"]'),
+    8000, 150
+  );
 
-  for (let i = 0; i < grids.length; i++) {
-    const grid = grids[i];
+  /* ===== 阶段 1：集中判断（同步、不点击、不延时） ===== */
+  bgLog('▶ 阶段1：集中判断是否需要更新');
+  const items = grids.map((g, i) => {
+    try { return bgHomeCollectGrid(g, i, grids.length); }
+    catch (e) {
+      bgErr(`[grid ${i + 1}/${grids.length}] 判断异常:`, e);
+      return { need: false, status: 'fail', reason: 'collect-error', tag: `[grid ${i + 1}/${grids.length}]` };
+    }
+  });
+  const todo = items.filter(x => x.need);
+  const skipped = items.filter(x => !x.need);
+  bgLog(`判断完成：需更新 ${todo.length}，跳过 ${skipped.length}`);
+  for (const s of skipped) {
+    bgLog(`  ⏭ ${s.tag || ''} id=${s.subjectId || '-'}${s.subjName ? ` "${s.subjName}"` : ''} → ${s.reason}`);
+  }
+
+  /* ===== 阶段 2：逐个执行（延时只发生在"执行 → 执行"之间） ===== */
+  const stats = { total: grids.length, ok: 0, skip: skipped.length, fail: 0, hover: 0, prgText: 0 };
+  if (todo.length) bgLog(`▶ 阶段2：开始执行 ${todo.length} 项更新（每项之间延时 400ms）`);
+
+  for (let i = 0; i < todo.length; i++) {
+    const it = todo[i];
+    bgLog(`[执行 ${i + 1}/${todo.length}] ${it.tag} ${it.baseInfo || ''}`);
+    let stop = false;
     try {
-      const r = await bgHomeProcessGrid(grid, i, grids.length);
+      const r = await bgHomeExecuteGrid(it);
       if (r && r.status === 'ok') {
         stats.ok++;
         if (r.method === 'hover') stats.hover++;
@@ -6512,14 +6571,16 @@ async function runBangumiHomeAutoMark() {
       else stats.fail++;
     } catch (e) {
       if (e && e._acgripNavigated) {
-        bgWarn(`[grid ${i + 1}/${grids.length}] 页面已导航，停止后续处理`);
+        bgWarn(`[执行 ${i + 1}/${todo.length}] 页面已导航，停止后续处理`);
         stats.fail++;
-        break;
+        stop = true;
+      } else {
+        bgErr(`[执行 ${i + 1}/${todo.length}] 处理异常:`, e);
+        stats.fail++;
       }
-      bgErr(`[grid ${i + 1}/${grids.length}] 处理异常:`, e);
-      stats.fail++;
     }
-    await sleep(400);
+    if (stop) break;
+    if (i < todo.length - 1) await sleep(400);
   }
 
   bgLog('全部处理完成', {

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.10
+// @version 3.14.11
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -3209,7 +3209,9 @@
         return false;
       }
       try {
-        GM_openInTab(j.url, { active: false, insert: true, setParent: true });
+        /* 保留句柄：子页自己 window.close() 在"并行开多个"时会被浏览器拒绝
+         *（不被视为脚本打开的窗口），父页拿句柄关才可靠 */
+        j.tab = GM_openInTab(j.url, { active: false, insert: true, setParent: true }) || null;
         j.opened = true;
         return true;
       } catch (e) {
@@ -3219,11 +3221,24 @@
         return false;
       }
     };
+    const closeJobTab = (j) => {
+      try {
+        const t = j.tab;
+        j.tab = null;
+        if (!t) return false;
+        if (typeof t.close === 'function' && !t.closed) { t.close(); return true; }
+      } catch {}
+      return false;
+    };
     const collect = () => {
       for (const j of jobs) {
         if (j.done || !j.opened || !j.shareId) continue;
         const r = consumeResult(j.shareId);
-        if (r) { j.result = r; j.done = true; log(` ← 收到结果 ${j.shareId}：${r.kind}`); }
+        if (r) {
+          j.result = r; j.done = true;
+          const closed = closeJobTab(j);
+          log(` ← 收到结果 ${j.shareId}：${r.kind}${closed ? '（已关闭子页）' : ''}`);
+        }
       }
     };
     const pausedNow = () => !!(qa && qa.isPaused && qa.isPaused());
@@ -3263,6 +3278,7 @@
         const lost = jobs.filter(j => !j.done);
         for (const j of lost) {
           clearTask(j.shareId);
+          closeJobTab(j);
           j.result = j.opened ? { kind: 'timeout', message: 'tab-timeout' } : { kind: 'fail', message: 'not-opened' };
           j.done = true;
         }
@@ -3275,6 +3291,9 @@
       } catch {}
       await sleep(500, true);
     }
+
+    /* 收尾：任何仍打开的句柄都关掉，避免留下孤儿标签页 */
+    for (const j of jobs) closeJobTab(j);
 
     const kinds = jobs.reduce((m, j) => {
       const k = (j.result && j.result.kind) || 'none';

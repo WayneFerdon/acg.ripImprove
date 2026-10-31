@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.11
+// @version 3.14.15
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -138,6 +138,21 @@
       const result = await fn();
       if (result) return result;
       if (waitMs > 0 && Date.now() - t0 >= waitMs) throw new Error(`untilStrict 超时：${waitMs}ms`);
+      await sleep(0, true, true);
+    }
+  }
+
+  /* 探测型：给一个上限，到点返回 null —— "这段时间内没有出现"本身是有效结论。
+   * 只用于"有没有某个信号/元素"的探测（如：有没有保存成功弹窗、有没有确认按钮），
+   * 不用于等待异步结果；等待异步结果一律用 until（无上限）。 */
+  async function untilMaybe(fn, maxWaitMs) {
+    const waitMs = Number(maxWaitMs) > 0 ? Number(maxWaitMs) : 0;
+    if (!waitMs) return null;
+    const t0 = Date.now();
+    for (;;) {
+      const result = await fn();
+      if (result) return result;
+      if (Date.now() - t0 >= waitMs) return null;
       await sleep(0, true, true);
     }
   }
@@ -1355,6 +1370,7 @@
     return 'none';
   }
   async function ensureTimeDescSort(qa, doc = document) {
+    /* 前置型：列表页必然有"修改日期"表头，等不到只可能是还没渲染 → 一直等 */
     const th0 = await until(() => findTimeSortHeader(doc));
     if (getThSortState(th0) === 'desc') {
       log(' 排序：已是"修改日期"降序');
@@ -1379,7 +1395,7 @@
         if (st !== before) return { done: false, st };
         return null;
       });
-      if (got && got.done) return { ok: true, method: 'clicked', tries: i + 1 };
+      if (got.done) return { ok: true, method: 'clicked', tries: i + 1 };
     }
   }
 
@@ -1395,15 +1411,53 @@
       return true;
     } catch { return false; }
   }
-  function isSuccessModalPresent(doc = document) {
-    const m = doc.querySelector('.save-share-file-success-modal');
-    if (!m) return false;
+  /* 严格可见：自身有尺寸，并且从自身到 <html> 的祖先链上没有 display:none / visibility:hidden /
+   * opacity:0，也不在 aria-hidden 容器里。
+   * 为什么必须这么严：**转存失败时 DOM 里同样存在 .save-share-file-success-modal（文案就是"保存成功"）**，
+   * 只是外层 .ant-modal-wrap 被置为 display:none。只看"有没有这个节点/这段文字"必然把失败判成成功。 */
+  function _isStrictlyVisible(el) {
+    if (!el || !el.isConnected) return false;
     try {
-      const wrap = m.closest('.ant-modal-wrap') || m.closest('.ant-modal-root') || m;
-      const cs = (wrap.ownerDocument.defaultView || window).getComputedStyle(wrap);
-      if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+      if (el.classList && el.classList.contains('out-screen')) return false;
+      const r = el.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return false;
+      const doc = el.ownerDocument || document;
+      const win = doc.defaultView || window;
+      for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+        if (n !== el && n.getAttribute && n.getAttribute('aria-hidden') === 'true') return false;
+        const cs = win.getComputedStyle(n);
+        if (cs.display === 'none' || cs.visibility === 'hidden') return false;
+        if (cs.opacity !== '' && Number(cs.opacity) === 0) return false;
+        if (n === doc.documentElement) break;
+      }
+      return true;
     } catch { return false; }
-    return true;
+  }
+  /* "保存成功"弹窗是否**真的显示着**。可能有多个实例（上次的隐藏残留 + 本次的），逐个判可见，任一可见即真。 */
+  function isSuccessModalPresent(doc = document) {
+    try {
+      for (const m of doc.querySelectorAll('.save-share-file-success-modal')) {
+        if (_isStrictlyVisible(m)) return true;
+      }
+    } catch {}
+    return false;
+  }
+  /* 更宽的成功信号：Quark 有时不用 .save-share-file-success-modal，而是 ant-message toast /
+   * swal2 弹窗，只说"保存成功"。只认 success-modal 会把它判成 unknown → 误判失败。
+   * 同样必须严格可见：隐藏容器里的旧文案不能算数。 */
+  function isSaveSuccessUiVisible(doc = document) {
+    try {
+      if (isSuccessModalPresent(doc)) return true;
+      const sels = ['.ant-message-notice', '.ant-notification-notice', '.swal2-popup', '.ant-modal', '[role="dialog"]'];
+      for (const sel of sels) {
+        for (const el of doc.querySelectorAll(sel)) {
+          if (!_isStrictlyVisible(el)) continue;
+          const t = (el.textContent || '').replace(/\s+/g, '');
+          if (/保存成功|转存成功|已保存到|保存到网盘成功|文件已保存/.test(t)) return true;
+        }
+      }
+    } catch {}
+    return false;
   }
   /* 视口中心最上层的元素是不是 iframe（= 有全屏/居中 iframe 真的盖在页面上） */
   function isIframeCovering(doc = document) {
@@ -1481,7 +1535,9 @@
     } catch {}
     return null;
   }
-  async function waitSaveButtonReady(qa, doc = document, timeout = 8000) {
+  /* 前置型等待：保存弹窗已经打开，就必然有可用的"保存到网盘"按钮。
+   * 等不到只可能是还没渲染完 → 一直等，不做兜底（兜底会把"没准备好"当成"没这个按钮"）。 */
+  async function waitSaveButtonReady(qa, doc = document) {
     const btn = await until(() => {
       const b = findSaveButton(doc);
       if (!b) return null;
@@ -1489,7 +1545,7 @@
       if (b.classList.contains('ant-btn-loading')) return null;
       if (b.querySelector('.anticon-loading')) return null;
       return b;
-    }, 100, timeout);
+    });
     return !!btn;
   }
   function clickSaveButton(qa, doc = document) {
@@ -1543,7 +1599,7 @@
         }
       }
       return false;
-    }, 100, timeout);
+    });
     if (!ok) {
       const btns = [...scope.querySelectorAll('button')].map(b => (b.textContent || '').trim()).filter(Boolean);
       warn('clickConfirmInDialog 未找到确认按钮，scope 内按钮：', btns);
@@ -1590,7 +1646,7 @@
     return null;
   }
   async function waitResult(qa, doc = document, timeout = 8000) {
-    const r = await until(() => {
+    const r = await untilMaybe(() => {
       let text = '';
       try {
         for (const sel of ['.swal2-popup', '.ant-message-notice', '.ant-notification-notice']) {
@@ -1600,9 +1656,9 @@
       text += ' ' + scanIframeErrors(doc);
       const k = classify(text);
       if (k === 'space' || k === 'over_limit' || k === 'fail') return k;
-      if (isSuccessModalPresent(doc)) return 'success';
+      if (isSaveSuccessUiVisible(doc)) return 'success';
       return null;
-    }, 50, timeout);
+    }, timeout);
     log('[桥接] waitResult 判定:', r || 'unknown');
     return r || 'unknown';
   }
@@ -1624,7 +1680,7 @@
     for (let i = 0; i < 4; i++) {
       if (!isSuccessModalPresent(doc)) break;
       try { closeDialog(qa, doc); } catch {}
-      const gone = await until(() => !isSuccessModalPresent(doc), 100, 1200);
+      const gone = await untilMaybe(() => !isSuccessModalPresent(doc), 1200);
       if (gone) break;
       const m = doc.querySelector('.save-share-file-success-modal');
       try { m && m.parentNode && m.parentNode.removeChild(m); } catch {}
@@ -1633,29 +1689,31 @@
     await waitAllModalsGone(qa, doc, 3000);
     await sleep(150, true);
     log(' → 等保存按钮就绪');
-    const ready = await waitSaveButtonReady(qa, doc, 8000);
+    const ready = await waitSaveButtonReady(qa, doc);
     if (!ready) { warn(' ⚠️ 保存按钮未就绪'); return 'fail'; }
     log(' → 点击保存按钮');
     try { clickSaveButton(qa, doc); } catch (e) {
       warn(' ⚠️ clickSaveButton 失败：', e);
       return 'fail';
     }
-    const outcome = await until(() => {
+    /* 这里是"等三种结果信号之一"的探测：12s 内都没有 → unknown（不是无限等待）。
+     * 用 untilMaybe，否则弹窗既没成功框也没对话框时会永远卡住、子任务不写结果也不关页。 */
+    const outcome = await untilMaybe(() => {
       const err = detectResultQuick(doc);
       if (err) return { type: 'error', kind: err };
-      if (isSuccessModalPresent(doc)) return { type: 'success' };
+      if (isSaveSuccessUiVisible(doc)) return { type: 'success' };
       const dlg = findSaveDialog(doc);
       if (dlg) return { type: 'dialog' };
       return null;
-    }, 100, 12000);
+    }, 12000);
     if (!outcome) { warn(' ⚠️ 12s 内无任何结果信号'); return 'unknown'; }
     if (outcome.type === 'success') {
       /* "保存成功"弹窗可能先于真实结果出现（实测存在"保存成功弹窗 + 容量不足收银台"并存的状态），
        * 所以再观察一小段：若收银台真的盖到页面上，就把这次判定为失败 */
-      const late = await until(() => {
+      const late = await untilMaybe(() => {
         const k = detectResultQuick(doc);
         return k ? k : null;
-      }, 150, 1200);
+      }, 1200);
       if (late) {
         warn(` ⚠️ 成功弹窗后又出现失败信号：${late}，按失败处理`);
         try { closeDialog(qa, doc); } catch {}
@@ -1671,7 +1729,7 @@
       return outcome.kind;
     }
     log(' → 保存对话框已出现');
-    const clicked = await clickConfirmInDialog(qa, doc, 6000);
+    const clicked = await clickConfirmInDialog(qa, doc);
     if (!clicked) warn(' ⚠️ 未点到确认按钮');
     const result = await waitResult(qa, doc, 8000);
     try { closeDialog(qa, doc); } catch {}
@@ -1691,7 +1749,7 @@
     if (!cb) return { ok: false, method: 'no-checkbox' };
     if (!!cb.checked === !!desired) return { ok: true, method: 'already' };
     try { cb.click(); } catch {}
-    if (await until(isDesired, 80, 500)) return { ok: true, method: 'native-click' };
+    if (await untilMaybe(isDesired, 500)) return { ok: true, method: 'native-click' };
     cb = getRowCheckbox(row);
     if (cb) {
       try {
@@ -1700,15 +1758,17 @@
         cb.dispatchEvent(new Event('input', { bubbles: true }));
         cb.dispatchEvent(new Event('change', { bubbles: true }));
       } catch {}
-      if (await until(isDesired, 80, 500)) return { ok: true, method: 'react-setter' };
+      if (await untilMaybe(isDesired, 500)) return { ok: true, method: 'react-setter' };
     }
     cb = getRowCheckbox(row);
     if (cb) {
       const label = cb.closest('label') || row.querySelector('label.ant-checkbox-wrapper');
       if (label) qa.realClick(label);
-      if (await until(isDesired, 80, 500)) return { ok: true, method: 'label-click' };
+      if (await untilMaybe(isDesired, 500)) return { ok: true, method: 'label-click' };
     }
-    return { ok: false, method: 'all-failed' };
+    /* 三种方式都点过仍未生效：只可能是 React 还没跟上 → 一直等（勾选是后续步骤的硬前置） */
+    await until(isDesired);
+    return { ok: true, method: 'slow' };
   }
 
   /* ===== 表头全选 ===== */
@@ -1747,11 +1807,13 @@
         if (qa && typeof qa.realClick === 'function') qa.realClick(label);
         else label.click();
       } catch { try { cb.click(); } catch {} }
-      if (await until(isDesired, 60, perTry)) {
+      if (await untilMaybe(isDesired, perTry)) {
         return { ok: true, method: 'header-click', tries: attempt + 1 };
       }
     }
-    return { ok: false, reason: 'header-click-failed' };
+    /* 4 轮点完仍没变：只可能是响应慢 → 一直等（全选框状态是后续步骤的硬前置） */
+    await until(isDesired);
+    return { ok: true, method: 'header-click-slow', tries: 5 };
   }
   async function clearAllViaHeader(qa, doc = document) {
     if (getHeaderCheckState(doc) === 'none') return { ok: true, tries: 0 };
@@ -1814,7 +1876,7 @@
           return { ok: false, reason: `clear-incomplete(${getHeaderCheckState(doc)})` };
         }
       }
-      let noSel = await until(() => getSelectedFids(doc).length === 0, 100, 1500);
+      const noSel = await until(() => getSelectedFids(doc).length === 0);
       if (!noSel) {
         /* 表头清不掉时逐行取消残留勾选。残留的上一行就是"改错文件"的另一大来源 */
         for (const r of [...doc.querySelectorAll('tr.ant-table-row-selected')]) {
@@ -1824,7 +1886,7 @@
             else { const cb = r.querySelector('input.ant-checkbox-input'); if (cb) cb.click(); }
           } catch {}
         }
-        noSel = await until(() => getSelectedFids(doc).length === 0, 100, 1500);
+        await until(() => getSelectedFids(doc).length === 0);
       }
       if (!noSel) {
         const n = getSelectedFids(doc).length;
@@ -2227,8 +2289,8 @@
     const editorClosed = () => !isEditorOpen(input);
     let closed = false;
     pressKeyOn(input, 'Enter');
-    closed = await until(() => editorClosed(), 150, 3000);
-    if (!closed) { try { input.blur(); } catch {} closed = await until(() => editorClosed(), 150, 3000); }
+    closed = await until(() => editorClosed());
+    if (!closed) { try { input.blur(); } catch {} closed = await until(() => editorClosed()); }
     if (!closed) {
       const cell = input.closest('.filename, .file-click-wrap, td') || doc;
       const okBtn = [...cell.querySelectorAll('button, .anticon-check, [class*="confirm"], [class*="sure"], [class*="save"]')]
@@ -2236,7 +2298,7 @@
       if (okBtn) {
         log(' → 改名：点击行内编辑的确认按钮');
         try { qa.realClick(okBtn); } catch {}
-        closed = await until(() => editorClosed(), 150, 3000);
+        closed = await until(() => editorClosed());
       }
     }
     if (!closed) {
@@ -2322,7 +2384,7 @@
         }
       }
       return null;
-    }, 100, 2500);
+    });
     if (!btn) {
       const btns = [...scope.querySelectorAll('button')].map(b => (b.textContent || '').trim()).filter(Boolean);
       warn(' ⚠️ 改名：未找到确认按钮，弹窗内按钮：', btns);
@@ -2330,22 +2392,26 @@
     }
     qa.realClick(btn);
     const modalEl = (scope && scope.tagName !== 'INPUT' && scope.isConnected) ? scope : null;
-    const closed = await until(
-      () => (modalEl ? (!modalEl.isConnected || !_isVisible(modalEl)) : !findRenameModal(originalName, doc)),
-      150, 6000
-    );
-    if (!closed) {
-      /* 弹窗不关通常是服务端拒绝：重名 / 非法字符 / 超长。把报错文字带出去 */
+    /* 一直等到"弹窗关闭"这个结论；但服务端明确拒绝（重名/非法字符/超长）会留下报错文案，
+     * 那是"失败的结论"而不是"还没到"，出现即立判失败，不空等。 */
+    const closeRes = await until(() => {
+      const gone = modalEl ? (!modalEl.isConnected || !_isVisible(modalEl)) : !findRenameModal(originalName, doc);
+      if (gone) return { ok: true };
       const errText = readRenameErrorText(modalEl || scope, doc);
+      if (errText) return { ok: false, errText };
+      return null;
+    });
+    if (!closeRes.ok) {
+      const errText = closeRes.errText;
       const dup = await findExactNameAnywhere(qa, newName, doc, 4000);
       const dupFid = dup.found && dup.hit ? dup.hit.fid : '';
       const looksDup = !!dupFid && (!fid || dupFid !== fid);
-      warn(` ⚠️ 改名：确认后弹窗未关闭${errText ? `，提示「${errText}」` : ''}`
+      warn(` ⚠️ 改名：确认后弹窗未关闭，提示「${errText}」`
            + `${looksDup ? `；目标名已被占用（fid ${dupFid}）` : ''}`);
       try { pressKeyOn(doc.body, 'Escape'); } catch {}
       await sleep(200, true);
-      if (looksDup) return `target-name-exists${errText ? `(${errText})` : ''}`;
-      return errText ? `submit-failed(${errText})` : 'submit-failed';
+      if (looksDup) return `target-name-exists(${errText})`;
+      return `submit-failed(${errText})`;
     }
     log(' ⏳ 改名：弹窗已提交，等待列表确认新名…');
     return 'submitted';
@@ -2364,7 +2430,7 @@
       const names = rows.map(r => normalizeFileName(r.name));
       return tokens.every(t => names.some(n => n === t.name || n.endsWith(t.tail)));
     };
-    const got = await until(hitAll, 200, timeout);
+    const got = await untilMaybe(hitAll, timeout);
     if (got) { log(' ✓ 刷新后列表已出现本次转存文件，开始改名'); return true; }
     warn(` ⚠️ 改名：${timeout}ms 内列表未出现全部目标文件`);
     return false;
@@ -2468,7 +2534,7 @@
         }
       }
       if (!loaded) loaded = findListRowByName(qa, e.old, doc);
-      if (!loaded) loaded = await until(() => findListRowByName(qa, e.old, doc), 200, waitMs);
+      if (!loaded) loaded = await untilMaybe(() => findListRowByName(qa, e.old, doc), waitMs);
       if (!loaded) loaded = await scrollToRowByName(qa, doc, e.old, { cacheKey: currentCacheKey(), maxMs: 6000 });
 
       /* ① 已经是目标名（可能上一趟改成功了只是没确认到）→ 直接算成功 */
@@ -2768,7 +2834,7 @@
     let lastWarn = 0;
     const remain = () => Math.max(800, maxMs - (Date.now() - t0));
 
-    const got = await until(() => {
+    const got = await untilMaybe(() => {
       if (isShareTableLoading(doc)) { lastCount = -1; stableHits = 0; return null; }
       const rows = qa.scanFileRows(doc);
       const cnt = rows.length;
@@ -2783,7 +2849,7 @@
       }
       lastCount = cnt;
       return null;
-    }, 300, remain());
+    }, remain());
 
     if (got) return got;
 
@@ -2914,7 +2980,7 @@
 
       let recorded = false;
       if (result === 'success'
-          || (result === 'unknown' && isSuccessModalPresent(doc) && !isIframeCovering(doc))) {
+          || (result === 'unknown' && isSaveSuccessUiVisible(doc) && !isIframeCovering(doc))) {
         const allRows = qa.scanFileRows(doc) || [];
         const actuallySaved = allRows.filter(row => row.checked);
         if (actuallySaved.length) {
@@ -3099,7 +3165,7 @@
 
     /* 保存前抓"转存至"（保存成功后弹窗会关，之后读不到） */
     try {
-      savePath = await until(() => readSaveTargetPath(document), 150, 3000) || readSaveTargetPath(document);
+      savePath = await until(() => readSaveTargetPath(document));
       if (savePath) log(` 转存至：${savePath}`);
       else warn(' ⚠️ 未读到"转存至"路径（.share-path .path-name）');
     } catch {}
@@ -4414,10 +4480,11 @@
 
   /* ===== 夸克端入口 ===== */
   async function waitForQA(timeout = 10000) {
-    return await until(() => {
+    /* 探测型：QA 脚本没装/未启用时，等不到也要能返回 null（否则子页永远不处理任务） */
+    return await untilMaybe(() => {
       const qa = unsafeWindow.quarkAssistant;
       return qa && qa.isReady && qa.isReady() ? qa : null;
-    }, 150, timeout);
+    }, timeout);
   }
 
   function isQAVersionOk(qa) {

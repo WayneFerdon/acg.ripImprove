@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.3.8
+// @version      1.3.9
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -2269,7 +2269,34 @@ function showEditDialog() {
     #gmEditOverlay #delayTableHost td { background:#1f1f1f !important; border:1px solid #333 !important; padding: 2px 4px; }
     #gmEditOverlay #delayTableHost tr.delay-sub td { background:#232323 !important; }
     #gmEditOverlay #delayTableHost input { background:#252525; color:#d4d4d4; border:1px solid #444; }
-    #gmEditOverlay #delayTableHost input.delay-name.no-match {
+    /* 延时表"名称/排除"：高度填满所在 td；文本自动折行；非编辑态超过 3 行截断显示省略号 */
+    #gmEditOverlay #delayTableHost td.delay-cell { position: relative; padding: 0 !important; }
+    #gmEditOverlay #delayTableHost td.delay-cell > .delay-field {
+      position: absolute; inset: 0;
+      box-sizing: border-box;
+      min-height: 1.6em;
+      padding: 2px 4px;
+      font-size: 12pt; line-height: 1.3;
+      color: #d4d4d4; background: #252525;
+      white-space: pre-wrap;
+      word-break: break-word;
+      overflow-wrap: anywhere;
+      overflow: hidden;
+      cursor: text;
+      outline: none;
+    }
+    #gmEditOverlay #delayTableHost td.delay-cell > .delay-field:not(:focus) {
+      display: -webkit-box;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 3;
+      text-overflow: ellipsis;
+    }
+    #gmEditOverlay #delayTableHost td.delay-cell > .delay-field:focus {
+      display: block;
+      overflow: auto;
+      outline: 1px solid #4a90d9;
+    }
+    #gmEditOverlay #delayTableHost .delay-name.no-match {
       color: #FFC000 !important;
       font-weight: bold !important;
       background: #2a2418 !important;
@@ -2719,6 +2746,32 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     }
     return max + 1;
   }
+  /* 延时表的"名称/排除"改用 contenteditable：<input> 无法自动折行，也做不了多行省略号。 */
+  function delayFieldText(el) {
+    if (!el) return '';
+    return String(el.textContent || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  }
+  function makeDelayTextField(className, value) {
+    const el = cE('div');
+    el.className = 'delay-field ' + className;
+    el.contentEditable = 'plaintext-only';
+    /* 不支持 plaintext-only 的浏览器会回落到 inherit/不可编辑，这里退化成普通可编辑 */
+    if (String(el.contentEditable).toLowerCase() !== 'plaintext-only') el.contentEditable = 'true';
+    el.spellcheck = false;
+    el.textContent = value || '';
+    /* Enter 不产生真实换行：折行只靠 CSS，值必须是单行，否则名称/排除的精确匹配会失效 */
+    el.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') { e.preventDefault(); try { el.blur(); } catch {} }
+    });
+    el.addEventListener('paste', (e) => {
+      e.preventDefault();
+      const t = String((e.clipboardData && e.clipboardData.getData('text')) || '')
+        .replace(/\s*\n+\s*/g, ' ').trim();
+      if (t) { try { document.execCommand('insertText', false, t); } catch {} }
+    });
+    el.addEventListener('input', onDelayInput);
+    return el;
+  }
   function onDelayInput() {
     updateDelayNameHighlight();
     scheduleRefresh();
@@ -2774,16 +2827,14 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   function addDelayPair(data = {}) {
     const cols = computeDelayCols();
     const mainTr = cE('tr'); mainTr.className = 'delay-main';
-    const tdName = cE('td'); tdName.rowSpan = 2;
-    tdName.style.cssText = 'padding:2px;border:1px solid #333;vertical-align:top;min-width:130px;';
-    const nameInput = cE('input'); nameInput.type = 'text'; nameInput.autocomplete = 'off'; nameInput.className = 'delay-name';
-    nameInput.value = data.名称 || ''; nameInput.style.cssText = 'width:100%;box-sizing:border-box;font-size:12pt;';
-    nameInput.addEventListener('input', onDelayInput); tdName.appendChild(nameInput);
-    const tdExc = cE('td'); tdExc.rowSpan = 2;
-    tdExc.style.cssText = 'padding:2px;border:1px solid #333;vertical-align:top;min-width:60px;';
-    const excInput = cE('input'); excInput.type = 'text'; excInput.autocomplete = 'off'; excInput.className = 'delay-exclude';
-    excInput.value = data.排除 || ''; excInput.style.cssText = 'width:100%;box-sizing:border-box;font-size:12pt;';
-    excInput.addEventListener('input', onDelayInput); tdExc.appendChild(excInput);
+    const tdName = cE('td'); tdName.rowSpan = 2; tdName.className = 'delay-cell delay-cell-name';
+    tdName.style.cssText = 'padding:0;border:1px solid #333;vertical-align:top;min-width:130px;';
+    const nameInput = makeDelayTextField('delay-name', data.名称 || '');
+    tdName.appendChild(nameInput);
+    const tdExc = cE('td'); tdExc.rowSpan = 2; tdExc.className = 'delay-cell delay-cell-exclude';
+    tdExc.style.cssText = 'padding:0;border:1px solid #333;vertical-align:top;min-width:60px;';
+    const excInput = makeDelayTextField('delay-exclude', data.排除 || '');
+    tdExc.appendChild(excInput);
     const tdDel = cE('td'); tdDel.rowSpan = 2;
     tdDel.style.cssText = 'padding:2px;border:1px solid #333;text-align:center;vertical-align:middle;';
     const delBtn = cE('button'); delBtn.type = 'button'; delBtn.textContent = '✕';
@@ -2942,9 +2993,9 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   function collectDelayData() {
     const rows = [];
     for (const mainTr of delayTbody.querySelectorAll('.delay-main')) {
-      const name = mainTr.querySelector('.delay-name').value.trim();
+      const name = delayFieldText(mainTr.querySelector('.delay-name'));
       if (!name) continue;
-      const exclude = mainTr.querySelector('.delay-exclude').value.trim();
+      const exclude = delayFieldText(mainTr.querySelector('.delay-exclude'));
       const epInputs = mainTr.querySelectorAll('.delay-episode');
       const subTr = mainTr.nextElementSibling;
       const wkInputs = subTr ? subTr.querySelectorAll('.delay-week') : [];
@@ -2969,7 +3020,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     for (const mainTr of delayTbody.querySelectorAll('.delay-main')) {
       const nameInput = mainTr.querySelector('.delay-name');
       if (!nameInput) continue;
-      const name = nameInput.value.trim();
+      const name = delayFieldText(nameInput);
       if (!name) { nameInput.classList.remove('no-match'); continue; }
       if (validNames.has(name)) nameInput.classList.remove('no-match');
       else nameInput.classList.add('no-match');
@@ -2982,8 +3033,8 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     const currentEP = Number(row.下集) || 0;
     let total = 0, matched = false;
     for (const mainTr of delayTbody.querySelectorAll('.delay-main')) {
-      const name = mainTr.querySelector('.delay-name')?.value.trim();
-      const exclude = mainTr.querySelector('.delay-exclude')?.value.trim() || '';
+      const name = delayFieldText(mainTr.querySelector('.delay-name'));
+      const exclude = delayFieldText(mainTr.querySelector('.delay-exclude'));
       if (!name || !keys.includes(name) || exclude) continue;
       matched = true;
       const epInputs = mainTr.querySelectorAll('.delay-episode');

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.3.5
+// @version      1.3.8
 // @description  acg.rip torrent auto download
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -993,17 +993,54 @@ function expandResourceUrl(url, row) {
   const ep = String(Number(row?.下集) || 1);
   return decoded.replace(/@@|@/g, (m) => m === '@@' ? pad2Episode(ep) : ep);
 }
+/* 规则是链接时，资源列填的是"相对播出时间的 delta"，格式 DHHMM（D=天、HH=时、MM=分，必须 5 位）。
+ * 例：00030 = +30 分钟；10200 = +1 天 2 小时；00000 = 与播出同时。
+ * 只有 5 位纯数字才认；解析失败返回 null（此时退回"直接用播出时间"）。 */
+function parseDeltaDHHMM(raw) {
+  const t = String(raw ?? '').trim();
+  if (!/^\d{5}$/.test(t)) return null;
+  const d = Number(t[0]);
+  const hh = Number(t.slice(1, 3));
+  const mm = Number(t.slice(3, 5));
+  if (!(hh >= 0 && hh <= 23) || !(mm >= 0 && mm <= 59)) return null;
+  return { d, hh, mm, ms: ((d * 24 + hh) * 60 + mm) * 60000 };
+}
+
+/* 取该行资源列"实际显示的时间"（DHHMM 数字），与写入格式解耦：
+ *   规则是链接 → 资源字段是 delta → 播出时间 + delta
+ *                  （delta 没填/解析不了 → 直接用播出时间，source='air'）
+ *   规则不是链接 → 资源字段本身就是绝对 DHHMM（source='abs'）
+ * 返回 { dh, source: 'delta'|'abs'|'air'|'none' } */
+function getResourceTimeValue(row) {
+  const rawRes = String(row?.资源 ?? '').trim();
+  const ruleStr = expandResourceUrl(String(row?.规则 ?? '').trim(), row);
+  const air = Number(row?._airDate) || 0;
+  if (isHttpUrl(ruleStr)) {
+    const delta = parseDeltaDHHMM(rawRes);
+    if (delta && air > 0) {
+      const dh = timeToDHHMM(air + delta.ms);
+      if (isDHHMM(dh)) return { dh, source: 'delta' };
+    }
+    if (air > 0) {
+      const dh = timeToDHHMM(air);
+      if (isDHHMM(dh)) return { dh, source: 'air' };
+    }
+    return { dh: 0, source: 'none' };
+  }
+  if (isDHHMM(rawRes)) return { dh: Number(rawRes), source: 'abs' };
+  return { dh: 0, source: 'none' };
+}
+
 function getResourceDisplayInfo(row) {
   const rawRule = String(row.规则 ?? '').trim();
   const rawRes = String(row.资源 ?? '').trim();
   const ruleStr = expandResourceUrl(rawRule, row);
   const resStr = expandResourceUrl(rawRes, row);
-  const resIsTime = isDHHMM(row.资源);
 
   let url = '';
   if (isHttpUrl(ruleStr)) url = ruleStr;
-  else if (!resIsTime && isHttpUrl(resStr)) url = resStr;
-  else if (!resIsTime && isHttpUrl(rawRes)) url = rawRes;
+  else if (!isDHHMM(row.资源) && isHttpUrl(resStr)) url = resStr;
+  else if (!isDHHMM(row.资源) && isHttpUrl(rawRes)) url = rawRes;
 
   const initialOf = u => {
     const d = extractDomainLastTwo(u);
@@ -1014,11 +1051,13 @@ function getResourceDisplayInfo(row) {
    *   'last'  → 只高亮文本最后 1 个字符（域名首字母）。表示"资源时间真实存在"。
    *   'full'  → 整条高亮。表示"资源时间缺失"（用播出时间推算或退回域名文本）。
    *   ''      → 不高亮。 */
-  if (resIsTime) {
+  const t = getResourceTimeValue(row);
+  if (t.dh) {
     const initial = initialOf(url);
-    if (url && initial) return { text: formatDHHMMWithLetter(row.资源, initial), href: url, highlight: 'last' };
-    if (url) return { text: formatDHHMM(row.资源), href: url, highlight: '' };
-    return { text: formatDHHMM(row.资源), href: '', highlight: '' };
+    /* 只有"没填 delta、纯用播出时间兜底"才算缺失；delta 是用户显式配置的，按真实时间显示 */
+    const hl = t.source === 'air' ? 'full' : '';
+    if (url && initial) return { text: formatDHHMMWithLetter(t.dh, initial), href: url, highlight: hl||'last' };
+    return { text: formatDHHMM(t.dh), href: url, highlight: hl };
   }
 
   if (url) {
@@ -2163,8 +2202,8 @@ function showEditDialog() {
       box-sizing: border-box;
       line-height: 1.4;
     }
-    #gmEditOverlay .u-main-table th:nth-child(1), #gmEditOverlay .u-main-table td:nth-child(1) { width: 210px !important; min-width: 210px !important; max-width: 210px !important; }
-    #gmEditOverlay .u-main-table th:nth-child(2), #gmEditOverlay .u-main-table td:nth-child(2) { width: 73px !important; max-width: 73px !important; }
+    #gmEditOverlay .u-main-table th:nth-child(1), #gmEditOverlay .u-main-table td:nth-child(1) { width: 230px !important; min-width: 230px !important; max-width: 230px !important; }
+    #gmEditOverlay .u-main-table th:nth-child(2), #gmEditOverlay .u-main-table td:nth-child(2) { width: 76px !important; max-width: 76px !important; }
     #gmEditOverlay .u-main-table th:nth-child(5), #gmEditOverlay .u-main-table td:nth-child(5) { width: 135px !important; max-width: 135px !important; }
     #gmEditOverlay .u-main-table th:nth-child(8), #gmEditOverlay .u-main-table td:nth-child(8) { width: 100px !important; min-width: 100px !important; max-width: 100px !important; }
     #gmEditOverlay .u-main-table th:nth-child(9), #gmEditOverlay .u-main-table td:nth-child(9) { width: 64px !important; max-width: 64px !important; }
@@ -2275,6 +2314,8 @@ function showEditDialog() {
   form.style.cssText = 'display:flex;flex-direction:column;flex:1;min-height:0;';
   form.innerHTML = `
         <h2 style="flex-shrink:0;">编辑数据<span class="info-icon" title="资源/规则列：@ 表示当前下集（1、2、10、101），@@ 表示补零两位（01、02、10、101）。
+资源列：规则为链接时填“与播出时间的 delta”，格式 DHHMM（5 位：D天 HH时 MM分）。例 00030=+30 分钟、10200=+1 天 2 小时、00000=与播出同时；显示值＝播出时间＋delta。
+规则不是链接时，资源列直接填绝对时间 DHHMM（如 31200＝周三 12:00）。
 延日列：支持算式与函数，@ 表示当前下集数字。如 @*2、@+7、@-5；
 或 =SUM((@&gt;={8,10,12,14,16})*-1) 表示下集达到 8,10,12,14,16 时各提前 1 天，并累计。
 BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进入编辑，可分别填写文本与 URL。粘贴含链接的富文本时会自动拆到两个 input。
@@ -4165,7 +4206,9 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
 
       const resVal = String(row.资源 ?? '').trim();
       const ruleVal = String(row.规则 ?? '').trim();
-      const hasTime = isDHHMM(resVal);
+      /* 显示时间与写入格式解耦：规则是链接时资源列存的是 delta，这里换算成"播出 + delta" */
+      const resTime = getResourceTimeValue(row);
+      const hasTime = !!resTime.dh;
 
       if (isExpanded) {
         /* 展开态（悬浮多行）：
@@ -4173,7 +4216,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
          * - 无时间值：不显示域名等，只显示规则/链接 */
         const lines = [];
         if (hasTime) {
-          lines.push({ text: formatDHHMM(resVal), href: '', highlight: '' });
+          lines.push({ text: formatDHHMM(resTime.dh), href: '', highlight: '' });
         }
         if (ruleVal) {
           const exp = expandResourceUrl(ruleVal, row);
@@ -4208,7 +4251,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
       }
 
       const tipParts = [];
-      if (hasTime) tipParts.push(formatDHHMM(resVal));
+      if (hasTime) tipParts.push(formatDHHMM(resTime.dh));
       if (ruleVal) tipParts.push(ruleVal);
       else if (resVal && !hasTime) tipParts.push(resVal);
       resDisplay.title = tipParts.join('\n');
@@ -4970,7 +5013,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   /* ===== 表格骨架 ===== */
   const header = cE('thead'); const hr = cE('tr');
   const headerCols = [
-    ['名称', '210px'], ['资源', '73px'],
+    ['名称', '230px'], ['资源', '76px'],
     ['下集', '36px'], ['总集', '36px'], ['播出', '135px'],
     ['延周', '36px'], ['延日', '36px'], ['BGMID', '100px'],
     ['名称', '64px'], ['中文', '64px'],

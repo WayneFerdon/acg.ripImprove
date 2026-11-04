@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.3.1
+// @version      6.3.2
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -1445,12 +1445,35 @@
     return ['settle-timeout', 'timeout', 'no-table'].includes(String(reason || ''));
   }
 
-  /* 步骤 2：勾选 → 删除 → 确认 → await until 消失 → 刷新复核 */
-  async function deleteFilesByFids(fids, opts = {}) {
-    return withListScrollLock(() => deleteFilesByFidsInner(fids, opts), opts.tag || '删除');
+  /* 滚动一屏：按"当前渲染窗口里实际显示的行"计算，留一行重叠，避免跳行 */
+  function listScreenStep(body) {
+    const fallback = Math.max(160, Math.floor((body.clientHeight || 400) * 0.8));
+    try {
+      const rows = [...body.querySelectorAll('tr.ant-table-row')];
+      let sum = 0, n = 0;
+      for (const r of rows) {
+        const h = r.offsetHeight || (r.getBoundingClientRect ? r.getBoundingClientRect().height : 0) || 0;
+        if (h > 0) { sum += h; n++; }
+      }
+      if (!n) return fallback;
+      const avgH = sum / n;
+      const visible = Math.max(1, Math.floor((body.clientHeight || 400) / avgH));
+      return Math.max(avgH * 0.8, (visible - 1) * avgH);
+    } catch { return fallback; }
   }
 
-  async function deleteFilesByFidsInner(fids, opts = {}) {
+  /* 步骤 2：逐屏删除。
+   *   1) 从顶部逐屏向下滚，直到当前渲染窗口里出现待删文件；
+   *   2) 确保没有任何选中；
+   *   3) 只勾选当前窗口里的待删文件，立即删除；
+   *   4) 删除后刷新；删除前不在底部就回顶部；
+   *   5) 重复 1~4，直到滚到底。
+   * 这样选中集合永远只有"当前屏的目标"，不可能出现滚出屏幕的残留选中。 */
+  async function deleteFilesByFids(fids, opts = {}) {
+    return withListScrollLock(() => deleteFilesByFidsByScreens(fids, opts), opts.tag || '删除');
+  }
+
+  async function deleteFilesByFidsByScreens(fids, opts = {}) {
     const tag = opts.tag || 'delete';
     const out = { requested: fids.length, picked: 0, pickedFids: [], result: 'none', failed: [], still: [] };
     if (!fids || !fids.length) return out;
@@ -1462,91 +1485,161 @@
     }
 
     const targets = [...new Set(fids)];
-    let remaining = targets.slice();
+    const remaining = new Set(targets);
+    const failed = new Set();
+    if (!tableBody()) { out.result = 'no-table'; out.failed = targets.slice(); return out; }
 
-    for (let attempt = 1; attempt <= 2 && remaining.length; attempt++) {
-      if (attempt > 1) {
-        log(`  删除重试 ${attempt}/2：剩余 ${remaining.length}，等 2000ms`);
-        await sleep(2000, true);
-        const settled = await waitListSettled({ tag: tag + '-retry', maxWaitMs: 20000 });
-        if (!settled.ok) break;
-      }
-      await clearAllSelection();
-      await sleep(150, true);
-      /* 清空失败（虚拟滚动残留）绝不能继续：夸克删除作用于"全部勾选"，
-       * 残留的旧勾选会被一起删掉 */
-      if (hasAnyRowSelected()) {
-        warn('  仍有残留勾选，放弃本次删除（避免删到目标之外的文件）');
-        out.result = 'selection-dirty';
-        out.failed = remaining.slice();
-        break;
+    const isHidden = !!document.hidden;
+    const maxRounds = Math.min(1000, targets.length + 40);
+    let round = 0;
+    let anyDeleted = false;
+
+    while (remaining.size && round++ < maxRounds) {
+      if (isPaused()) { out.result = 'paused'; break; }
+
+      /* 每轮重新取容器：刷新后 React 可能替换 .ant-table-body，旧引用会失效 */
+      const body = tableBody();
+      if (!body) { out.result = 'no-table'; break; }
+
+      /* 每一轮都从顶部开始逐屏找：删除后列表会重排，从头扫最可靠 */
+      try { body.scrollTop = 0; } catch {}
+      await sleep(120, true);
+
+      let deletedThisRound = 0;
+      let scannedScreens = 0;
+
+      for (;;) {
+        if (++scannedScreens > 3000 && !deletedThisRound) {
+          warn('  本屏扫描次数异常，结束本轮');
+          break;
+        }
+        if (isLoadingAnimPresent()) { await sleep(160, true); continue; }
+        if (isPaused()) { out.result = 'paused'; break; }
+
+        /* 当前渲染窗口里的目标行 */
+        const rows = [...body.querySelectorAll('tr.ant-table-row[data-row-key]')];
+        const hitRows = rows.filter(r => remaining.has(r.getAttribute('data-row-key')));
+
+        if (hitRows.length) {
+          /* 1) 确保没有任何选中 */
+          await clearAllSelection();
+          if (hasAnyRowSelected()) {
+            warn('  仍有残留勾选，放弃本次删除（避免删到目标之外的文件）');
+            out.result = 'selection-dirty';
+            for (const fid of remaining) failed.add(fid);
+            remaining.clear();
+            break;
+          }
+
+          /* 2) 只勾选当前窗口里的目标 */
+          const picked = [];
+          for (const row of hitRows) {
+            const fid = row.getAttribute('data-row-key');
+            if (await setRowChecked(row, true)) picked.push(fid);
+          }
+          if (picked.length !== hitRows.length) {
+            warn(`  本屏只勾选到 ${picked.length}/${hitRows.length} 个，跳过本屏`);
+            await clearAllSelection();
+            for (const row of hitRows) {
+              const fid = row.getAttribute('data-row-key');
+              failed.add(fid);
+              remaining.delete(fid);
+            }
+            deletedThisRound++;
+            break;
+          }
+          if (!hasAnyRowSelected()) {
+            warn('  勾选后表头显示无选中，放弃本次删除');
+            out.result = 'selection-lost';
+            break;
+          }
+
+          const wasAtBottom = body.scrollTop >= Math.max(0, body.scrollHeight - body.clientHeight) - 2;
+
+          out.picked += picked.length;
+          out.pickedFids.push(...picked);
+          log(`  第 ${round} 轮/本屏删除 ${picked.length} 个：` +
+              picked.slice(0, 6).map(f => String(f).slice(0, 8)).join('、') + (picked.length > 6 ? '…' : ''));
+
+          if (!await clickDeleteButton(8000)) {
+            warn('  未找到顶栏删除按钮');
+            out.result = 'delete-button-missing';
+            break;
+          }
+          if (!await confirmDeleteDialog(8000)) {
+            warn('  未找到删除确认按钮');
+            await until(() => !document.querySelector('.base-confirm-modal'), 100, 1200);
+            out.result = 'confirm-missing';
+            break;
+          }
+
+          const st = await awaitRowsGone(picked, 25000);
+          log(`  本屏删除结果：${st}（${picked.length} 个）`);
+          await until(() => !document.querySelector('.base-confirm-modal'), 100, 1500);
+
+          /* 3) 刷新列表 */
+          const rf = await refreshListAndWait({ tag: tag + '-refresh' });
+          if (!rf.ok && isRefreshFatal(rf.reason)) {
+            out.result = 'unverified';
+            out.failed = targets.slice();
+            return out;
+          }
+          /* 4) 删除前不在底部 → 回顶部（下一轮本来就从头扫，这里只是立即复位） */
+          if (!wasAtBottom) { try { (tableBody() || body).scrollTop = 0; } catch {} }
+          await sleep(120, true);
+
+          if (st === 'fail' || st === 'timeout') {
+            for (const fid of picked) { failed.add(fid); remaining.delete(fid); }
+          } else {
+            anyDeleted = true;
+            for (const fid of picked) remaining.delete(fid);
+          }
+          deletedThisRound++;
+          break;   /* 回到 while，重新从顶部开始 */
+        }
+
+        /* 当前窗口没有目标：向下滚一屏 */
+        const maxTop = Math.max(0, body.scrollHeight - body.clientHeight);
+        if (body.scrollTop >= maxTop - 2) {
+          if (hasMoreRow() || hasLoadingMore()) { await sleep(220, true); continue; }
+          for (const fid of [...remaining]) {
+            warn(`  目标 ${String(fid).slice(0, 8)} 已不在列表，放弃`);
+            failed.add(fid);
+            remaining.delete(fid);
+          }
+          break;
+        }
+        try { body.scrollTop = Math.min(maxTop, body.scrollTop + listScreenStep(body)); } catch {}
+        await sleep(isHidden ? 220 : 90, true);
       }
 
-      const picked = [];
-      let paused = false;
-      for (const fid of remaining) {
-        if (isPaused()) { paused = true; break; }
-        const row = await scrollRowIntoViewRaw(fid);
-        if (!row) { log(`  目标 ${fid.slice(0, 8)} 不在列表中，跳过`); continue; }
-        if (await setRowChecked(row, true)) picked.push(fid);
-      }
-      if (paused) {
-        warn('  ⏸ 暂停：放弃本次删除（不点了，避免只删一半）');
-        out.result = 'paused';
-        out.failed = remaining.slice();
-        await clearAllSelection();
-        break;
-      }
-      out.picked = picked.length;
-      out.pickedFids = picked.slice();
-      if (!picked.length) {
-        warn(`  没有勾选到任何目标文件（${remaining.length} 个都不在列表内）`);
-        await clearAllSelection();
-        break;
-      }
-      /* 勾选数必须与计划完全一致：少了说明列表已变，多了说明还有残留；
-       * 两者都意味着"点删除会删错范围"，一律中止 */
-      if (picked.length !== remaining.length) {
-        warn(`  只勾选到 ${picked.length}/${remaining.length} 个，放弃本次删除（避免范围不符）`);
-        out.result = 'selection-incomplete';
-        out.failed = remaining.slice();
-        await clearAllSelection();
-        break;
-      }
-
-      if (!await clickDeleteButton(8000)) { warn('  未找到顶栏删除按钮'); break; }
-      if (!await confirmDeleteDialog(8000)) {
-        warn('  未找到删除确认按钮');
-        await until(() => !document.querySelector('.base-confirm-modal'), 100, 1200);
-        break;
-      }
-
-      const st = await awaitRowsGone(picked, 25000);
-      out.result = st;
-      log(`  删除结果：${st}（勾选 ${picked.length}）`);
-      await until(() => !document.querySelector('.base-confirm-modal'), 100, 1500);
-
-      const rf = await refreshListAndWait({ tag: tag + '-refresh' });
-      if (!rf.ok && isRefreshFatal(rf.reason)) {
-        warn(`  删除后刷新未完成（${rf.reason}），无法复核`);
-        out.still = picked.slice();
-        out.result = 'unverified';
-        return out;
-      }
-      if (!rf.ok) warn(`  刷新未确认（${rf.reason}），按当前（服务端已确认的）列表复核`);
-
-      const left = [];
-      for (const fid of picked) {
-        if (await scrollRowIntoViewRaw(fid, { maxMs: 5000 })) left.push(fid);
-      }
-      out.still = left;
-      out.failed = targets.filter(f => !picked.includes(f)).concat(left);
-      remaining = left.slice();
-      if (!left.length) { out.result = 'deleted'; break; }
-      warn(`  ${left.length} 个文件刷新后仍在列表中，判定未删除`);
+      if (!deletedThisRound) break;
     }
 
-    log(`★ [${tag}] 删除汇总：请求 ${out.requested}，勾选 ${out.picked}，剩余 ${out.still.length}（${out.result}）`);
+    /* 暂停：不再滚动复核，未处理的目标全部记为失败 */
+    if (out.result === 'paused') {
+      out.failed = [...new Set([...failed, ...remaining])];
+      log(`★ [${tag}] 逐屏删除暂停：请求 ${out.requested}，勾选 ${out.picked}，未处理 ${remaining.size}`);
+      invalidateListSnapshot();
+      return out;
+    }
+
+    /* 最终复核：完整扫描一次，报告仍在列表的目标 */
+    let scan = null;
+    /* 本函数已持有滚动锁，这里必须用无锁版本，否则会自己等自己 */
+    try { scan = await scanAllRowsWithScrollInner({ tag: tag + '-verify' }); } catch {}
+    if (scan && scan.complete) {
+      out.still = targets.filter(fid => scan.byFid.has(fid));
+    } else {
+      warn('  删除后复核扫描未确认完整，只报告本轮失败项');
+      out.still = [...failed];
+      out.result = 'unverified';
+    }
+    out.failed = [...new Set([...failed, ...out.still])];
+    if (out.result === 'none') {
+      out.result = out.still.length ? 'partial' : (anyDeleted ? 'deleted' : 'none');
+    }
+    log(`★ [${tag}] 逐屏删除汇总：请求 ${out.requested}，勾选 ${out.picked}，仍存在 ${out.still.length}（${out.result}）`);
     invalidateListSnapshot();   /* 文件集已变，旧全量快照作废 */
     return out;
   }
@@ -2130,7 +2223,7 @@
       if (del.result === 'paused') return { ok: false, reason: 'paused', files: del };
       if (del.result === 'unverified') return { ok: false, reason: 'delete-unverified', files: del };
       /* 勾选范围与计划不一致：一个文件都没点删除，绝不能继续走"删除后"的统计与清记录 */
-      if (del.result === 'selection-dirty' || del.result === 'selection-incomplete') {
+      if (del.result === 'selection-dirty' || del.result === 'selection-incomplete' || del.result === 'selection-lost') {
         warn(`⚠️ [${tag}] 删除未执行（${del.result}），本轮不删文件也不清记录`);
         return { ok: false, reason: del.result, files: del };
       }
@@ -2558,6 +2651,7 @@
             'delete-unverified': '删除后卡在加载，无法复核',
             'selection-dirty': '勾选未能清空（虚拟滚动残留），已中止删除',
             'selection-incomplete': '只勾选到部分目标，已中止删除（避免删错范围）',
+            'selection-lost': '勾选后未检测到选中项，已中止删除',
             'refresh-settle-timeout': '删除后刷新卡在加载',
             'refresh-timeout': '删除后列表未就绪',
             'refresh-no-table': '找不到文件表格',
@@ -2594,7 +2688,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.3.1',
+    version: '6.3.2',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -2628,16 +2722,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.1`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.2`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.1');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.2');
     } else {
-      log('平台层就绪（其他页）v6.3.1');
+      log('平台层就绪（其他页）v6.3.2');
     }
     startGrayPolling();
   })();

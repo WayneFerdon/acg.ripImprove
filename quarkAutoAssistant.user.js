@@ -1112,6 +1112,7 @@
     let reachedBottom = false;
     let stalled = false;
     let lastReport = -1;
+    let lastDiag = Date.now();
     let noMove = 0;          /* 滚动位置推不动、且没有新行：虚拟容器异常/已无更多内容 */
 
     for (;;) {
@@ -1130,6 +1131,13 @@
       const sig = `${allKeys.size}|${Math.round(scrollH)}`;
       const grew = sig !== lastSig;
       lastSig = sig;
+
+      /* 长时间滚动时每 5s 留一条诊断，卡住时能看出卡在"加载更多"还是滚动无效 */
+      if (Date.now() - lastDiag >= 5000) {
+        lastDiag = Date.now();
+        log(`  [${tag}] 扫描中：文件 ${files.length} / 数据行 ${allKeys.size}，` +
+            `scrollTop=${Math.round(body.scrollTop)}/${Math.round(maxTop)}，更多批次=${more}，加载中=${hasLoadingMore()}`);
+      }
 
       if (uiBottom || (atBottom && !more)) {
         /* 已到末尾：虚拟滚动可能还要补渲染最后几行，等集合稳定 */

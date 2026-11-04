@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.3.0
+// @version      6.3.1
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -723,6 +723,11 @@
     downloadRunning = true;
     log('===== 开始批量自动下载 =====');
     try {
+      /* 清理还在跑就先等它：同一张列表不能一边删一边勾选下载 */
+      if (GATE.state === 'cleanup') {
+        setStatus('等待清理完成...', 'running');
+        await until(() => GATE.state !== 'cleanup', 300);
+      }
       setStatus('等待下载助手...', 'running');
       const ready = await waitForApiReady();
       if (!ready) {
@@ -849,6 +854,9 @@
       const cb = document.querySelector('.swal2-close');
       if (cb && isVisible(cb)) realClick(cb);
       await until(() => !document.querySelector('.swal2-popup'), 100, 3000);
+      /* 下载已触发，必须清空勾选：否则这批文件会一直处于选中态，
+       * 后续清理点"删除"时会把它们一并删掉（虚拟滚动下行数很多，逐行清不掉） */
+      await clearAllSelection();
       if (targetFidsSet) result.pendingAfter = targetFids.filter(fid => !isFidDownloaded(fid)).length;
       log(`===== 批量下载完成（${done}/${links.length}）=====`);
       setStatus('下载完成', 'done');
@@ -862,6 +870,7 @@
       result.reason = 'error: ' + (e && e.message || e);
       const cb = document.querySelector('.swal2-close');
       if (cb && isVisible(cb)) realClick(cb);
+      try { await clearAllSelection(); } catch {}
       return result;
     } finally {
       downloadRunning = false;
@@ -999,7 +1008,8 @@
   /* 表格底部"加载更多"行（Quark 列表是分批加载的：tr.recent-loading-tr[data-row-config-type=more]） */
   function hasLoadingMore() {
     try {
-      return !!document.querySelector(
+      const root = tableWrap() || document;
+      return !!root.querySelector(
         '.recent-loading-tr .ant-spin-spinning, tr[data-row-config-type="more"] .ant-spin-spinning'
       );
     } catch { return false; }
@@ -1013,7 +1023,9 @@
    * 即灰框是虚拟滚动的**最后一行**，只在渲染窗口覆盖到末尾时才存在，是最直接的证据。 */
   function hasBottomDropRow(doc = document) {
     try {
-      const list = doc.querySelectorAll('tr.drag-bottom');
+      /* 限定在当前文件表格内：页面上其它表格/拖拽区也可能有 drag-bottom */
+      const root = (doc.querySelector && doc.querySelector('.ant-table-wrapper')) || doc;
+      const list = root.querySelectorAll('tr.drag-bottom');
       for (const tr of list) {
         if (!tr || !tr.isConnected) continue;
         if (tr.closest && tr.closest('.ant-table-measure-row')) continue;
@@ -1025,7 +1037,8 @@
   /* 是否还存在"加载更多"行（不管转圈有没有在转）：有它说明后面还有批次没来 */
   function hasMoreRow(doc = document) {
     try {
-      return !!doc.querySelector(
+      const root = (doc.querySelector && doc.querySelector('.ant-table-wrapper')) || doc;
+      return !!root.querySelector(
         'tr[data-row-config-type="more"], tr.recent-loading-tr'
       );
     } catch { return false; }
@@ -1052,6 +1065,10 @@
    * 后续勾选/标记/清除都基于它，不再用"当前渲染的十几行"。
    */
   async function scanAllRowsWithScroll(opts = {}) {
+    return withListScrollLock(() => scanAllRowsWithScrollInner(opts), opts.tag || 'scan');
+  }
+
+  async function scanAllRowsWithScrollInner(opts = {}) {
     const tag = opts.tag || 'scan';
     /* 后台标签页渲染仍会被节流，步进等待略放大（用 Worker 定时器，不受 setTimeout 节流） */
     const isHidden = !!document.hidden;
@@ -1086,10 +1103,12 @@
     if (!body) {
       addAll();
       const empty = isEmptyUiVisible();
-      const complete = files.length > 0 || empty;
+      /* 没有表格容器：只有"确认空目录"可信；有行但容器丢失说明 DOM 异常，不能用来清记录 */
+      const complete = empty;
       return { ok: true, byFid, allKeys, files, count: files.length, allCount: allKeys.size, total, empty, complete, reachedBottom: complete, timedOut: false, stalled: false };
     }
 
+    const originTop = body.scrollTop;
     try { body.scrollTop = 0; } catch {}
     await sleep(100, true);
     addAll();
@@ -1129,11 +1148,26 @@
             `scrollTop=${Math.round(body.scrollTop)}/${Math.round(maxTop)}，更多批次=${more}，加载中=${hasLoadingMore()}`);
       }
 
-      if (uiBottom || (atBottom && !more)) {
-        /* 已到末尾：虚拟滚动可能还要补渲染最后几行，等集合稳定 */
+      /* 硬证据：底部"拖拽/粘贴"灰框 + 没有更多批次 */
+      if (uiBottom) {
         if (!grew) stable++; else stable = 0;
         if (stable >= bottomStable) { reachedBottom = true; break; }
         await sleep(120, true);
+        continue;
+      }
+
+      if (atBottom && !more) {
+        /* 个人页只有"底部灰框"才是到底硬证据。
+         * more 行消失可能只是"批次间隙"（下一批还没到），
+         * 此时判完成会漏掉后面所有批次 → 进而误删记录。
+         * 等足够久仍无灰框，按"未确认"退出（宁可清理失败，也不误删）。 */
+        if (!grew) stable++; else stable = 0;
+        if (stable >= bottomStable * 8) {
+          warn(`  [${tag}] 已滚到底且无更多批次，但始终没有底部灰框 → 按未确认结束`);
+          stalled = true;
+          break;
+        }
+        await sleep(160, true);
         continue;
       }
 
@@ -1159,11 +1193,14 @@
     }
 
     addAll();
-    try { body.scrollTop = 0; } catch {}
+    /* 回到扫描前的位置：避免清理/统计把用户正在看的列表甩回顶部 */
+    try { body.scrollTop = originTop; } catch {}
     await sleep(80, true);
 
     const empty = isEmptyUiVisible();
     reachedBottom = reachedBottom || isListAtBottom();
+    /* 推断值只用于诊断：行高不均会让它偏高/偏低，绝不能拿它当完成判据
+     * （之前就因为"推断 55 < 实际 109"误判过） */
     const complete = (reachedBottom || empty) && !stalled;
     log(`★ [${tag}] 全量扫描：文件 ${files.length} / 数据行 ${allKeys.size} / 推断 ${total == null ? '?' : total}` +
         `${empty ? '（空目录）' : ''} → 底部灰框=${hasBottomDropRow()} 更多批次=${hasMoreRow()} ` +
@@ -1192,6 +1229,10 @@
   /* 按列表顺序滚动遍历目标 fid：只向前滚，避免每行都从顶部重新找
    * （虚拟滚动 + 100+ 行时，逐条 scrollRowIntoView 会慢十几倍） */
   async function forEachRowInOrder(keys, handler, opts = {}) {
+    return withListScrollLock(() => forEachRowInOrderInner(keys, handler, opts), '逐行处理');
+  }
+
+  async function forEachRowInOrderInner(keys, handler, opts = {}) {
     const list = (Array.isArray(keys) ? keys : []).filter(Boolean);
     const out = { done: 0, missed: [] };
     if (!list.length) return out;
@@ -1204,6 +1245,7 @@
     /* 上限只防「永远推不动」，按目标数放大（1000 个文件约需 1100 轮） */
     const maxLoops = Number(opts.maxLoops) > 0 ? Number(opts.maxLoops) : Math.min(20000, Math.max(600, list.length * 4 + 400));
 
+    const originTop = body.scrollTop;
     try { body.scrollTop = 0; } catch {}
     await sleep(120, true);
 
@@ -1237,24 +1279,14 @@
       try { body.scrollTop = Math.min(maxTop, before + step); } catch {}
       await sleep(sleepStep, true);
     }
+    try { body.scrollTop = originTop; } catch {}
     return out;
   }
 
   /* 清空全量勾选：虚拟滚动卸载掉的行不在 DOM 里，逐行清不到，
    * 用表头全选开关（全选 → 取消）让 React 一次性清空 selectedRowKeys */
   async function clearRowSelectionAll() {
-    await clearRowSelection();
-    const head = document.querySelector('.ant-table-thead input.ant-checkbox-input');
-    const wrap = head && head.closest('label.ant-checkbox-wrapper');
-    if (!head || !wrap) return;
-    if (!head.checked && !head.indeterminate) return;
-    realClick(wrap);
-    await sleep(150, true);
-    realClick(wrap);
-    await until(() => {
-      const h = document.querySelector('.ant-table-thead input.ant-checkbox-input');
-      return h && !h.checked && !h.indeterminate;
-    }, 60, 3000);
+    await clearAllSelection();
   }
 
   function findRowByFid(fid) {
@@ -1266,8 +1298,31 @@
     return null;
   }
 
+  /* 同一时刻只允许一个流程改变列表滚动位置：
+   * 自动清理、手动下载、记录复核可能并发，一个往下滚、一个回顶，
+   * 表现出来就是"在顶部和底部来回跳"，而且会让别的流程读到不完整的行。 */
+  let _listScrollBusy = false;
+  const _listScrollWaiters = [];
+  async function withListScrollLock(fn, label = '') {
+    if (_listScrollBusy) {
+      if (label) log(`  [滚动锁] ${label} 等待其它列表操作结束...`);
+      await new Promise(r => _listScrollWaiters.push(r));
+    }
+    _listScrollBusy = true;
+    try { return await fn(); }
+    finally {
+      _listScrollBusy = false;
+      const next = _listScrollWaiters.shift();
+      if (next) next();
+    }
+  }
+
   /* 滚动直到目标行进入 DOM（虚拟滚动下必须） */
   async function scrollRowIntoView(fid, opts = {}) {
+    return withListScrollLock(() => scrollRowIntoViewRaw(fid, opts), '定位行');
+  }
+
+  async function scrollRowIntoViewRaw(fid, opts = {}) {
     const isHidden = !!document.hidden;
     /* 后台标签页里每步 ~1s（定时器节流），必须放大超时，否则长列表找不到目标行 */
     const maxMs = Number(opts.maxMs) > 0 ? Number(opts.maxMs) : (isHidden ? 20000 : 8000);
@@ -1392,6 +1447,10 @@
 
   /* 步骤 2：勾选 → 删除 → 确认 → await until 消失 → 刷新复核 */
   async function deleteFilesByFids(fids, opts = {}) {
+    return withListScrollLock(() => deleteFilesByFidsInner(fids, opts), opts.tag || '删除');
+  }
+
+  async function deleteFilesByFidsInner(fids, opts = {}) {
     const tag = opts.tag || 'delete';
     const out = { requested: fids.length, picked: 0, pickedFids: [], result: 'none', failed: [], still: [] };
     if (!fids || !fids.length) return out;
@@ -1414,12 +1473,20 @@
       }
       await clearAllSelection();
       await sleep(150, true);
+      /* 清空失败（虚拟滚动残留）绝不能继续：夸克删除作用于"全部勾选"，
+       * 残留的旧勾选会被一起删掉 */
+      if (hasAnyRowSelected()) {
+        warn('  仍有残留勾选，放弃本次删除（避免删到目标之外的文件）');
+        out.result = 'selection-dirty';
+        out.failed = remaining.slice();
+        break;
+      }
 
       const picked = [];
       let paused = false;
       for (const fid of remaining) {
         if (isPaused()) { paused = true; break; }
-        const row = await scrollRowIntoView(fid);
+        const row = await scrollRowIntoViewRaw(fid);
         if (!row) { log(`  目标 ${fid.slice(0, 8)} 不在列表中，跳过`); continue; }
         if (await setRowChecked(row, true)) picked.push(fid);
       }
@@ -1434,6 +1501,16 @@
       out.pickedFids = picked.slice();
       if (!picked.length) {
         warn(`  没有勾选到任何目标文件（${remaining.length} 个都不在列表内）`);
+        await clearAllSelection();
+        break;
+      }
+      /* 勾选数必须与计划完全一致：少了说明列表已变，多了说明还有残留；
+       * 两者都意味着"点删除会删错范围"，一律中止 */
+      if (picked.length !== remaining.length) {
+        warn(`  只勾选到 ${picked.length}/${remaining.length} 个，放弃本次删除（避免范围不符）`);
+        out.result = 'selection-incomplete';
+        out.failed = remaining.slice();
+        await clearAllSelection();
         break;
       }
 
@@ -1460,7 +1537,7 @@
 
       const left = [];
       for (const fid of picked) {
-        if (await scrollRowIntoView(fid, { maxMs: 5000 })) left.push(fid);
+        if (await scrollRowIntoViewRaw(fid, { maxMs: 5000 })) left.push(fid);
       }
       out.still = left;
       out.failed = targets.filter(f => !picked.includes(f)).concat(left);
@@ -1538,9 +1615,11 @@
     const list = (items || []).filter(it => fdmItemNameKeys(it).length > 0);
     if (!list.length) return out;
 
-    let scan = null;
-    try { scan = await scanAllRowsWithScroll({ tag: 'fdm-adopt', maxMs: opts.scanMs || 20000 }); }
-    catch (e) { warn('☁️ 认领扫描异常', e); }
+    let scan = opts.scan || null;
+    if (!scan) {
+      try { scan = await scanAllRowsWithScroll({ tag: 'fdm-adopt', maxMs: opts.scanMs || 20000 }); }
+      catch (e) { warn('☁️ 认领扫描异常', e); }
+    }
     if (!scan) return out;
     out.scanned = true;
     out.count = scan.count || 0;
@@ -1653,8 +1732,11 @@
     if (now - _fdmStaleScanAt < 10 * 60 * 1000) { out.skipped = aged.length; gmSet(GM_FDM_UNMATCHED, store); return out; }
     _fdmStaleScanAt = now;
 
-    let scan = null;
-    try { scan = await scanAllRowsWithScroll({ tag: 'fdm-stale', maxMs: 20000 }); } catch (e) { warn('☁️ 残留项扫描异常', e); }
+    let scan = (_listSnapshot && _listSnapshot.complete && _listSnapshot.scope === currentListScope())
+      ? _listSnapshot : null;
+    if (!scan) {
+      try { scan = await scanAllRowsWithScroll({ tag: 'fdm-stale', maxMs: 20000 }); } catch (e) { warn('☁️ 残留项扫描异常', e); }
+    }
     if (!scan || scan.complete !== true) {
       log('☁️ FDM 残留项：列表未确认完整，本轮不清理');
       out.skipped = aged.length;
@@ -1726,7 +1808,12 @@
        *  ② 列表里确实没有了 → 记时间戳，7 天后 ack 掉，避免永远挂在 /pending。 */
       if (unmatched.length) {
         try {
-          const adopt = await fdmAdoptByName(unmatched, { scanMs: opts.scanMs || 20000 });
+          /* 优先复用当前完整快照/清理流程刚扫过的结果，避免 FDM 轮询又整表滚一遍 */
+          const useScan = opts.scan || (
+            _listSnapshot && _listSnapshot.complete && _listSnapshot.scope === currentListScope()
+              ? _listSnapshot : null
+          );
+          const adopt = await fdmAdoptByName(unmatched, { scanMs: opts.scanMs || 20000, scan: useScan });
           if (adopt.plan.length) {
             for (const p of adopt.plan) plan.push(p);
             const taken = new Set(adopt.plan.map(p => p.item.url || p.item.name));
@@ -1796,6 +1883,9 @@
 
   function isListLoaded() { return !isLoadingAnimPresent(); }
 
+  /* 清空全量勾选：虚拟滚动卸载掉的行不在 DOM 里，逐行清不到，
+   * 必须用表头全选开关（全选 → 取消）让 React 一次性清空 selectedRowKeys。
+   * 删除前若残留未清，会连同目标之外的文件一起删掉。 */
   async function clearAllSelection() {
     const rows = document.querySelectorAll('tr.ant-table-row, [data-row-key]');
     for (const row of rows) {
@@ -1808,6 +1898,31 @@
         return !(i && i.checked) && !row.classList.contains('ant-table-row-selected');
       }, 50, 800);
     }
+    /* 再走表头：把已卸载行里的选中一并清掉。
+     * Ant 表头语义：全选态点一次=清空；部分选中点一次=全选，必须再点一次取消。
+     * 旧写法无条件点两次，在"本来是全选"时会变回全选，反而把整页都选中。 */
+    const head = document.querySelector('.ant-table-thead input.ant-checkbox-input');
+    const wrap = head && head.closest('label.ant-checkbox-wrapper');
+    if (!head || !wrap) return;
+    if (!head.checked && !head.indeterminate) return;
+    const wasChecked = !!head.checked;
+    realClick(wrap);
+    await sleep(150, true);
+    if (!wasChecked) {
+      realClick(wrap);
+      await sleep(150, true);
+    }
+    await until(() => {
+      const h = document.querySelector('.ant-table-thead input.ant-checkbox-input');
+      return h && !h.checked && !h.indeterminate;
+    }, 60, 3000);
+  }
+
+  /* 是否还有任何勾选（表头 checked/indeterminate 能覆盖已卸载行） */
+  function hasAnyRowSelected() {
+    const h = document.querySelector('.ant-table-thead input.ant-checkbox-input');
+    if (h && (h.checked || h.indeterminate)) return true;
+    return !!document.querySelector('tr.ant-table-row-selected');
   }
 
   async function clickDeleteButton(timeout = 6000) {
@@ -1868,8 +1983,10 @@
   }
 
   /* 步骤 3：只清"文件确实不在列表里"的记录。
-   * 判据不依赖条数：对每个候选 fid **滚动定位复核**一次，找不到才清
-   * （虚拟滚动/分批加载下，"这次没扫到"不等于"不存在"） */
+   * byFid 由调用方用"已确认到底"的全量扫描给出（scanTrust）。
+   * 不能再对每个候选 scrollRowIntoView 判存在：长列表 + 后台节流下 8s 滚不到，
+   * 会把仍然存在的文件误判成"已删除"从而清掉记录——这正是误删的来源。
+   * 这里只做 1 条抽样反证：抽样若找到了，说明这次扫描不可信，整批保留。 */
   async function clearRecordsMissingFromList(byFid, scope, opts = {}) {
     const out = { removed: [], kept: 0, noScope: 0, unverified: 0, names: [] };
     if (!scope) return out;
@@ -1887,21 +2004,26 @@
     if (!candidates.length) return out;
     if (isPaused()) { out.unverified = candidates.length; return out; }
 
-    const verifyMs = Number(opts.verifyMs) > 0 ? Number(opts.verifyMs) : 8000;
-    const dead = [];
-    for (const fid of candidates) {
-      const row = await scrollRowIntoView(fid, { maxMs: verifyMs });
-      /* 复核期间列表若在刷新，结论不可信 → 本轮不动记录 */
-      if (!row && isLoadingAnimPresent()) { out.unverified++; continue; }
-      if (row) {
-        out.kept++;
-        log(`  记录 ${String(fid).slice(0, 8)}「${(recs[fid] && recs[fid].name) || ''}」复核时找到了，保留`);
-      } else {
-        dead.push(fid);
-        out.names.push((recs[fid] && recs[fid].name) || fid);
-      }
+    /* 抽样复核（只用于"发现反例"）：找到任何一条就整批不清 */
+    const sample = candidates[0];
+    const row = await scrollRowIntoView(sample, {
+      maxMs: Number(opts.verifyMs) > 0 ? Number(opts.verifyMs) : 15000,
+    });
+    if (row) {
+      out.kept += candidates.length;
+      warn(`  抽样复核：记录 ${String(sample).slice(0, 8)}「${(recs[sample] && recs[sample].name) || ''}」仍在列表，本轮不清任何记录`);
+      return out;
     }
-    if (dead.length) { clearDlRecordsFids(dead); out.removed = dead; }
+    if (isLoadingAnimPresent()) {
+      out.unverified += candidates.length;
+      warn('  抽样复核期间列表在刷新，本轮不清任何记录');
+      return out;
+    }
+
+    const dead = candidates.slice();
+    clearDlRecordsFids(dead);
+    out.removed = dead;
+    out.names = dead.map(fid => (recs[fid] && recs[fid].name) || fid);
     return out;
   }
 
@@ -1940,6 +2062,12 @@
       if (!again || again.allCount >= scan.allCount) scan = again || scan;
       log(`★ [${tag}] 重试后：文件 ${scan.count} / 数据行 ${scan.allCount} / 推断 ${scan.total}，可信=${scanTrust(scan)}`);
     }
+    /* 扫描不完整时**一个文件都不删、一条记录都不清**：
+     * 之前"不可信还继续删"正是误删的来源。 */
+    if (!scanTrust(scan)) {
+      warn(`⚠️ [${tag}] 列表扫描不可信（文件 ${scan.count} / 数据行 ${scan.allCount} / 推断 ${scan.total}），本轮不删除任何文件`);
+      return { ok: false, reason: 'scan-incomplete', rows: scan.count, allRows: scan.allCount, empty: scan.empty };
+    }
 
     /* ---- 1.5 先走 FDM 桥：本地已确认下载完成的，立刻删云端 ----
      * 顺序很重要：先删"确证本地有完整副本"的，再按 24h TTL 兜底删剩下的，
@@ -1947,7 +2075,7 @@
     let fdmDeleted = 0;
     let fdmState = 'skipped';
     if (fdmAvailable()) {
-      const pg = await purgeFdmConfirmed({ tag: tag + '-fdm' });
+      const pg = await purgeFdmConfirmed({ tag: tag + '-fdm', scan });
       if (pg.ok) {
         fdmState = pg.pending ? `确认删除 ${pg.deleted}/${pg.pending}` : '无待删';
         if (pg.deleted > 0) {
@@ -2001,6 +2129,11 @@
       if (del.result === 'account-limited') return { ok: false, reason: 'account-limited', files: del };
       if (del.result === 'paused') return { ok: false, reason: 'paused', files: del };
       if (del.result === 'unverified') return { ok: false, reason: 'delete-unverified', files: del };
+      /* 勾选范围与计划不一致：一个文件都没点删除，绝不能继续走"删除后"的统计与清记录 */
+      if (del.result === 'selection-dirty' || del.result === 'selection-incomplete') {
+        warn(`⚠️ [${tag}] 删除未执行（${del.result}），本轮不删文件也不清记录`);
+        return { ok: false, reason: del.result, files: del };
+      }
 
       /* 删除后尽量重新拉一次列表：Quark 的删除不是乐观更新（行在服务端确认后才消失），
        * 所以刷新失败不等于数据不可信；只有"卡在 loading"才必须放弃 */
@@ -2012,7 +2145,12 @@
       else await waitListSettled({ tag: tag + '-after-refresh', maxWaitMs: 20000 });
 
       scan = await scanAllRowsWithScroll({ tag: tag + '-after', maxMs: opts.scanMs });
-      if (!scanTrust(scan)) warn(`⚠️ [${tag}] 删除后扫描不可信，本轮不清记录`);
+      if (!scanTrust(scan)) {
+        warn(`⚠️ [${tag}] 删除后扫描不可信：不判断删除结果、也不清记录`);
+        del.still = expired.map(e => e.name);
+        del.deleted = 0;
+        return { ok: false, reason: 'rescan-incomplete', files: del, expired: expired.length };
+      }
 
       del.still = expired.filter(e => scan.byFid.has(e.fid)).map(e => e.name);
       del.deleted = expired.length - del.still.length;
@@ -2266,6 +2404,10 @@
 
   async function markSelectedAsDownloaded() {
     if (!isListPage()) { alert('当前不是列表页'); return 0; }
+    if (GATE.state === 'cleanup') {
+      setStatus('等待清理完成...', 'running');
+      await until(() => GATE.state !== 'cleanup', 300);
+    }
     setStatus('扫描全量列表...', 'running');
     setProgress('扫描中...');
     /* 勾选状态在虚拟滚动下只对"已渲染行"可见：滚完整张表，才能把用户滚选过的
@@ -2305,6 +2447,10 @@
 
   async function clearDlRecordsFlow() {
     if (!isListPage()) { alert('当前不是列表页'); return; }
+    if (GATE.state === 'cleanup') {
+      setStatus('等待清理完成...', 'running');
+      await until(() => GATE.state !== 'cleanup', 300);
+    }
     setStatus('扫描全量列表...', 'running');
     setProgress('扫描中...');
     const snap = await collectFullList({
@@ -2410,6 +2556,8 @@
             'scan-incomplete': '全量扫描不完整',
             'rescan-incomplete': '删除后重扫不完整',
             'delete-unverified': '删除后卡在加载，无法复核',
+            'selection-dirty': '勾选未能清空（虚拟滚动残留），已中止删除',
+            'selection-incomplete': '只勾选到部分目标，已中止删除（避免删错范围）',
             'refresh-settle-timeout': '删除后刷新卡在加载',
             'refresh-timeout': '删除后列表未就绪',
             'refresh-no-table': '找不到文件表格',
@@ -2446,7 +2594,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.3.0',
+    version: '6.3.1',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -2480,16 +2628,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.0`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.1`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.0');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.1');
     } else {
-      log('平台层就绪（其他页）v6.3.0');
+      log('平台层就绪（其他页）v6.3.1');
     }
     startGrayPolling();
   })();

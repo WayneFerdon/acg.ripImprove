@@ -11,8 +11,8 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.2.3
-// @description  夸克网盘平台层：个人页清理（等列表就绪 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后自动下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
+// @version      6.3.0
+// @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
 // @updateURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -42,7 +42,6 @@
 
   /* 流程参数 */
   const LIST_WAIT_MS = 45000;      // 等列表就绪
-  const SCAN_MS = 25000;           // 全量滚动扫描
   const NOT_ACG_GRACE_MS = 5000;   // 非 acg 唤起时，留给桥接自报身份的时间
   const CLOSE_DELAY_MS = 5000;     // 下载触发后关页延时
 
@@ -521,9 +520,23 @@
       if (isFidDownloaded(f.fid, recs)) { f.row.classList.add('qap-grayed'); grayed++; }
       else f.row.classList.remove('qap-grayed');
     }
-    if (doc === document && files.length > 0) {
-      showProgress(grayed, files.length, _progressLabel);
-      if (uiRefs) uiRefs.progress.textContent = `${grayed} / ${files.length}`;
+    if (doc === document) {
+      /* 面板进度优先用"全量快照"（虚拟滚动下 DOM 只有十几行，按渲染行显示会严重偏少）；
+       * 还没做过全量扫描时，退回当前渲染行并在文案上标明，避免把局部数字当成总数。 */
+      const snap = _listSnapshot;
+      const snapOk = !!(snap && snap.complete && snap.scope === currentListScope());
+      let total = files.length;
+      let shown = grayed;
+      if (snapOk) {
+        total = snap.files.length;
+        let n = 0;
+        for (const f of snap.files) if (f.fid && isFidDownloaded(f.fid, recs)) n++;
+        shown = n;
+      }
+      if (total > 0) {
+        showProgress(shown, total, snapOk ? _progressLabel : `${_progressLabel}（已渲染）`);
+        if (uiRefs) uiRefs.progress.textContent = `${shown} / ${total}${snapOk ? '' : '（已渲染）'}`;
+      }
     }
     return { grayed, total: files.length };
   }
@@ -604,16 +617,29 @@
   }
 
 
-  async function collectApiLinks(timeout = 15000) {
-    const g = await untilOrGiveUp(() => {
+  /* 收集下载助手返回的直链。
+   * 关键：弹窗里的链接是**陆续渲染**的，旧实现见到第一个 .listener-link-api 就返回，
+   * 100+ 个文件会被截成只有前几个。这里等数量稳定（或达到期望数量）再取。 */
+  async function collectApiLinks(timeout = 15000, expectCount = 0) {
+    const t0 = Date.now();
+    let popup = null;
+    let lastCount = -1;
+    let stableSince = Date.now();
+    while (Date.now() - t0 < timeout) {
       const p = document.querySelector('.swal2-popup');
-      if (!p) return null;
-      if (p.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning')) return p;
-      if (p.querySelector('.listener-link-api')) return p;
-      return null;
-    }, 200, timeout);
-    if (!g.ok) return null;
-    const popup = g.result;
+      if (p) {
+        if (p.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning')) { popup = p; break; }
+        const n = p.querySelectorAll('.listener-link-api').length;
+        popup = p;
+        if (n > 0) {
+          if (n !== lastCount) { lastCount = n; stableSince = Date.now(); }
+          if (expectCount > 0 && n >= expectCount) break;
+          if (Date.now() - stableSince >= 1200) break;
+        }
+      }
+      await sleep(200, true);
+    }
+    if (!popup) return null;
     if (popup.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning')) return null;
     const links = [...popup.querySelectorAll('.listener-link-api')];
     return links.map(a => {
@@ -715,9 +741,24 @@
         result.reason = 'api-not-ready';
         return result;
       }
-      await until(() => scanFileRows().length > 0, 200, 5000);
-      const files = scanFileRows();
-      const fileByFid = new Map(files.filter(f => f.fid).map(f => [f.fid, f]));
+      /* 全量统计：个人页是虚拟滚动 + 分批加载（每批约 100 行），DOM 里永远只有十几行。
+       * 先滚完整张表再决定"下载哪些、共多少个"，否则超过单页上限的文件永远轮不到。 */
+      setStatus('统计全量列表中...', 'running');
+      setProgress('扫描中...');
+      const snap = await collectFullList({
+        tag: 'download',
+        force: true,
+        onProgress: (n) => setProgress(`扫描 ${n} 个...`),
+      });
+      if (!snap.complete) {
+        warn(`列表未加载完整（已采集 ${snap.count} 个），为避免漏下，本次不执行`);
+        setStatus('列表未加载完整', 'error');
+        setProgress('-');
+        result.reason = 'list-incomplete';
+        return result;
+      }
+      const files = snap.files;
+      const fileByFid = snap.byFid;
       const targetFidsSet = Array.isArray(targetFids) && targetFids.length ? new Set(targetFids) : null;
       const dlRecs = loadDlRecords();
       const pending = files.filter(f => {
@@ -726,7 +767,7 @@
         return !isFidDownloaded(f.fid, dlRecs);
       });
       result.pendingAtStart = pending.length;
-      log(`批量下载：共 ${files.length} 个文件，待下载 ${pending.length} 个`);
+      log(`批量下载：全量 ${files.length} 个文件，待下载 ${pending.length} 个`);
       if (!pending.length) {
         log('  无待下载文件');
         setStatus('无待下载', 'done');
@@ -738,14 +779,21 @@
       }
       setStatus('批量勾选中...', 'running');
       setProgress(`选中 0/${pending.length}`);
-      await clearRowSelection();
+      /* 勾选状态在虚拟滚动里由 React 保存，必须先把"全量已选"清掉，
+       * 再按列表顺序滚一遍逐行勾选（只向前滚，不逐条回顶）。 */
+      await clearRowSelectionAll();
       let selected = 0;
-      for (const f of pending) {
+      const order = pending.map(f => f.fid).filter(Boolean);
+      const walked = await forEachRowInOrder(order, async (row) => {
         await waitWhilePaused();
-        if (!f.row.isConnected) continue;
-        const done = await selectRow(f.row);
-        if (done) selected++;
-        setProgress(`选中 ${selected}/${pending.length}`);
+        const done = await selectRow(row);
+        if (done) {
+          selected++;
+          setProgress(`选中 ${selected}/${order.length}`);
+        }
+      });
+      if (walked.missed.length) {
+        warn(`  ${walked.missed.length} 个待下载文件在滚动遍历中未找到（列表可能刚刷新），已跳过`);
       }
       log(`已勾选 ${selected} 个文件`);
       if (!selected) {
@@ -757,7 +805,7 @@
       await waitWhilePaused();
       setStatus('获取链接中...', 'running');
       await triggerApiDownload();
-      const links = await collectApiLinks(15000);
+      const links = await collectApiLinks(Math.max(15000, Math.min(60000, order.length * 400)), order.length);
       result.totalLinks = links ? links.length : 0;
       if (!links || !links.length) {
         const err = document.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning');
@@ -771,6 +819,9 @@
         return result;
       }
       log(`★ 获取到 ${links.length} 个下载链接`);
+      if (links.length < selected) {
+        warn(`  ⚠️ 直链 ${links.length} 个 < 已勾选 ${selected} 个：下载助手只返回了部分（可能被截断），未返回的本次不会下载`);
+      }
       let done = 0;
       for (let i = 0; i < links.length; i++) {
         await waitWhilePaused();
@@ -834,14 +885,21 @@
     return w ? w.querySelector('.ant-table-body') : null;
   }
 
+  /* 整表 loading（刷新/切目录）才叫 loading。
+   * 注意：列表分批加载时，底部"加载更多"行常驻 .ant-spin-spinning，
+   * 它**不是**整表刷新。旧实现把它算成 loading，导致扫描每轮都 continue、
+   * 一步也不滚动，25s 预算用完后只拿到首批 100 行 —— 这就是超多文件列表的根因。 */
   function isLoadingAnimPresent() {
     const w = tableWrap();
     if (!w) return false;
-    return !!(
-      w.querySelector('.table-loading-wrap') ||
-      w.querySelector('.ant-spin-spinning') ||
-      w.querySelector('.ant-spin-container.ant-spin-blur')
-    );
+    if (w.querySelector('.table-loading-wrap')) return true;
+    if (w.querySelector('.ant-spin-container.ant-spin-blur')) return true;
+    for (const el of w.querySelectorAll('.ant-spin-spinning')) {
+      /* 行内 spinner（加载更多、上传进度等）不代表整表在刷新 */
+      if (el.closest('tr')) continue;
+      return true;
+    }
+    return false;
   }
 
   function isEmptyUiVisible() {
@@ -991,25 +1049,39 @@
     } catch { return false; }
   }
 
-  /* 步骤 1.5：滚动全量收集（列表分批加载 + 虚拟滚动，必须滚到底并等每一批加载完）
-   * 返回 { byFid(文件) / allKeys(所有数据行，含文件夹) / reachedBottom / timedOut }
-   * 注意：**不拿条数当完整性判据**——vt 高度推算会因行高不一/文件夹行/分批加载而失真，
-   * 记录清理改为"逐条滚动复核"（见 clearRecordsMissingFromList） */
+  /* 步骤 1.5：全量滚动采集（列表分批加载 + 虚拟滚动）
+   * 目标：**不靠时间预算**，把当前目录的数据行全部收齐（个人页单页只渲染十几行，
+   * 且每批只加载 100 行，必须滚到底、等每一批到达）。
+   *
+   * 结束判据（全部是 UI 证据，不看耗时）：
+   *   1) 渲染出底部灰框（tr.drag-bottom）且没有"加载更多"行，行集合/滚动高度连续 3 轮不变；
+   *   2) 几何到底 + 无"加载更多"行，行集合/滚动高度连续 3 轮不变（分享页兜底）；
+   *   3) "加载更多"行还在但 spinner 已停、连续多轮没有新行 → 加载停滞，结束并标记 complete=false。
+   *
+   * 返回 files：按列表顺序排列的全量文件（含最后一次读到的 checked 状态），
+   * 后续勾选/标记/清除都基于它，不再用"当前渲染的十几行"。
+   */
   async function scanAllRowsWithScroll(opts = {}) {
     const tag = opts.tag || 'scan';
-    /* acg 唤起时个人页是后台标签页，setTimeout 被节流到 ~1s，超时与步进都要放大 */
+    /* 后台标签页渲染仍会被节流，步进等待略放大（用 Worker 定时器，不受 setTimeout 节流） */
     const isHidden = !!document.hidden;
-    const maxMsBase = Number(opts.maxMs) > 0 ? Number(opts.maxMs) : SCAN_MS;
-    const maxMs = isHidden ? Math.round(maxMsBase * 2.5) : maxMsBase;
-    const sleepStep = isHidden ? 300 : 150;
-    if (isHidden) log(`★ [${tag}] 后台标签页：扫描步进放大（maxMs=${maxMs}，sleep=${sleepStep}）`);
+    const sleepStep = isHidden ? 240 : 90;
+    const stallLimit = Number(opts.stallRounds) > 0 ? Number(opts.stallRounds) : 20;
+    const report = typeof opts.onProgress === 'function' ? opts.onProgress : null;
 
     const byFid = new Map();
     const allKeys = new Set();          /* 所有已见数据行的 key（含文件夹/无名字行） */
+    const files = [];                   /* 全量文件，按首次出现顺序 */
     const addAll = () => {
       for (const f of scanFileRows()) {
         const k = f.fid || f.name;
-        if (k && !byFid.has(k)) byFid.set(k, f);
+        if (!k) continue;
+        if (!byFid.has(k)) { byFid.set(k, f); files.push(f); }
+        else {
+          const prev = byFid.get(k);
+          if (f.checked) prev.checked = true;      /* 勾选状态一旦读到 true 就保留 */
+          if (f.row && f.row.isConnected) prev.row = f.row;
+        }
       }
       try {
         for (const tr of document.querySelectorAll('tr.ant-table-row[data-row-key]')) {
@@ -1024,81 +1096,167 @@
     if (!body) {
       addAll();
       const empty = isEmptyUiVisible();
-      const complete = byFid.size > 0 || empty;
-      return { ok: true, byFid, allKeys, count: byFid.size, allCount: allKeys.size, total, empty, complete, reachedBottom: complete, timedOut: false };
+      const complete = files.length > 0 || empty;
+      return { ok: true, byFid, allKeys, files, count: files.length, allCount: allKeys.size, total, empty, complete, reachedBottom: complete, timedOut: false, stalled: false };
     }
 
     try { body.scrollTop = 0; } catch {}
-    await sleep(120, true);
+    await sleep(100, true);
+    addAll();
 
-    const step = Math.max(120, Math.floor((body.clientHeight || 400) * 0.75));
-    let last = -1;
-    let lastScrollH = body.scrollHeight;
+    const step = Math.max(160, Math.floor((body.clientHeight || 400) * 0.8));
+    /* 后台标签页的渲染可能被节流到 ~1s/帧，末尾稳定判定要等更久，避免漏掉最后几行 */
+    const bottomStable = isHidden ? 12 : 4;
+    let lastSig = '';
     let stable = 0;
     let reachedBottom = false;
-    let geomBottom = false;   /* 几何到底（分享页没有拖拽灰框，只能靠它兜底） */
-    let timedOut = false;
-    const t0 = Date.now();
+    let stalled = false;
+    let lastReport = -1;
+    let noMove = 0;          /* 滚动位置推不动、且没有新行：虚拟容器异常/已无更多内容 */
 
-    while (Date.now() - t0 < maxMs) {
-      if (isLoadingAnimPresent()) { await sleep(200, true); continue; }
+    for (;;) {
+      /* 整表 loading（刷新/切目录）：行不可信，等它结束；加载更多不算 */
+      if (isLoadingAnimPresent()) { stable = 0; await sleep(160, true); continue; }
+
       addAll();
+      if (report && files.length !== lastReport) { lastReport = files.length; try { report(files.length, allKeys.size); } catch {} }
 
-      /* 判据一（首选，直接看 UI）：底部"拖拽/粘贴"灰框已渲染且没有更多批次 → 已到最后一行 */
-      if (isListAtBottom()) {
-        reachedBottom = true;
-        /* 灰框出现即代表渲染窗口已覆盖末尾；再确认数据行不再增长即可收工 */
-        if (allKeys.size === last) { if (++stable >= 2) break; }
-        else stable = 0;
-        last = allKeys.size;
-        lastScrollH = body.scrollHeight;
-        await sleep(sleepStep, true);
+      const more = hasMoreRow();
+      const scrollH = body.scrollHeight;
+      const maxTop = Math.max(0, scrollH - body.clientHeight);
+      const atBottom = body.scrollTop >= maxTop - 2;
+      const uiBottom = hasBottomDropRow() && !more;
+
+      const sig = `${allKeys.size}|${Math.round(scrollH)}`;
+      const grew = sig !== lastSig;
+      lastSig = sig;
+
+      if (uiBottom || (atBottom && !more)) {
+        /* 已到末尾：虚拟滚动可能还要补渲染最后几行，等集合稳定 */
+        if (!grew) stable++; else stable = 0;
+        if (stable >= bottomStable) { reachedBottom = true; break; }
+        await sleep(120, true);
         continue;
       }
 
-      const scrollH = body.scrollHeight;
-      const atBottom = body.scrollTop + body.clientHeight >= scrollH - 2;
-      geomBottom = atBottom;   /* 只反映这一轮：后面若又加载出更多行会被覆盖回 false */
       if (atBottom) {
-        if (hasMoreRow() || hasLoadingMore()) {
-          /* 到底了但还有下一批：等它加载完（有没有 more 行就是判据，不看时间） */
-          await until(() => !hasMoreRow() && !hasLoadingMore(), 150, 8000);
-          stable = 0;
-          await sleep(120, true);
-          continue;
+        /* 到底但还有下一批：spinner 在转就无限等；spinner 停了且长期无新行 = 加载停滞 */
+        if (hasLoadingMore()) stable = 0;
+        else {
+          if (!grew) stable++; else stable = 0;
+          if (stable >= stallLimit) { stalled = true; break; }
         }
-        /* 几何到底但灰框还没渲染（过渡帧/行高极端）：保持旧稳定判定兜底 */
-        if (allKeys.size === last && scrollH === lastScrollH) {
-          if (++stable >= 3) { reachedBottom = true; break; }
-        } else stable = 0;
-      } else stable = 0;
-      last = allKeys.size;
-      lastScrollH = scrollH;
-      if (!atBottom) {
-        try { body.scrollTop = Math.min(scrollH, body.scrollTop + step); } catch {}
+        await sleep(180, true);
+        continue;
       }
+
+      stable = 0;
+      const beforeTop = body.scrollTop;
+      try { body.scrollTop = Math.min(maxTop, beforeTop + step); } catch {}
+      /* 滚动无位移且没有新行：容器不接受滚动/已没有更多内容，避免无限重试 */
+      if (!grew && body.scrollTop <= beforeTop) {
+        if (++noMove >= stallLimit) { stalled = true; break; }
+      } else noMove = 0;
       await sleep(sleepStep, true);
     }
-    /* timedOut 只表示"循环用完了时间预算"，**不再作为列表是否加载完的判据** */
-    timedOut = (Date.now() - t0) >= maxMs;
 
     addAll();
     try { body.scrollTop = 0; } catch {}
-    await sleep(120, true);
+    await sleep(80, true);
 
     const empty = isEmptyUiVisible();
-    /* 完整性只看 UI 证据：渲染出底部灰框（个人页硬证据）或"几何到底且无更多批次"（分享页/兜底），
-     * 与耗时/超时无关 */
-    const uiBottom = isListAtBottom();
-    reachedBottom = uiBottom || reachedBottom || (geomBottom && !hasMoreRow());
-    const complete = reachedBottom || empty;
-    log(`★ [${tag}] 全量扫描：文件 ${byFid.size} / 数据行 ${allKeys.size} / 推断 ${total == null ? '?' : total}` +
-        `${empty ? '（空目录）' : ''} → 底部灰框=${hasBottomDropRow()} 更多批次=${hasMoreRow()} 几何到底=${geomBottom} ` +
-        `到底=${reachedBottom}${timedOut ? '（循环用满预算）' : ''} → ${complete ? '可用' : '未确认'}`);
+    reachedBottom = reachedBottom || isListAtBottom();
+    const complete = (reachedBottom || empty) && !stalled;
+    log(`★ [${tag}] 全量扫描：文件 ${files.length} / 数据行 ${allKeys.size} / 推断 ${total == null ? '?' : total}` +
+        `${empty ? '（空目录）' : ''} → 底部灰框=${hasBottomDropRow()} 更多批次=${hasMoreRow()} ` +
+        `到底=${reachedBottom}${stalled ? '（加载停滞）' : ''} → ${complete ? '可用' : '未确认'}`);
     if (total != null && allKeys.size < total) {
-      warn(`  ⚠️ 数据行 ${allKeys.size} < 推断 ${total}：列表可能仍有未渲染的行（清理会逐条复核，不会误清）`);
+      warn(`  ⚠️ 数据行 ${allKeys.size} < 推断 ${total}：推断按平均行高估算，仅作参考（以是否滚到底为准）`);
     }
-    return { ok: true, byFid, allKeys, count: byFid.size, allCount: allKeys.size, total, empty, complete, reachedBottom, timedOut };
+    return { ok: true, byFid, allKeys, files, count: files.length, allCount: allKeys.size, total, empty, complete, reachedBottom, timedOut: false, stalled };
+  }
+
+  /* 全量快照：同一目录、刚扫过且完整时复用，避免一次操作里反复滚整表 */
+  let _listSnapshot = null;
+  function invalidateListSnapshot() { _listSnapshot = null; }
+
+  async function collectFullList(opts = {}) {
+    const scope = currentListScope();
+    const reuseMs = opts.force ? 0 : 1500;
+    if (_listSnapshot && _listSnapshot.complete && _listSnapshot.scope === scope &&
+        Date.now() - _listSnapshot.at <= reuseMs) return _listSnapshot;
+    const scan = await scanAllRowsWithScroll({ tag: opts.tag || 'full', onProgress: opts.onProgress });
+    const snap = { ...scan, scope, at: Date.now() };
+    if (scan.complete) _listSnapshot = snap;
+    return snap;
+  }
+
+  /* 按列表顺序滚动遍历目标 fid：只向前滚，避免每行都从顶部重新找
+   * （虚拟滚动 + 100+ 行时，逐条 scrollRowIntoView 会慢十几倍） */
+  async function forEachRowInOrder(keys, handler, opts = {}) {
+    const list = (Array.isArray(keys) ? keys : []).filter(Boolean);
+    const out = { done: 0, missed: [] };
+    if (!list.length) return out;
+    const body = tableBody();
+    if (!body) { out.missed = list.slice(); return out; }
+
+    const isHidden = !!document.hidden;
+    const step = Math.max(160, Math.floor((body.clientHeight || 400) * 0.8));
+    const sleepStep = isHidden ? 220 : 90;
+    /* 上限只防「永远推不动」，按目标数放大（1000 个文件约需 1100 轮） */
+    const maxLoops = Number(opts.maxLoops) > 0 ? Number(opts.maxLoops) : Math.min(20000, Math.max(600, list.length * 4 + 400));
+
+    try { body.scrollTop = 0; } catch {}
+    await sleep(120, true);
+
+    let idx = 0;
+    let loops = 0;
+    while (idx < list.length && loops++ < maxLoops) {
+      /* 先把当前渲染窗口内、顺序连续的目标一次处理完，再滚动一屏：
+       * 逐条滚动会让 100+ 行慢一个数量级 */
+      let progressed = false;
+      while (idx < list.length) {
+        const row = findRowByFid(list[idx]);
+        if (!row) break;
+        try { await handler(row, list[idx], idx); } catch (e) { warn(`  行处理异常 ${String(list[idx]).slice(0, 8)}: ${e.message}`); }
+        out.done++;
+        idx++;
+        progressed = true;
+        if (loops++ > maxLoops) break;
+      }
+      if (idx >= list.length) break;
+      if (progressed) continue;
+
+      const before = body.scrollTop;
+      const maxTop = Math.max(0, body.scrollHeight - body.clientHeight);
+      if (before >= maxTop - 2) {
+        /* 到底还没渲染出目标：下一批可能正在加载，等它；确实没有就记为缺失 */
+        if (hasMoreRow() || hasLoadingMore()) { await sleep(220, true); continue; }
+        out.missed.push(list[idx]);
+        idx++;
+        continue;
+      }
+      try { body.scrollTop = Math.min(maxTop, before + step); } catch {}
+      await sleep(sleepStep, true);
+    }
+    return out;
+  }
+
+  /* 清空全量勾选：虚拟滚动卸载掉的行不在 DOM 里，逐行清不到，
+   * 用表头全选开关（全选 → 取消）让 React 一次性清空 selectedRowKeys */
+  async function clearRowSelectionAll() {
+    await clearRowSelection();
+    const head = document.querySelector('.ant-table-thead input.ant-checkbox-input');
+    const wrap = head && head.closest('label.ant-checkbox-wrapper');
+    if (!head || !wrap) return;
+    if (!head.checked && !head.indeterminate) return;
+    realClick(wrap);
+    await sleep(150, true);
+    realClick(wrap);
+    await until(() => {
+      const h = document.querySelector('.ant-table-thead input.ant-checkbox-input');
+      return h && !h.checked && !h.indeterminate;
+    }, 60, 3000);
   }
 
   function findRowByFid(fid) {
@@ -1219,6 +1377,7 @@
       if (appeared) {
         const gone = await until(() => !isLoadingAnimPresent(), 150, settleMs);
         if (!gone) return { ok: false, reason: 'settle-timeout' };
+        invalidateListSnapshot();   /* 列表内容已刷新，旧全量快照作废 */
         const settled = await waitListSettled({ tag, maxWaitMs: 20000 });
         return settled.ok ? { ok: true } : { ok: false, reason: settled.reason };
       }
@@ -1313,6 +1472,7 @@
     }
 
     log(`★ [${tag}] 删除汇总：请求 ${out.requested}，勾选 ${out.picked}，剩余 ${out.still.length}（${out.result}）`);
+    invalidateListSnapshot();   /* 文件集已变，旧全量快照作废 */
     return out;
   }
 
@@ -1889,6 +2049,8 @@
     } else {
       cleared = await clearRecordsMissingFromList(scan.byFid, scope);
     }
+    /* 本轮最后一次 scan 就是"删除后的真实全量"，直接作为进度统计快照 */
+    if (scanTrust(scan)) _listSnapshot = { ...scan, scope, at: Date.now() };
     const ms = Date.now() - t0;
     log(`★ [${tag}] 清理完成：FDM 确认 ${fdmDeleted}（${fdmState}），过期文件 ${expired.length}（删掉 ${del.deleted}）` +
         `，清记录 ${cleared.removed.length}（保留 ${cleared.kept}，待复核 ${cleared.unverified}）` +
@@ -2034,7 +2196,7 @@
           GATE.readyAt = Date.now();
           gateSet('ready', `删文件 ${cleanup.deleted} / 清记录 ${cleanup.records}`);
           setStatus('清理完成，等待下一步', 'running');
-          setProgress(`列表 ${cleanup.rows} 行`);
+          setProgress(`列表 ${cleanup.rows} 个文件 / ${cleanup.allRows} 行`);
         }
 
         /* ---- 5. 一直 await until：不是 acg 唤起的 / 挂起结束 ---- */
@@ -2104,12 +2266,28 @@
     }
   }
 
-  function markSelectedAsDownloaded() {
+  async function markSelectedAsDownloaded() {
     if (!isListPage()) { alert('当前不是列表页'); return 0; }
-    const files = scanFileRows();
-    const picked = files.filter(f => f.checked && f.fid);
+    setStatus('扫描全量列表...', 'running');
+    setProgress('扫描中...');
+    /* 勾选状态在虚拟滚动下只对"已渲染行"可见：滚完整张表，才能把用户滚选过的
+     * 100+ 个文件全部读出来（React 在行重新挂载时会恢复 selected 类）。 */
+    const snap = await collectFullList({
+      tag: 'mark',
+      force: true,
+      onProgress: (n) => setProgress(`扫描 ${n} 个...`),
+    });
+    if (!snap.complete) {
+      setStatus('列表未加载完整', 'error');
+      setProgress('-');
+      alert(`列表未加载完整（已采集 ${snap.count} 个），为避免漏标，本次不执行。\n请等列表加载完再试。`);
+      return 0;
+    }
+    const picked = snap.files.filter(f => f.checked && f.fid);
     if (!picked.length) {
-      alert('未勾选任何文件（或勾选的文件无有效 fid）');
+      setStatus('待机（个人页）');
+      setProgress('-');
+      alert(`未勾选任何文件（已扫描全量 ${snap.count} 个）`);
       return 0;
     }
     for (const f of picked) {
@@ -2119,49 +2297,76 @@
         { keepTs: true }
       );
     }
-    log(`★ 标记选中为已下载：${picked.length} 个`);
+    log(`★ 标记选中为已下载：${picked.length} 个（全量 ${snap.count} 个中）`);
     refreshGray();
+    setStatus('待机（个人页）');
+    setProgress('-');
     alert(`已标记 ${picked.length} 个文件为已下载`);
     return picked.length;
   }
 
-  function clearDlRecordsFlow() {
+  async function clearDlRecordsFlow() {
     if (!isListPage()) { alert('当前不是列表页'); return; }
-    const files = scanFileRows();
+    setStatus('扫描全量列表...', 'running');
+    setProgress('扫描中...');
+    const snap = await collectFullList({
+      tag: 'clear',
+      force: true,
+      onProgress: (n) => setProgress(`扫描 ${n} 个...`),
+    });
+    if (!snap.complete) {
+      setStatus('列表未加载完整', 'error');
+      setProgress('-');
+      alert(`列表未加载完整（已采集 ${snap.count} 个），无法确定"本页全部文件"，本次不执行。\n请等列表加载完再试。`);
+      return;
+    }
+    const files = snap.files;
     const dl = loadDlRecords();
     const checked = files.filter(f => f.checked && f.fid);
     if (checked.length) {
       const hitIds = checked.filter(f => dl[f.fid]).map(f => f.fid);
-      if (!hitIds.length) { alert(`勾选 ${checked.length} 个文件，但均无下载记录`); return; }
-      if (!confirm(`清除勾选的 ${hitIds.length} 条下载记录？`)) return;
+      if (!hitIds.length) {
+        setStatus('待机（个人页）'); setProgress('-');
+        alert(`勾选 ${checked.length} 个文件，但均无下载记录`);
+        return;
+      }
+      if (!confirm(`清除勾选的 ${hitIds.length} 条下载记录？`)) { setStatus('待机（个人页）'); setProgress('-'); return; }
       clearDlRecordsFids(hitIds);
       alert(`已清除 ${hitIds.length} 条（勾选）`);
       refreshGray();
+      setStatus('待机（个人页）');
+      setProgress('-');
       return;
     }
     if (!files.length) {
       const n = Object.keys(dl).length;
-      if (!n) { alert('无下载记录可清除'); return; }
-      if (!confirm(`当前页面无文件，清除全部 ${n} 条下载记录？`)) return;
+      if (!n) { setStatus('待机（个人页）'); setProgress('-'); alert('无下载记录可清除'); return; }
+      if (!confirm(`当前页面无文件，清除全部 ${n} 条下载记录？`)) { setStatus('待机（个人页）'); setProgress('-'); return; }
       clearAllDlRecords();
       alert(`已清全部 ${n} 条`);
       refreshGray();
+      setStatus('待机（个人页）');
+      setProgress('-');
       return;
     }
     const ids = files.map(f => f.fid).filter(Boolean);
     const hit = ids.filter(id => dl[id]).length;
-    if (!hit) { alert('本页无下载记录'); return; }
-    if (!confirm(`未勾选文件，清除本页 ${hit} 条下载记录？`)) return;
+    if (!hit) { setStatus('待机（个人页）'); setProgress('-'); alert('本页无下载记录'); return; }
+    if (!confirm(`未勾选文件，清除本页 ${hit} 条下载记录（全量 ${ids.length} 个文件）？`)) {
+      setStatus('待机（个人页）'); setProgress('-'); return;
+    }
     clearDlRecordsFids(ids);
     alert(`已清除 ${hit} 条（本页）`);
     refreshGray();
+    setStatus('待机（个人页）');
+    setProgress('-');
   }
 
   function installListPageActions() {
     addBuiltinAction({
       label: '⬇️ 下载',
       color: '#52c41a',
-      title: '批量下载本页未下载过的文件',
+      title: '滚动统计全量文件后，批量下载未下载过的文件',
       onclick: () => autoDownloadWorkflow(),
     });
     addBuiltinAction({
@@ -2178,7 +2383,7 @@
     addBuiltinAction({
       label: '✅ 标记已下载',
       color: '#1677ff',
-      title: '把当前勾选的文件标记为已下载',
+      title: '滚动统计全量列表后，把勾选的文件标记为已下载',
       onclick: () => markSelectedAsDownloaded(),
     });
     addBuiltinAction({
@@ -2194,7 +2399,7 @@
                 + (r.still && r.still.length ? `\n删除后仍在：${r.still.join('、')}` : '')
                 + `\n清理记录：${r.records}`
                 + (r.recordNames && r.recordNames.length ? `\n${r.recordNames.slice(0, 10).join('、')}` : '')
-                + `\n列表：${r.rows} 行`);
+                + `\n列表：${r.rows} 个文件 / ${r.allRows} 个数据行`);
         } else {
           const reasonMap = {
             'busy': '已有清理在执行',
@@ -2220,7 +2425,7 @@
     addBuiltinAction({
       label: '🗑️ 清除下载记录',
       color: '#8c2f1f',
-      title: '清除本页/全部下载记录（只删记录，不删文件）',
+      title: '滚动统计全量列表后，清除本页/全部下载记录（只删记录，不删文件）',
       onclick: () => clearDlRecordsFlow(),
     });
   }
@@ -2243,7 +2448,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.2.0',
+    version: '6.3.0',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -2277,16 +2482,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.2.3`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.0`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.2.3');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.0');
     } else {
-      log('平台层就绪（其他页）v6.2.3');
+      log('平台层就绪（其他页）v6.3.0');
     }
     startGrayPolling();
   })();

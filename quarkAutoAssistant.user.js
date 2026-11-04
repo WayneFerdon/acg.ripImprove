@@ -1,13 +1,3 @@
-/*
- * @Author: WayneFerdon wayneferdon@hotmail.com
- * @Date: 2026-10-30 00:20:19
- * @LastEditors: WayneFerdon wayneferdon@hotmail.com
- * @LastEditTime: 2026-10-30 00:27:09
- * @FilePath: \acg.ripImprove\quarkAutoAssistant.user.js
- * ----------------------------------------------------------------
- * Licensed to the .NET Foundation under one or more agreements.
- * The .NET Foundation licenses this file to you under the MIT license.
- */
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.3.2
+// @version      6.3.3
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -687,6 +687,39 @@
     return isChecked();
   }
 
+  /* 等 FDM 确认"上一个链接已入队"：命中即返回，最多等 maxMs（默认 5s 兜底）。
+   * FDM 刚入队时 title 还是空，主要靠完整 URL / URL path 匹配（见 Python 桥 /queued）。 */
+  async function waitFdmQueued(link, maxMs = THROTTLE) {
+    const t0 = Date.now();
+    const waitMs = Number(maxMs) > 0 ? Number(maxMs) : THROTTLE;
+    if (!fdmAvailable()) {
+      await sleep(waitMs, true);
+      return { ok: false, reason: 'no-api', waitedMs: Date.now() - t0 };
+    }
+    const el = link && link.el;
+    const urls = [];
+    const add = (u) => { if (u && !urls.includes(u)) urls.push(String(u)); };
+    add(link && link.link);
+    try { add(el && el.dataset && el.dataset.link); } catch {}
+    try { add(el && el.getAttribute && el.getAttribute('href')); } catch {}
+
+    const payload = { urls, name: (link && link.filename) || '', windowSec: 180 };
+    let reason = 'timeout';
+    for (;;) {
+      try {
+        const r = await fdmRequest('/queued', { method: 'POST', data: payload, timeout: 1200 });
+        if (r && r.ok && r.queued) {
+          return { ok: true, match: r.match || '', taskId: r.taskId, waitedMs: Date.now() - t0 };
+        }
+        if (r && r.ok === false) reason = r.error || 'bridge-error';
+      } catch (e) {
+        reason = (e && e.message) || 'unreachable';
+      }
+      if (Date.now() - t0 >= waitMs) return { ok: false, reason, waitedMs: Date.now() - t0 };
+      await sleep(200, true);
+    }
+  }
+
   async function autoDownloadWorkflow(opts = {}) {
     const { throttle = THROTTLE, waitForBusy = false, targetFids = null, ignoreBusy = false } = opts;
     const result = {
@@ -849,7 +882,16 @@
           done++;
           refreshGray();
         } catch (e) { warn(`  下载失败 ${l.filename}: ${e.message}`); }
-        if (i < links.length - 1) await sleep(throttle, true);
+        if (i < links.length - 1) {
+          /* 默认 5s 兜底；FDM 桥确认已入队就提前下一个 */
+          setStatus('等待 FDM 入队...', 'running');
+          const q = await waitFdmQueued(l, throttle);
+          if (q.ok) {
+            log(`  [${i + 1}/${links.length}] FDM 已入队（${q.waitedMs}ms，${q.match || '-'}）`);
+          } else {
+            warn(`  [${i + 1}/${links.length}] FDM 入队未确认（${q.reason}，${q.waitedMs}ms），按 ${throttle}ms 兜底继续`);
+          }
+        }
       }
       const cb = document.querySelector('.swal2-close');
       if (cb && isVisible(cb)) realClick(cb);
@@ -2688,7 +2730,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.3.2',
+    version: '6.3.3',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -2722,16 +2764,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.2`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.3`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.2');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.3');
     } else {
-      log('平台层就绪（其他页）v6.3.2');
+      log('平台层就绪（其他页）v6.3.3');
     }
     startGrayPolling();
   })();

@@ -116,8 +116,8 @@ def _norm_queued_path(u):
 _RETRYABLE_CATEGORY = 'httperror'
 # 描述里出现这些，基本可确认是"链接失效/签名过期"
 _LINK_EXPIRED_HINTS = (
-    '403', '404', '410', '401', 'forbidden', 'unauthorized',
-    'expired', 'invalid', 'signature', 'token',
+    '403', '404', '410', '401', '412', 'forbidden', 'unauthorized',
+    'precondition failed', 'expired', 'invalid', 'signature', 'token',
     '链接失效', '链接已过期', '签名', '过期',
 )
 # 描述里是网络/连接问题，而不是链接本身失效 → 不重取

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.3.6
+// @version      6.3.7
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -356,7 +356,7 @@
     return '';
   }
 
-  /* 文件夹行：显式标记 / class / 图标 / 无扩展名且没有文件大小 */
+  /* 文件夹行：显式标记 / class / 图标 / 大小列「N项」/ 无扩展名且没有文件大小 */
   function isFolderRow(row) {
     try {
       if (row.getAttribute('data-row-type') === 'folder' || row.getAttribute('data-is-folder') === '1') return true;
@@ -369,16 +369,21 @@
       const iconSig = getFileIconSig(row);
       if (/folder|[-_/]dir\b|wenjianjia/i.test(iconSig)) return true;
 
-      /* 兜底：文件夹没有扩展名，且大小列为空或 "-"。
-       * 夸克文件夹行不会显示文件大小，这是最稳的通用判据。 */
       const nameEl = row.querySelector('.filename-text, [class*="filename-text"], .file-name, [class*="file-name"]');
       const nm = String(
         (nameEl && (nameEl.getAttribute('title') || nameEl.textContent)) ||
         (row.querySelector('input.input-edit, .filename input.ant-input') || {}).value || ''
       ).trim();
+      const tds = row.querySelectorAll('td');
+      const size = tds.length >= 3 ? String(tds[2].textContent || '').trim() : '';
+
+      /* 分享页文件夹的大小列显示「N项」（如 5项 / 12 项），文件显示 1.2M / 800KB。
+       * 这个判据与文件名无关，最可靠——先看它。 */
+      if (/^\d+\s*(项|个)/.test(size)) return true;
+
+      /* 兜底：文件夹没有扩展名，且大小列为空或 "-"（个人页的文件夹就是这样）。
+       * 夸克文件夹行不显示文件大小，这是最稳的通用判据。 */
       if (nm && !/\.[A-Za-z0-9]{1,8}$/.test(nm)) {
-        const tds = row.querySelectorAll('td');
-        const size = tds.length >= 3 ? String(tds[2].textContent || '').trim() : '';
         if (!size || /^[-—]+$/.test(size)) return true;
       }
     } catch {}
@@ -2886,7 +2891,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.3.6',
+    version: '6.3.7',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -2920,16 +2925,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.6`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.7`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.6');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.7');
     } else {
-      log('平台层就绪（其他页）v6.3.6');
+      log('平台层就绪（其他页）v6.3.7');
     }
     startGrayPolling();
   })();

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.3.7
+// @version      6.3.8
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -1094,18 +1094,35 @@
     return false;
   }
 
+  /* 空目录 UI 判据。Quark 当前目录没有内容时渲染：
+   *   .ant-table.ant-table-empty
+   *   thead > tr.tr-header.hide（表头也藏掉）
+   *   .ant-table-placeholder > .table-empty-wrap[style="opacity: 1"]
+   *     └ .list-all-empty「拖拽/粘贴 到灰框内处上传文件」
+   * 此时表体 0 行、高度 0，**底部永远不会渲染 tr.drag-bottom**，
+   * 所以空目录只能靠这条判据收工（否则会被当成"到底但没有灰框 = 加载停滞"）。
+   *
+   * 三个条件缺一不可：
+   *   1) 不在整表 loading（切目录时会先闪 loading，那一拍行数也是 0）
+   *   2) 空列表容器可见（opacity 由 0 动画到 1，>0.01 才算真的显示）
+   *   3) 表格里一个数据行都没有（挡住"动画过渡帧/旧 DOM 残留"的假空） */
   function isEmptyUiVisible() {
     if (isLoadingAnimPresent()) return false;
-    const w = tableWrap() || document;
-    const wrap = w.querySelector('.table-empty-wrap') || document.querySelector('.table-empty-wrap');
+    const scope = tableWrap() || document;
+    const wrap = scope.querySelector('.table-empty-wrap') || document.querySelector('.table-empty-wrap');
     if (!wrap) return false;
     let op = '';
     try { op = getComputedStyle(wrap).opacity; } catch {}
     if (op === '' || op == null) op = (wrap.style && wrap.style.opacity) || '';
     if (op === '') return false;
     const n = Number(op);
-    if (!Number.isFinite(n)) return false;
-    return n > 0.01;
+    if (!Number.isFinite(n) || n <= 0.01) return false;
+    /* 有数据行就不是空目录：切目录时占位层会先显示、旧行还没卸载 */
+    try {
+      if (scope.querySelector('tr.ant-table-row')) return false;
+      if (document.querySelectorAll('tr.ant-table-row').length) return false;
+    } catch {}
+    return true;
   }
 
   function getVirtualScrollInfo(body = null) {
@@ -1316,13 +1333,25 @@
     let lastReport = -1;
     let lastDiag = Date.now();
     let noMove = 0;          /* 滚动位置推不动、且没有新行：虚拟容器异常/已无更多内容 */
+    let emptyStable = 0;     /* 空目录占位连续确认次数 */
+    let emptyConfirmed = false;
 
     for (;;) {
       /* 整表 loading（刷新/切目录）：行不可信，等它结束；加载更多不算 */
-      if (isLoadingAnimPresent()) { stable = 0; await sleep(160, true); continue; }
+      if (isLoadingAnimPresent()) { stable = 0; emptyStable = 0; await sleep(160, true); continue; }
 
       addAll();
       if (report && files.length !== lastReport) { lastReport = files.length; try { report(files.length, allKeys.size); } catch {} }
+
+      /* 空目录：`ant-table-empty` + `.table-empty-wrap`（拖拽/粘贴到灰框内上传），
+       * 表体高度 0 且底部**永远不会**渲染 tr.drag-bottom。
+       * 不在这里直接收工，就会掉进下面"到底但没灰框"的分支，被误判成加载停滞。 */
+      if (!allKeys.size && isEmptyUiVisible()) {
+        if (++emptyStable >= 2) { emptyConfirmed = true; reachedBottom = true; break; }
+        await sleep(150, true);
+        continue;
+      }
+      emptyStable = 0;
 
       const more = hasMoreRow();
       const scrollH = body.scrollHeight;
@@ -1390,11 +1419,12 @@
     try { body.scrollTop = originTop; } catch {}
     await sleep(80, true);
 
-    const empty = isEmptyUiVisible();
+    const empty = emptyConfirmed || (isEmptyUiVisible() && allKeys.size === 0);
+    if (empty) reachedBottom = true;   /* 空目录本身就是"到底" */
     reachedBottom = reachedBottom || isListAtBottom();
     /* 推断值只用于诊断：行高不均会让它偏高/偏低，绝不能拿它当完成判据
      * （之前就因为"推断 55 < 实际 109"误判过） */
-    const complete = (reachedBottom || empty) && !stalled;
+    const complete = empty || (reachedBottom && !stalled);
     log(`★ [${tag}] 全量扫描：文件 ${files.length} / 数据行 ${allKeys.size} / 推断 ${total == null ? '?' : total}` +
         `${empty ? '（空目录）' : ''} → 底部灰框=${hasBottomDropRow()} 更多批次=${hasMoreRow()} ` +
         `到底=${reachedBottom}${stalled ? '（加载停滞）' : ''} → ${complete ? '可用' : '未确认'}`);
@@ -2891,7 +2921,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.3.7',
+    version: '6.3.8',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -2925,16 +2955,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.7`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.8`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.7');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.8');
     } else {
-      log('平台层就绪（其他页）v6.3.7');
+      log('平台层就绪（其他页）v6.3.8');
     }
     startGrayPolling();
   })();

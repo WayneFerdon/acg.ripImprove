@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.3.3
+// @version      6.3.4
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -687,8 +687,44 @@
     return isChecked();
   }
 
+  /* 直链在 FDM 侧的查询参数：三个候选 URL 覆盖 fixed/原始/+ 与 %20 差异 */
+  function fdmLinkPayload(link) {
+    const el = link && link.el;
+    const urls = [];
+    const add = (u) => { if (u && !urls.includes(u)) urls.push(String(u)); };
+    add(link && link.link);
+    try { add(el && el.dataset && el.dataset.link); } catch {}
+    try { add(el && el.getAttribute && el.getAttribute('href')); } catch {}
+    return { urls, name: (link && link.filename) || '', windowSec: 180 };
+  }
+
+  /* 查询 FDM 里该直链的任务状态：
+   *   exists=false                 没有任务
+   *   exists=true, state=error     已有任务处于 HttpError/GenericError 等异常
+   *   exists=true, state=active/done/stopped  正常任务
+   */
+  async function fdmTaskState(link) {
+    if (!fdmAvailable()) return { ok: false, reason: 'no-api' };
+    try {
+      const r = await fdmRequest('/queued', { method: 'POST', data: fdmLinkPayload(link), timeout: 1200 });
+      if (!r || r.ok !== true) return { ok: false, reason: (r && r.error) || 'bad-response' };
+      return {
+        ok: true,
+        exists: !!r.exists,
+        state: r.state || (r.queued ? 'active' : ''),
+        error: r.error || '',
+        match: r.match || '',
+        queued: !!r.queued,
+        taskId: r.taskId,
+      };
+    } catch (e) {
+      return { ok: false, reason: (e && e.message) || 'unreachable' };
+    }
+  }
+
   /* 等 FDM 确认"上一个链接已入队"：命中即返回，最多等 maxMs（默认 5s 兜底）。
-   * FDM 刚入队时 title 还是空，主要靠完整 URL / URL path 匹配（见 Python 桥 /queued）。 */
+   * 如果命中的任务处于 error 状态，不算入队完成，继续轮询等状态变化
+   * （重新触发后 FDM 会新建任务或把原任务重置为 active）。 */
   async function waitFdmQueued(link, maxMs = THROTTLE) {
     const t0 = Date.now();
     const waitMs = Number(maxMs) > 0 ? Number(maxMs) : THROTTLE;
@@ -696,28 +732,74 @@
       await sleep(waitMs, true);
       return { ok: false, reason: 'no-api', waitedMs: Date.now() - t0 };
     }
-    const el = link && link.el;
-    const urls = [];
-    const add = (u) => { if (u && !urls.includes(u)) urls.push(String(u)); };
-    add(link && link.link);
-    try { add(el && el.dataset && el.dataset.link); } catch {}
-    try { add(el && el.getAttribute && el.getAttribute('href')); } catch {}
-
-    const payload = { urls, name: (link && link.filename) || '', windowSec: 180 };
     let reason = 'timeout';
+    let lastState = '';
     for (;;) {
-      try {
-        const r = await fdmRequest('/queued', { method: 'POST', data: payload, timeout: 1200 });
-        if (r && r.ok && r.queued) {
-          return { ok: true, match: r.match || '', taskId: r.taskId, waitedMs: Date.now() - t0 };
-        }
-        if (r && r.ok === false) reason = r.error || 'bridge-error';
-      } catch (e) {
-        reason = (e && e.message) || 'unreachable';
+      const r = await fdmTaskState(link);
+      if (r.ok && r.queued) {
+        return { ok: true, match: r.match, state: r.state, taskId: r.taskId, waitedMs: Date.now() - t0 };
       }
-      if (Date.now() - t0 >= waitMs) return { ok: false, reason, waitedMs: Date.now() - t0 };
+      if (r.ok && r.exists && r.state === 'error') {
+        lastState = `error:${r.error || '?'}`;
+        reason = lastState;
+      } else if (!r.ok) {
+        reason = r.reason;
+      }
+      if (Date.now() - t0 >= waitMs) return { ok: false, reason, state: lastState, waitedMs: Date.now() - t0 };
       await sleep(200, true);
     }
+  }
+
+  function urlPathOf(u) {
+    try { return new URL(String(u), location.href).pathname || ''; } catch { return ''; }
+  }
+
+  /* 批量下载前：把 FDM 里处于错误状态的旧任务对应的下载记录清掉，
+   * 让这些文件重新进入 pending（否则会被当成"已下载"永远跳过）。 */
+  async function reconcileFdmErrors() {
+    if (!fdmAvailable()) return { ok: false, reason: 'no-api', cleared: 0, errors: 0 };
+    let r = null;
+    try {
+      r = await fdmRequest('/errors', {
+        method: 'POST',
+        data: { windowSec: 7 * 24 * 3600, limit: 500 },
+        timeout: 3000,
+      });
+    } catch (e) {
+      return { ok: false, reason: (e && e.message) || 'unreachable', cleared: 0, errors: 0 };
+    }
+    if (!r || r.ok !== true) return { ok: false, reason: (r && r.error) || 'bad-response', cleared: 0, errors: 0 };
+    const items = Array.isArray(r.items) ? r.items : [];
+    if (!items.length) return { ok: true, cleared: 0, errors: 0 };
+
+    const byPath = new Map();
+    const byName = new Map();
+    for (const it of items) {
+      if (it.path) byPath.set(it.path, it);
+      if (it.name) byName.set(it.name, it);
+    }
+    const recs = loadDlRecords();
+    const hit = [];
+    const names = [];
+    for (const [fid, rec] of Object.entries(recs)) {
+      if (!rec || typeof rec !== 'object') continue;
+      const p = urlPathOf(rec.link || '');
+      const nm = String(rec.name || '').trim();
+      const nameHit = nm && byName.has(nm);
+      if ((p && byPath.has(p)) || nameHit) {
+        hit.push(fid);
+        names.push(nm || (p && byPath.get(p) && byPath.get(p).name) || fid.slice(0, 8));
+      }
+    }
+    if (hit.length) {
+      clearDlRecordsFids(hit);
+      log(`♻️ FDM 异常任务 ${items.length} 个，匹配到 ${hit.length} 条下载记录，已清理并重新下载：` +
+          names.slice(0, 8).join('、') + (names.length > 8 ? '…' : ''));
+      refreshGray();
+    } else {
+      log(`♻️ FDM 异常任务 ${items.length} 个，但当前下载记录里没有匹配项（可能属于其它目录）`);
+    }
+    return { ok: true, cleared: hit.length, errors: items.length, names };
   }
 
   async function autoDownloadWorkflow(opts = {}) {
@@ -788,6 +870,12 @@
       const files = snap.files;
       const fileByFid = snap.byFid;
       const targetFidsSet = Array.isArray(targetFids) && targetFids.length ? new Set(targetFids) : null;
+      /* 先修正历史失败：FDM 里处于 error 的任务对应记录清掉，让它们重新进入 pending */
+      if (fdmAvailable()) {
+        setStatus('检查 FDM 异常任务...', 'running');
+        const fix = await reconcileFdmErrors();
+        if (fix.ok && fix.cleared) setProgress(`修正失败记录 ${fix.cleared} 条`);
+      }
       const dlRecs = loadDlRecords();
       const pending = files.filter(f => {
         if (!f.fid) return false;
@@ -859,6 +947,30 @@
           result.skippedFids.push(l.fid);
           done++;
           continue;
+        }
+        /* FDM 里已有任务且不是异常状态 → 跳过触发，避免重复下载；
+         * 处于 HttpError/GenericError 等异常 → 继续触发，让它重建/重试。 */
+        if (fdmAvailable()) {
+          const ex = await fdmTaskState(l);
+          if (ex.ok && ex.exists && ex.state !== 'error') {
+            log(`  [${i + 1}/${links.length}] FDM 已有任务（${ex.state}${ex.match ? '/' + ex.match : ''}），跳过触发: ${l.filename}`);
+            if (l.fid) {
+              result.skippedFids.push(l.fid);
+              const src = fileByFid.get(l.fid);
+              markFidDownloaded(l.fid, {
+                name: l.filename, link: l.link,
+                sizeStr: src ? src.sizeStr : '',
+                iconSig: src ? src.iconSig : '',
+                mtime: src ? src.mtime : '',
+              });
+            }
+            done++;
+            refreshGray();
+            continue;
+          }
+          if (ex.ok && ex.exists && ex.state === 'error') {
+            warn(`  [${i + 1}/${links.length}] FDM 已有异常任务（${ex.error || 'error'}），重新触发: ${l.filename}`);
+          }
         }
         setStatus('下载中...', 'running');
         setProgress(`${i + 1}/${links.length}  ${l.filename || ''}`);
@@ -2730,7 +2842,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.3.3',
+    version: '6.3.4',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -2764,16 +2876,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.3`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.4`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.3');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.4');
     } else {
-      log('平台层就绪（其他页）v6.3.3');
+      log('平台层就绪（其他页）v6.3.4');
     }
     startGrayPolling();
   })();

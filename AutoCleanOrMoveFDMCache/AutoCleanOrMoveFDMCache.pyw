@@ -95,6 +95,62 @@ def ack_pending_delete(urls):
         log_msg(f"⚠️ 确认待删失败: {e}")
         return 0
 
+
+# ============ 已处理任务（跨重启） ============
+# 正常流程是"移动后源文件消失"，下次扫描自然不会再处理。
+# 但文件本来就在 TARGET_DIR 时不会移动，源文件会一直存在，
+# 只靠内存里的 processed_ids 会在每次重启后重复登记云端待删 → 这里做持久化。
+HANDLED_PATH = os.path.join(BASE_DIR, "fdm_handled_tasks.json")
+HANDLED_MAX = 3000
+_handled_lock = threading.RLock()
+_handled_cache = None          # {key: ts}，dict 保序，按插入顺序淘汰最旧的
+
+
+def _handled_load():
+    global _handled_cache
+    with _handled_lock:
+        if _handled_cache is None:
+            try:
+                with open(HANDLED_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    _handled_cache = {str(k): float(v or 0) for k, v in data.items()}
+                else:
+                    _handled_cache = {}
+            except Exception:
+                _handled_cache = {}
+        return _handled_cache
+
+
+def _handled_has(key):
+    try:
+        return str(key) in _handled_load()
+    except Exception:
+        return False
+
+
+def _handled_add(key):
+    global _handled_cache
+    if not key:
+        return
+    with _handled_lock:
+        cur = _handled_cache if _handled_cache is not None else {}
+        key = str(key)
+        if key in cur:
+            return
+        cur[key] = time.time()
+        if len(cur) > HANDLED_MAX:
+            for old in list(cur.keys())[:len(cur) - HANDLED_MAX]:
+                cur.pop(old, None)
+        _handled_cache = cur
+        try:
+            tmp = HANDLED_PATH + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cur, f, ensure_ascii=False, indent=0)
+            os.replace(tmp, HANDLED_PATH)
+        except Exception as e:
+            log_msg(f"⚠️ 保存已处理任务失败: {e}")
+
 def _norm_queued_name(v):
     """文件名归一化：去掉 FDM 自动加的 (1)/(2) 副本后缀"""
     s = str(v or '').strip()
@@ -566,6 +622,14 @@ def get_unique_filename(dst):
         new_dst = f"{base} ({i}){ext}"
     return new_dst
 
+
+def _same_dir(a, b):
+    """两个路径是否是同一个目录（忽略大小写/尾部分隔符/相对写法）"""
+    try:
+        return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+    except Exception:
+        return False
+
 def _file_md5(path, chunk_size=4 * 1024 * 1024):
     h = hashlib.md5()
     with open(path, "rb") as f:
@@ -736,6 +800,19 @@ def safe_move(src, dst, chunk_size=4 * 1024 * 1024):
         if src_size <= 0:
             log_msg(f"⚠️ 源文件大小为 0，跳过移动: {os.path.basename(src)}")
             return None
+
+        # ★ 源与目标是同一个文件（用户把 FDM 下载目录直接设成了 TARGET_DIR）：
+        #   后面"目标已存在且内容一致 → 删源"的分支会把刚下好的正片删掉。
+        #   这里直接返回，什么也不做。
+        try:
+            if os.path.exists(dst) and os.path.samefile(src, dst):
+                log_msg(f"ℹ️ 源与目标是同一个文件，跳过移动: {os.path.basename(src)}")
+                return dst
+        except OSError:
+            if _same_dir(os.path.dirname(os.path.abspath(src)), os.path.dirname(os.path.abspath(dst))) \
+               and os.path.normcase(os.path.basename(src)) == os.path.normcase(os.path.basename(dst)):
+                log_msg(f"ℹ️ 源与目标路径相同，跳过移动: {os.path.basename(src)}")
+                return dst
 
         dst_dir = os.path.dirname(os.path.abspath(dst)) or "."
         try:
@@ -995,11 +1072,15 @@ def process_db():
                             ".pdf", ".zip", ".rar", ".7z", ".jpg", ".jpeg", ".png", ".txt")
 
                 def _try_move(path, fname):
-                    """尝试把单个文件移到 TARGET_DIR，返回是否成功"""
+                    """尝试把单个文件移到 TARGET_DIR，返回是否（视为）已完成"""
                     if not os.path.isfile(path) or is_temp_file(fname):
                         return False
                     if not any(fname.lower().endswith(ext) for ext in media_exts):
                         return False
+                    # 已经在目标目录里：不能再"移动"，否则 src==dst 会被判成重复而删源
+                    if _same_dir(os.path.dirname(os.path.abspath(path)), TARGET_DIR):
+                        log_msg(f"ℹ️ 已在目标目录，跳过移动: {fname}")
+                        return True
                     dst = os.path.join(TARGET_DIR, os.path.basename(fname))
                     log_msg(f"➡️ 移动种子文件: {fname}")
                     return safe_move(path, dst)
@@ -1088,7 +1169,23 @@ def process_db():
             if not os.path.exists(file_path) or is_temp_file(file_path):
                 continue
 
+            # ★ 文件已经在目标目录里（用户把 FDM 下载目录手动改成了 TARGET_DIR）：
+            #   绝不移动、绝不删除 —— 源文件本身就是最终文件。
+            #   只通知页面：更新下载记录 + 删除云端副本。
+            if _same_dir(os.path.dirname(os.path.abspath(file_path)), TARGET_DIR):
+                key = f"direct:{task_id}"
+                if _handled_has(key):
+                    continue
+                processed_ids.add(task_id)
+                _handled_add(key)
+                log_msg(f"✅ 已在目标目录，跳过移动，仅通知删除云端: {final_title}")
+                add_pending_delete(url, final_title)
+                continue
+
             if task_id in processed_ids:
+                # 源文件若就在目标目录里，那是最终文件，绝不能当"残留"删掉
+                if _same_dir(os.path.dirname(os.path.abspath(file_path)), TARGET_DIR):
+                    continue
                 try:
                     os.remove(file_path)
                     log_msg(f"🧹 已清理之前残留的源文件: {final_title}")

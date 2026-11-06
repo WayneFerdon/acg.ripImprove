@@ -4,6 +4,8 @@
 AutoCleanOrMoveFDMCache/fdm_mover.lock
 AutoCleanOrMoveFDMCache/fdm_mover.log
 AutoCleanOrMoveFDMCache/quark_pending_delete.json
+AutoCleanOrMoveFDMCache/fdm_handled_tasks.json
+AutoCleanOrMoveFDMCache/fdm_handled_tasks.json.tmp
 /AutoCleanOrMoveFDMCache/*.exe
 /AutoCleanOrMoveFDMCache/*.bak-*
 /AutoCleanOrMoveFDMCache/__pycache__/

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.3.9
+// @version      6.4.0
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -457,6 +457,19 @@
 
   function captureListIdentity() {
     return { scope: currentListScope(), crumb: readListCrumb() };
+  }
+
+  /* 是否在「来自：分享」转存目录树里（含它的子目录）。
+   * 自动删除云端文件只允许发生在这棵树内；其它个人页文件夹只清理"文件已不在"的残留记录。 */
+  function isTransferTreeView() {
+    try {
+      const crumb = readListCrumb();
+      if (crumb && /(^|\/)来自[：:]分享(\/|$)/.test(crumb)) return true;
+      let h = String(location.hash || '');
+      try { h = decodeURIComponent(h); } catch {}
+      /* 名字必须正好是「来自：分享」，避免把「来自：分享备份」这类相似名当成转存目录 */
+      return /#\/list\/all\/[^/?#]*来自[：:]分享(?=$|[/?#])/.test(h);
+    } catch { return false; }
   }
 
   /* 目录身份是否未变：hash 段必须一致；面包屑只在两边都读到时才比较
@@ -2217,6 +2230,8 @@
   /* 定时/等待用：加状态守卫与失败退避（清理流程内部直接调 purgeFdmConfirmed） */
   async function syncFdmFinishedDeletes(opts = {}) {
     if (!isListPage()) return { ok: false, reason: 'not-list-page' };
+    /* 后台轮询也会删云端文件：只在「来自：分享」目录树里做，其它个人页文件夹一律不动 */
+    if (!isTransferTreeView()) return { ok: false, reason: 'not-transfer-dir' };
     if (isPaused()) return { ok: false, reason: 'paused' };
     if (!fdmAvailable()) return { ok: false, reason: 'no-api' };
     if (_fdmBusy) return { ok: false, reason: 'busy' };
@@ -2417,6 +2432,14 @@
     const id0 = captureListIdentity();
     const scope = id0.scope;
     if (!scope) return { ok: false, reason: 'no-scope' };
+    /* 只有「来自：分享」转存目录树里才自动删除云端文件。
+     * 其它个人页文件夹：不删文件、不动"文件还在"的记录，只清"文件已经不在"的残留记录。
+     * 手动点「立即清理」视为明确授权，仍可删（但会先弹确认）。 */
+    const transferDir = isTransferTreeView();
+    const allowDelete = transferDir || opts.manual === true;
+    if (!transferDir) {
+      log(`★ [${tag}] 非「来自：分享」目录（${scope}）：本轮不自动删除云端文件，只清理"文件已不存在"的残留记录`);
+    }
     const ensureSameDir = (where) => {
       if (sameListIdentity(id0, captureListIdentity())) return true;
       warn(`⚠️ [${tag}] 目录已变化（${id0.scope}${id0.crumb ? `「${id0.crumb}」` : ''} → ` +
@@ -2449,7 +2472,10 @@
      * 避免 TTL 先动手把还没下到本地的文件删掉。 */
     let fdmDeleted = 0;
     let fdmState = 'skipped';
-    if (fdmAvailable()) {
+    if (!allowDelete) {
+      fdmState = '非转存目录，跳过';
+      log(`★ [${tag}] 非「来自：分享」目录：跳过 FDM 确认删除（不删云端文件）`);
+    } else if (fdmAvailable()) {
       const pg = await purgeFdmConfirmed({ tag: tag + '-fdm', scan });
       if (pg.ok) {
         fdmState = pg.pending ? `确认删除 ${pg.deleted}/${pg.pending}` : '无待删';
@@ -2498,7 +2524,27 @@
       log(`★ [${tag}] 另有下载记录属于其它目录（本次不动）：${[...otherScope].join('、')}`);
     }
 
+    /* 非「来自：分享」目录：即使文件已过 TTL 也不删（记录一并保留），
+     * 只在第 3 步清理"文件确实已经不在这个目录"的残留记录。 */
+    let expiredSkipped = 0;
+    if (expired.length && !allowDelete) {
+      expiredSkipped = expired.length;
+      log(`★ [${tag}] 非转存目录：跳过过期文件删除（${expiredSkipped} 个：`
+          + expired.slice(0, 8).map(e => e.name).join('、') + (expiredSkipped > 8 ? '…' : '') + '）');
+      expired.length = 0;
+    }
+
     let del = { requested: 0, picked: 0, result: 'none', failed: [], still: [], deleted: 0 };
+    /* 手动清理且不在转存目录：删云端文件是不可逆的，必须再确认一次 */
+    if (expired.length && !transferDir && opts.manual === true) {
+      const names = expired.slice(0, 10).map(e => e.name).join('\n');
+      if (!confirm(`当前不是「来自：分享」目录。\n\n确定要删除这 ${expired.length} 个已下载的云端文件？\n\n`
+                  + names + (expired.length > 10 ? '\n…' : ''))) {
+        log(`★ [${tag}] 用户取消：非转存目录下不删除云端文件（仅清理残留记录）`);
+        expiredSkipped = expired.length;
+        expired.length = 0;
+      }
+    }
     if (expired.length) {
       /* 删除前再核一次目录：勾选动作会滚动列表，期间若被切走会删到别的目录 */
       if (!ensureSameDir('删除前')) return { ok: false, reason: 'scope-changed', files: del };
@@ -2547,7 +2593,7 @@
         const ts = recordTs(r);
         if (!(ts > 0)) { left.push(`${nm}（下载记录无时间戳）`); continue; }
         const age = Date.now() - ts;
-        if (age > DL_TTL) left.push(`${nm}（已超保留期却仍在列表：删除未生效？）`);
+        if (age > DL_TTL) left.push(`${nm}（已超保留期却仍在列表：${allowDelete ? '删除未生效？' : '非转存目录，不自动删除'}）`);
         else left.push(`${nm}（已下载 ${(age / 3600000).toFixed(1)}h，${Math.ceil((DL_TTL - age) / 3600000)}h 后清理）`);
       }
       if (left.length) {
@@ -2571,13 +2617,15 @@
     /* 本轮最后一次 scan 就是"删除后的真实全量"，直接作为进度统计快照 */
     if (scanTrust(scan)) _listSnapshot = { ...scan, scope, at: Date.now() };
     const ms = Date.now() - t0;
-    log(`★ [${tag}] 清理完成：FDM 确认 ${fdmDeleted}（${fdmState}），过期文件 ${expired.length}（删掉 ${del.deleted}）` +
+    log(`★ [${tag}] 清理完成：FDM 确认 ${fdmDeleted}（${fdmState}），过期文件 ${expired.length + expiredSkipped}（删掉 ${del.deleted}` +
+        `${expiredSkipped ? ` / 非转存目录跳过 ${expiredSkipped}` : ''}）` +
         `，清记录 ${cleared.removed.length}（保留 ${cleared.kept}，待复核 ${cleared.unverified}）` +
         `，文件 ${scan.count} / 数据行 ${scan.allCount}，耗时 ${ms}ms`);
     refreshGray();
     return {
       ok: true, scope, rows: scan.count, allRows: scan.allCount, empty: scan.empty,
-      expired: expired.length, deleted: del.deleted, still: del.still,
+      transferDir, fileDeleteSkipped: !allowDelete,
+      expired: expired.length + expiredSkipped, expiredSkipped, deleted: del.deleted, still: del.still,
       fdmDeleted, fdmState,
       records: cleared.removed.length, recordNames: cleared.names,
       kept: cleared.kept, unverified: cleared.unverified,
@@ -2717,8 +2765,9 @@
           setStatus(`清理失败(${reason})，仅下载`, 'running');
         } else {
           GATE.readyAt = Date.now();
-          gateSet('ready', `删文件 ${cleanup.deleted} / 清记录 ${cleanup.records}`);
-          setStatus('清理完成，等待下一步', 'running');
+          const onlyRec = cleanup.fileDeleteSkipped === true;
+          gateSet('ready', `${onlyRec ? '仅清记录' : `删文件 ${cleanup.deleted}`} / 清记录 ${cleanup.records}`);
+          setStatus(onlyRec ? '已清残留记录（非转存目录不删文件）' : '清理完成，等待下一步', 'running');
           setProgress(`列表 ${cleanup.rows} 个文件（已排除文件夹）`);
         }
 
@@ -2937,6 +2986,8 @@
         if (r.ok) {
           alert(`清理完成\n\nFDM 已确认完成：${r.fdmDeleted || 0}（${r.fdmState || '-'}）`
                 + `\n过期文件：${r.expired}（删掉 ${r.deleted}）`
+                + (r.expiredSkipped ? `\n非「来自：分享」目录：${r.expiredSkipped} 个已跳过，不删文件` : '')
+                + (r.fileDeleteSkipped ? `\n（本目录只清理残留记录，不自动删除文件）` : '')
                 + (r.still && r.still.length ? `\n删除后仍在：${r.still.join('、')}` : '')
                 + `\n清理记录：${r.records}`
                 + (r.recordNames && r.recordNames.length ? `\n${r.recordNames.slice(0, 10).join('、')}` : '')
@@ -2994,7 +3045,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.3.9',
+    version: '6.4.0',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -3028,16 +3079,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.9`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.4.0`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.9');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.4.0');
     } else {
-      log('平台层就绪（其他页）v6.3.9');
+      log('平台层就绪（其他页）v6.4.0');
     }
     startGrayPolling();
   })();

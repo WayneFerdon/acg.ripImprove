@@ -109,9 +109,28 @@ def _norm_queued_path(u):
         return ''
 
 
+# 这些类别不代表"需要重新下载的异常"：
+#   NoError                 正常
+#   File*                   文件被删除/已存在/权限问题（文件被删除是正常情况）
+#   Canceled/Aborted        用户取消或中断
+_NOT_ERROR_CATEGORIES = {
+    'noerror', 'noterror',
+    'fileerror', 'filenotfounderror', 'fileexistserror', 'fileaccesserror',
+    'filepermissionerror', 'filewriteerror', 'filereaderror',
+    'cancelederror', 'cancellederror', 'abortederror',
+}
+# 描述里明确说文件被删除/不存在 → 正常，不算下载异常。
+# 不用泛化的 "not found"：HTTP 404 的描述也可能含这个词，那是真异常。
+_FILE_GONE_HINTS = (
+    'file was deleted', 'file deleted', 'source file was deleted',
+    'file not found', 'no such file', 'file does not exist',
+    '文件不存在', '文件已删除', '已删除', '找不到文件',
+)
+
+
 def _last_result_category(blob):
     """从 FDM downloads.lastResult（UTF-16 结构）里取错误类别：
-       成功/无结果 → ''；失败 → 'HttpError' / 'GenericError' 等。"""
+       成功/无结果/文件被删除 → ''；真正的下载失败 → 'HttpError' / 'GenericError' 等。"""
     if not blob:
         return ''
     raw = bytes(blob)
@@ -126,7 +145,11 @@ def _last_result_category(blob):
         if not m:
             continue
         cat = m.group(1)
-        if cat.lower() in ('noerror', 'noterror'):
+        low = cat.lower()
+        if low in _NOT_ERROR_CATEGORIES:
+            continue
+        low_text = text.lower()
+        if any(h in low_text for h in _FILE_GONE_HINTS):
             continue
         return cat
     return ''

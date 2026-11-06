@@ -1,3 +1,14 @@
 /.verify
 /.workbuddy
 /quarkStatus
+AutoCleanOrMoveFDMCache/fdm_mover.lock
+AutoCleanOrMoveFDMCache/fdm_mover.log
+AutoCleanOrMoveFDMCache/quark_pending_delete.json
+/AutoCleanOrMoveFDMCache/*.exe
+/AutoCleanOrMoveFDMCache/*.bak-*
+/AutoCleanOrMoveFDMCache/__pycache__/
+/AutoCleanOrMoveFDMCache/build/
+/AutoCleanOrMoveFDMCache/dist/
+/AutoCleanOrMoveFDMCache/*.spec
+/AutoCleanOrMoveFDMCache/fdm_diag.txt
+/AutoCleanOrMoveFDMCache/run-tmp/

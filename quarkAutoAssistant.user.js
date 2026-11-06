@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.3.8
+// @version      6.3.9
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -435,6 +435,41 @@
     return '';
   }
 
+  /* 真实文件夹视图：#/list/all 或 #/list/all/<guid>-<名字>。
+   * recent/video/img/doc/music/bt/myshare/trash 都不是文件夹：
+   *   · 它们的 scope 只是虚拟视图名，按它清记录会误伤同名目录的记录；
+   *   · 回收站里"删除"是永久删除，绝不能自动跑 TTL 清理。 */
+  function isFolderListView() {
+    try {
+      return /^#\/list\/all(\/|$|\?|&)/.test(String(location.hash || ''));
+    } catch { return false; }
+  }
+
+  /* 面包屑文本：反映"当前真正渲染的是哪个目录"，比 hash 更贴近 DOM。
+   * SPA 切目录时 hash 与 DOM 可能短暂不一致，用它做交叉校验。 */
+  function readListCrumb() {
+    try {
+      const el = document.querySelector('.file-list-breadcrumb .primary');
+      if (!el) return '';
+      return String(el.textContent || '').replace(/\s+/g, ' ').trim();
+    } catch { return ''; }
+  }
+
+  function captureListIdentity() {
+    return { scope: currentListScope(), crumb: readListCrumb() };
+  }
+
+  /* 目录身份是否未变：hash 段必须一致；面包屑只在两边都读到时才比较
+   * （React 重渲染的瞬间取不到面包屑，不能因此误判成"换了目录"）。
+   * 清理会滚动整表并可按 fid 清记录，一旦"扫的是 A、比的是 B"，B 的记录会被整批误清。 */
+  function sameListIdentity(a, b) {
+    if (!a || !b) return false;
+    if (!a.scope || !b.scope) return false;
+    if (a.scope !== b.scope) return false;
+    if (a.crumb && b.crumb && a.crumb !== b.crumb) return false;
+    return true;
+  }
+
   /* 自动批量下载只针对 acg 转存目录：
    *   https://pan.quark.cn/list#/list/all/<32位guid>-来自：分享
    * 其他个人页（根目录、普通文件夹）只做清理，下载保留给手动点击。 */
@@ -823,7 +858,10 @@
       if (!rec || typeof rec !== 'object') continue;
       const p = urlPathOf(rec.link || '');
       const nm = String(rec.name || '').trim();
-      const nameHit = nm && byName.has(nm);
+      /* 有直链就用 path 精确匹配；**不要**再按文件名兜底 ——
+       * 不同目录下同名文件（01.mp4 之类）会被一起清掉，白白重下一次。
+       * 只有"没有直链"的旧记录（手动标记的）才退回按名匹配。 */
+      const nameHit = !p && nm && byName.has(nm);
       if ((p && byPath.has(p)) || nameHit) {
         hit.push(fid);
         names.push(nm || (p && byPath.get(p) && byPath.get(p).name) || fid.slice(0, 8));
@@ -2361,12 +2399,31 @@
     if (isPaused() && !opts.manual) return { ok: false, reason: 'paused' };
     if (isAccountLimited()) return { ok: false, reason: 'account-limited' };
 
+    /* 只在真实文件夹视图里做破坏性操作（删文件 + 清记录）。
+     * 最近/视频/图片/文档/音频/BT/我的分享/回收站 都不是目录：
+     * 它们的 scope 只是视图名，按 scope 清记录会误伤；回收站里删除是永久的。 */
+    if (!isFolderListView()) {
+      log(`★ [${tag}] 当前不是文件夹视图（${location.hash || '#/list/all'}），跳过清理（不删文件、不清记录）`);
+      return { ok: false, reason: 'not-folder-view', skip: true };
+    }
+
     /* ---- 1. 等文件列表加载完 ---- */
     const settled = await waitListSettled({ tag, maxWaitMs: opts.listWaitMs });
     if (!settled.ok) return { ok: false, reason: 'list-' + settled.reason };
 
-    const scope = currentListScope();
+    /* 目录身份：整轮清理必须钉在同一个目录。
+     * 清理会滚整表再按 fid 清记录，一旦中途 SPA 切了目录（hash 与 DOM 还可能先后错开），
+     * 就会变成"扫的是 A、比的是 B"，把 B 的记录整批当成"文件已不存在"清掉。 */
+    const id0 = captureListIdentity();
+    const scope = id0.scope;
     if (!scope) return { ok: false, reason: 'no-scope' };
+    const ensureSameDir = (where) => {
+      if (sameListIdentity(id0, captureListIdentity())) return true;
+      warn(`⚠️ [${tag}] 目录已变化（${id0.scope}${id0.crumb ? `「${id0.crumb}」` : ''} → ` +
+           `${currentListScope()}${readListCrumb() ? `「${readListCrumb()}」` : ''}，${where}）：` +
+           `本轮中止，既不删文件也不清记录`);
+      return false;
+    };
 
     let scan = await scanAllRowsWithScroll({ tag: tag + '-before', maxMs: opts.scanMs });
     if (!scanTrust(scan)) {
@@ -2378,6 +2435,8 @@
       if (!again || again.allCount >= scan.allCount) scan = again || scan;
       log(`★ [${tag}] 重试后：文件 ${scan.count} / 数据行 ${scan.allCount} / 推断 ${scan.total}，可信=${scanTrust(scan)}`);
     }
+    /* 扫描期间目录被切走：这份 byFid 属于别的目录，任何删除/清记录都不可信 */
+    if (!ensureSameDir('扫描后')) return { ok: false, reason: 'scope-changed', rows: scan.count, allRows: scan.allCount };
     /* 扫描不完整时**一个文件都不删、一条记录都不清**：
      * 之前"不可信还继续删"正是误删的来源。 */
     if (!scanTrust(scan)) {
@@ -2400,6 +2459,7 @@
           const rescan = await scanAllRowsWithScroll({ tag: tag + '-fdm-after', maxMs: opts.scanMs });
           if (rescan && scanTrust(rescan)) scan = rescan;
           else warn(`⚠️ [${tag}] FDM 删除后重扫不可信，沿用删除前的扫描结果`);
+          if (!ensureSameDir('FDM 删除后重扫')) return { ok: false, reason: 'scope-changed', files: { deleted: fdmDeleted } };
         }
       } else if (pg.reason === 'bridge-unreachable') {
         fdmState = '桥不可达';
@@ -2440,6 +2500,8 @@
 
     let del = { requested: 0, picked: 0, result: 'none', failed: [], still: [], deleted: 0 };
     if (expired.length) {
+      /* 删除前再核一次目录：勾选动作会滚动列表，期间若被切走会删到别的目录 */
+      if (!ensureSameDir('删除前')) return { ok: false, reason: 'scope-changed', files: del };
       log(`★ [${tag}] 过期文件 ${expired.length} 个：${expired.map(e => e.name).join('、')}`);
       del = await deleteFilesByFids(expired.map(e => e.fid), { tag });
       if (del.result === 'account-limited') return { ok: false, reason: 'account-limited', files: del };
@@ -2467,6 +2529,8 @@
         del.deleted = 0;
         return { ok: false, reason: 'rescan-incomplete', files: del, expired: expired.length };
       }
+      /* 刷新/重扫后目录被切走：这份 byFid 不能用来判断"哪些文件还在" */
+      if (!ensureSameDir('删除后重扫')) return { ok: false, reason: 'scope-changed', files: del, expired: expired.length };
 
       del.still = expired.filter(e => scan.byFid.has(e.fid)).map(e => e.name);
       del.deleted = expired.length - del.still.length;
@@ -2498,6 +2562,9 @@
       warn(`⚠️ [${tag}] 列表扫描不可信（文件 ${scan.count} / 数据行 ${scan.allCount} / 推断 ${scan.total}），本轮保留全部记录`);
     } else if (scan.byFid.size === 0 && !scan.empty) {
       warn(`⚠️ [${tag}] 列表扫到 0 个文件且未确认空目录，跳过记录清理`);
+    } else if (!ensureSameDir('清记录前')) {
+      /* 这是最关键的一道闸：byFid 与 scope 一旦错位，会把另一个目录的记录整批清掉 */
+      return { ok: false, reason: 'scope-changed', files: del, expired: expired.length };
     } else {
       cleared = await clearRecordsMissingFromList(scan.byFid, scope);
     }
@@ -2633,7 +2700,11 @@
 
         if (!cleanup || cleanup.ok !== true) {
           const reason = (cleanup && cleanup.reason) || 'unknown';
-          if (GATE.acg) {
+          /* 非文件夹视图（最近/回收站等）：不是失败，是主动跳过破坏性操作 */
+          if (cleanup && cleanup.skip === true) {
+            gateSet('ready', `跳过清理(${reason})`);
+            setStatus('非文件夹视图，跳过清理', 'running');
+          } else if (GATE.acg) {
             /* acg 唤起：清不干净就不动子任务、不下载，挂起等人工/下次重开 */
             gateSet('blocked', reason);
             setStatus(`清理未完成(${reason})`, 'error');
@@ -2889,6 +2960,8 @@
             'refresh-timeout': '删除后列表未就绪',
             'refresh-no-table': '找不到文件表格',
             'empty-unconfirmed': '扫到 0 行但未确认空目录',
+            'not-folder-view': '当前不是文件夹视图（最近/回收站等），已跳过',
+            'scope-changed': '清理过程中目录被切换，已中止（不删文件、不清记录）',
           };
           const key = r.reason || '';
           alert(`未清理（${reasonMap[key] || key || '未知原因'}）\n\n本次未改动任何记录。`);
@@ -2921,7 +2994,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.3.8',
+    version: '6.3.9',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -2955,16 +3028,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.8`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.9`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.8');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.9');
     } else {
-      log('平台层就绪（其他页）v6.3.8');
+      log('平台层就绪（其他页）v6.3.9');
     }
     startGrayPolling();
   })();

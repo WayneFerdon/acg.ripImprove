@@ -109,28 +109,29 @@ def _norm_queued_path(u):
         return ''
 
 
-# 这些类别不代表"需要重新下载的异常"：
-#   NoError                 正常
-#   File*                   文件被删除/已存在/权限问题（文件被删除是正常情况）
-#   Canceled/Aborted        用户取消或中断
-_NOT_ERROR_CATEGORIES = {
-    'noerror', 'noterror',
-    'fileerror', 'filenotfounderror', 'fileexistserror', 'fileaccesserror',
-    'filepermissionerror', 'filewriteerror', 'filereaderror',
-    'cancelederror', 'cancellederror', 'abortederror',
-}
-# 描述里明确说文件被删除/不存在 → 正常，不算下载异常。
-# 不用泛化的 "not found"：HTTP 404 的描述也可能含这个词，那是真异常。
-_FILE_GONE_HINTS = (
-    'file was deleted', 'file deleted', 'source file was deleted',
-    'file not found', 'no such file', 'file does not exist',
-    '文件不存在', '文件已删除', '已删除', '找不到文件',
+# 只有 HTTP 类失败才可能需要"重新获取链接"：
+#   HttpError → 403/404/410（签名过期、链接失效）等
+# 其余一律不算：硬盘写入异常、无网络连接、文件被删除、用户取消……
+# 刻意用白名单，不再把任意 *Error 都当成可重取。
+_RETRYABLE_CATEGORY = 'httperror'
+# 描述里出现这些，基本可确认是"链接失效/签名过期"
+_LINK_EXPIRED_HINTS = (
+    '403', '404', '410', '401', 'forbidden', 'unauthorized',
+    'expired', 'invalid', 'signature', 'token',
+    '链接失效', '链接已过期', '签名', '过期',
+)
+# 描述里是网络/连接问题，而不是链接本身失效 → 不重取
+_NETWORK_HINTS = (
+    'no network', 'network', 'connection', 'connect', 'timeout', 'timed out',
+    'offline', 'unreachable', 'disconnected', 'reset by peer',
+    '无网络', '网络', '连接', '超时',
 )
 
 
 def _last_result_category(blob):
-    """从 FDM downloads.lastResult（UTF-16 结构）里取错误类别：
-       成功/无结果/文件被删除 → ''；真正的下载失败 → 'HttpError' / 'GenericError' 等。"""
+    """从 FDM downloads.lastResult（UTF-16 结构）里取"需要重新获取链接"的类别。
+       只有 HttpError 且能判断为链接失效时返回非空；
+       文件被删除、磁盘写入、无网络、取消等均返回 ''。"""
     if not blob:
         return ''
     raw = bytes(blob)
@@ -145,11 +146,13 @@ def _last_result_category(blob):
         if not m:
             continue
         cat = m.group(1)
-        low = cat.lower()
-        if low in _NOT_ERROR_CATEGORIES:
+        if cat.lower() != _RETRYABLE_CATEGORY:
             continue
         low_text = text.lower()
-        if any(h in low_text for h in _FILE_GONE_HINTS):
+        has_link_hint = any(h in low_text for h in _LINK_EXPIRED_HINTS)
+        has_net_hint = any(h in low_text for h in _NETWORK_HINTS)
+        if has_net_hint and not has_link_hint:
+            # 无网络/连接超时等：链接没失效，不需要重新获取
             continue
         return cat
     return ''

@@ -874,7 +874,8 @@
       if (fdmAvailable()) {
         setStatus('检查 FDM 异常任务...', 'running');
         const fix = await reconcileFdmErrors();
-        if (fix.ok && fix.cleared) setProgress(`修正失败记录 ${fix.cleared} 条`);
+        if (!fix.ok) warn(`  跳过 FDM 异常任务检查（${fix.reason}）`);
+        else if (fix.cleared) setProgress(`修正失败记录 ${fix.cleared} 条`);
       }
       const dlRecs = loadDlRecords();
       const pending = files.filter(f => {

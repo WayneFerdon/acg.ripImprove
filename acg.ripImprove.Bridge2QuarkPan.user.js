@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.15
+// @version 3.14.16
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -977,15 +977,17 @@
   function isFolderFile(f) {
     if (!f) return false;
     if (f.isFolder === true || f.isDir === true || f.type === 'folder' || f.kind === 'folder') return true;
+    const name = String(f.name || '');
+    if (name.endsWith('/')) return true;
     const row = f.row;
     if (!row || typeof row.querySelector !== 'function') return false;
-    return !!(
-      row.querySelector('.anticon-folder') ||
-      row.querySelector('.anticon-folder-open') ||
-      row.querySelector('[class*="icon-folder"]') ||
-      row.querySelector('[class*="folder-icon"]') ||
-      row.querySelector('svg[data-icon="folder"]')
-    );
+    if (row.getAttribute('data-row-type') === 'folder' || row.getAttribute('data-is-folder') === '1') return true;
+    if (row.querySelector('[class*="folder" i],[class*="Folder"]')) return true;
+    for (const u of row.querySelectorAll('use')) {
+      const href = u.getAttribute('xlink:href') || u.getAttribute('href') || '';
+      if (/folder|[-_/]dir\b/i.test(href)) return true;
+    }
+    return false;
   }
 
   /* ===== 全表缓存 ===== */

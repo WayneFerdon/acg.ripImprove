@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.3.4
+// @version      6.3.5
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -356,13 +356,14 @@
     return '';
   }
 
-  /* 文件夹行：class 含 folder，或图标 use 指向 #qkdrive-folder */
+  /* 文件夹行：class 含 folder，或图标 use 指向 #qkdrive-folder / qkdrive-dir */
   function isFolderRow(row) {
     try {
+      if (row.getAttribute('data-row-type') === 'folder' || row.getAttribute('data-is-folder') === '1') return true;
       if (row.querySelector('[class*="folder" i],[class*="Folder"]')) return true;
       for (const u of row.querySelectorAll('use')) {
         const href = u.getAttribute('xlink:href') || u.getAttribute('href') || '';
-        if (/folder/i.test(href)) return true;
+        if (/folder|[-_/]dir\b/i.test(href)) return true;
       }
     } catch {}
     return false;
@@ -411,6 +412,18 @@
       if (m2 && m2[1]) { try { return decodeURIComponent(m2[1]); } catch { return m2[1]; } }
     } catch {}
     return '';
+  }
+
+  /* 自动批量下载只针对 acg 转存目录：
+   *   https://pan.quark.cn/list#/list/all/<32位guid>-来自：分享
+   * 其他个人页（根目录、普通文件夹）只做清理，下载保留给手动点击。 */
+  function isAutoDownloadScope() {
+    try {
+      const raw = String(location.hash || '');
+      let h = raw;
+      try { h = decodeURIComponent(raw); } catch {}
+      return /#\/list\/all\/[0-9a-f]{32}-来自[：:]分享/i.test(h);
+    } catch { return false; }
   }
 
   /* 读取页面"共 N 个/条/项"提示。已补充分页总数等常见选择器。 */
@@ -2580,7 +2593,7 @@
           GATE.readyAt = Date.now();
           gateSet('ready', `删文件 ${cleanup.deleted} / 清记录 ${cleanup.records}`);
           setStatus('清理完成，等待下一步', 'running');
-          setProgress(`列表 ${cleanup.rows} 个文件 / ${cleanup.allRows} 行`);
+          setProgress(`列表 ${cleanup.rows} 个文件（已排除文件夹）`);
         }
 
         /* ---- 5. 一直 await until：不是 acg 唤起的 / 挂起结束 ---- */
@@ -2605,7 +2618,17 @@
           continue;
         }
 
-        /* ---- 6. 执行自动下载 ---- */
+        /* ---- 6. 执行自动下载 ----
+         * 只有 acg 转存目录（/list/all/<32位guid>-来自：分享）才自动批量下载；
+         * 其他个人页只做清理，下载保留给手动点击。 */
+        if (!isAutoDownloadScope()) {
+          log('★ 当前目录不是「-来自：分享」转存目录，跳过自动批量下载（仍可手动点击）');
+          gateSet(GATE.acg ? 'blocked' : 'idle', 'not-share-import-dir');
+          setStatus('非自动下载目录（可手动下载）');
+          setProgress('-');
+          await until(() => GATE._pendingRearm, 500);
+          continue;
+        }
         gateSet('downloading', decision.kind === 'self' ? '非 acg 唤起' : '桥接已放行');
         clearBridgeBusy();
         setStatus('自动下载中...', 'running');
@@ -2843,7 +2866,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.3.4',
+    version: '6.3.5',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -2877,16 +2900,16 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.4`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.3.5`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
       setTimeout(() => { syncFdmFinishedDeletes().catch(() => {}); }, 5000);
       setInterval(() => { syncFdmFinishedDeletes().catch(() => {}); }, FDM_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.4');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.3.5');
     } else {
-      log('平台层就绪（其他页）v6.3.4');
+      log('平台层就绪（其他页）v6.3.5');
     }
     startGrayPolling();
   })();

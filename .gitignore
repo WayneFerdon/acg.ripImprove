@@ -1,6 +1,7 @@
 /.verify
 /.workbuddy
 /quarkStatus
+*.bak-*
 AutoCleanOrMoveFDMCache/fdm_mover.lock
 AutoCleanOrMoveFDMCache/fdm_mover.log
 AutoCleanOrMoveFDMCache/quark_pending_delete.json

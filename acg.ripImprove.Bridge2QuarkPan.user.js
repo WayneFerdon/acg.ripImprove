@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.16
+// @version 3.14.17
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -979,6 +979,13 @@
     if (f.isFolder === true || f.isDir === true || f.type === 'folder' || f.kind === 'folder') return true;
     const name = String(f.name || '');
     if (name.endsWith('/')) return true;
+    /* 文件夹没有扩展名，且大小列为空或 "-" */
+    if (name && !/\.[A-Za-z0-9]{1,8}$/.test(name)) {
+      const size = String(f.sizeStr || '').trim();
+      if (!size || /^[-—]+$/.test(size)) return true;
+    }
+    const sig = String(f.iconSig || '');
+    if (/folder|[-_/]dir\b|wenjianjia/i.test(sig)) return true;
     const row = f.row;
     if (!row || typeof row.querySelector !== 'function') return false;
     if (row.getAttribute('data-row-type') === 'folder' || row.getAttribute('data-is-folder') === '1') return true;
@@ -1347,7 +1354,12 @@
     try {
       const key = currentCacheKey();
       const allFiles = (await scanAllRowsByScroll(qa, doc, { key, useCache: true }) || []).filter(f => !isFolderFile(f));
-      if (!allFiles.length) return;
+      if (!allFiles.length) {
+        /* 只有文件夹/空目录：必须清掉旧进度，否则会一直显示上一次的 0 / 1 */
+        setShareFullCounts(qa, 0, 0);
+        log('★ 全量进度：0 / 0（目录内无文件，已排除文件夹）');
+        return;
+      }
       const savedInfos = healShareRecords(normalizeShareKey(location.href), allFiles);
       const savedCount = allFiles.filter(f => isFileSaved(f, savedInfos)).length;
       setShareFullCounts(qa, savedCount, allFiles.length);

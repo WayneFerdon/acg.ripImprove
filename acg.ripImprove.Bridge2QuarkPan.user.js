@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.21
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
+// @version 3.15.0
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；悬停面板里的 CD 统计可看正在 CD 的条目与下次尝试时间）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -4455,6 +4455,212 @@
     });
   }
 
+  /* ===== CD 明细悬浮提示：悬停插入的 UI（如“CD N”）时，列出正在 CD 的条目与下一次尝试时间 ===== */
+  const CD_TIP_ID = 'acgrip-quark-cd-tip';
+  const CD_TIP_MAX_ROWS = 12;
+  const CD_NAME_TTL = 10 * 1000;
+  let _cdTipAnchor = null;
+  let _cdTipTimer = null;
+  let _cdTipReposition = null;
+  let _cdNameCache = { at: 0, idx: null };
+
+  /* 与 runQuarkAutoTrigger 里的 CD 计算保持同一口径 */
+  function cdNextAtOf(st) {
+    const ts = Number(st && st.ts) || 0;
+    if (!ts) return 0;
+    const attempts = Math.max(0, Number(st && st.attempts) || 0);
+    return ts + Math.min(BASE_CD * Math.pow(2, attempts), MAX_CD);
+  }
+
+  function fmtRemain(ms) {
+    const sec = Math.max(0, Math.floor(ms / 1000));
+    const d = Math.floor(sec / 86400);
+    const h = Math.floor((sec % 86400) / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    if (d > 0) return `${d} 天 ${h} 小时`;
+    if (h > 0) return `${h} 小时 ${m} 分`;
+    if (m > 0) return `${m} 分 ${s} 秒`;
+    return `${s} 秒`;
+  }
+
+  function fmtClock(ts) {
+    const d = new Date(ts), now = new Date();
+    if (isNaN(d.getTime())) return '-';
+    const pad = n => String(n).padStart(2, '0');
+    const hm = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+    const dayStart = x => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+    const deltaDays = Math.round((dayStart(d) - dayStart(now)) / 86400000);
+    if (deltaDays === 0) return hm;
+    if (deltaDays === 1) return `明天 ${hm}`;
+    if (deltaDays === -1) return `昨天 ${hm}`;
+    return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${hm}`;
+  }
+
+  /* 分享链接 → { names, eps }，用来把 CD 里的 URL 还原成条目名
+   * （CD 的 key 带 #hash，比对前统一走 normalizeShareKey 去掉 hash） */
+  function cdNameIndex() {
+    if (_cdNameCache.idx && Date.now() - _cdNameCache.at < CD_NAME_TTL) return _cdNameCache.idx;
+    const idx = new Map();
+    let bd = null;
+    try { bd = loadBangumiData(); } catch {}
+    for (const row of ((bd && Array.isArray(bd.rows)) ? bd.rows : [])) {
+      if (!row) continue;
+      let name = '';
+      try { name = getAcgDisplayName(row); } catch {}
+      const ep = Number(row['下集']) || 0;
+      for (const f of ['资源', '规则']) {
+        const raw = String(row[f] || '').trim();
+        if (!raw) continue;
+        let expanded = raw;
+        try { expanded = expandUrl(raw, row); } catch {}
+        const re = /pan\.quark\.cn\/s\/([a-zA-Z0-9]+)/g;
+        let m;
+        while ((m = re.exec(expanded))) {
+          const key = `https://pan.quark.cn/s/${m[1]}`;
+          let e = idx.get(key);
+          if (!e) { e = { names: new Set(), eps: new Set() }; idx.set(key, e); }
+          if (name) e.names.add(name);
+          if (ep > 0) e.eps.add(ep);
+        }
+      }
+    }
+    _cdNameCache = { at: Date.now(), idx };
+    return idx;
+  }
+
+  function collectCdEntries() {
+    const state = gmGet(GM_CD, {}) || {};
+    const now = Date.now();
+    const idx = cdNameIndex();
+    const out = [];
+    for (const url of Object.keys(state)) {
+      const st = state[url];
+      if (!st || typeof st !== 'object') continue;
+      const key = normalizeShareKey(url);
+      const meta = idx.get(key) || null;
+      const eps = meta ? [...meta.eps].sort((a, b) => a - b) : [];
+      const nextAt = cdNextAtOf(st);
+      out.push({
+        url,
+        key,
+        name: meta && meta.names.size ? [...meta.names].join(' / ') : '',
+        epText: !eps.length ? '' : (eps.length === 1 ? `第 ${eps[0]} 集` : `第 ${eps[0]}~${eps[eps.length - 1]} 集`),
+        attempts: Math.max(0, Number(st.attempts) || 0),
+        space: !!st.space,
+        nextAt,
+        remain: nextAt - now,
+      });
+    }
+    /* 正在 CD 的排前面，按“下次尝试时间”升序；已到期的排后面 */
+    out.sort((a, b) => {
+      const aa = a.remain > 0 ? 0 : 1, bb = b.remain > 0 ? 0 : 1;
+      if (aa !== bb) return aa - bb;
+      return a.nextAt - b.nextAt;
+    });
+    return out;
+  }
+
+  function ensureCdTip() {
+    let el = document.getElementById(CD_TIP_ID);
+    if (el && el.isConnected) return el;
+    el = document.createElement('div');
+    el.id = CD_TIP_ID;
+    el.style.cssText = 'position:fixed;z-index:100000;display:none;box-sizing:border-box;'
+      + 'max-width:min(560px,calc(100vw - 24px));padding:8px 10px;border-radius:6px;'
+      + 'background:#1e1e1e;color:#d4d4d4;border:1px solid #444;color-scheme:dark;'
+      + 'box-shadow:0 6px 18px rgba(0,0,0,.65);font-size:11pt;line-height:1.5;'
+      + 'font-family:inherit;text-align:left;pointer-events:none;';
+    document.body.appendChild(el);
+    return el;
+  }
+
+  function renderCdTip(el, entries) {
+    const now = Date.now();
+    const active = entries.filter(e => e.nextAt > now);
+    const expired = entries.length - active.length;
+    el.textContent = '';
+    const add = (text, css) => {
+      const d = document.createElement('div');
+      if (css) d.style.cssText = css;
+      d.textContent = text;
+      el.appendChild(d);
+      return d;
+    };
+    if (!entries.length) {
+      add('暂无 CD 记录', 'font-weight:bold;color:#e6e6e6;');
+      return;
+    }
+    add(`CD 进行中 ${active.length} 个 / 共 ${entries.length} 个`, 'font-weight:bold;color:#e6e6e6;margin-bottom:2px;');
+    for (const e of active.slice(0, CD_TIP_MAX_ROWS)) {
+      const title = e.name ? (e.epText ? `${e.name} · ${e.epText}` : e.name) : e.key;
+      add(title, 'margin-top:5px;color:#dcdcdc;word-break:break-all;');
+      const bits = [`下次尝试 ${fmtClock(e.nextAt)}（还剩 ${fmtRemain(e.nextAt - now)}）`];
+      if (e.attempts > 0) bits.push(`已尝试 ${e.attempts} 次`);
+      if (e.space) bits.push('空间不足，最多 30 分钟后再试');
+      add(bits.join(' · '), 'color:#9a9a9a;font-variant-numeric:tabular-nums;');
+    }
+    if (active.length > CD_TIP_MAX_ROWS) {
+      add(`… 另有 ${active.length - CD_TIP_MAX_ROWS} 个进行中未显示`, 'margin-top:5px;color:#7f7f7f;');
+    }
+    if (expired > 0) {
+      add(`另有 ${expired} 个已过 CD，下次自动触发会重新检查`, 'margin-top:6px;padding-top:5px;border-top:1px dashed #3a3a3a;color:#7f7f7f;');
+    }
+  }
+
+  function placeCdTip(el, anchor) {
+    const pad = 8;
+    const r = anchor.getBoundingClientRect();
+    const w = el.offsetWidth, h = el.offsetHeight;
+    let left = r.left;
+    if (left + w > window.innerWidth - pad) left = Math.max(pad, window.innerWidth - pad - w);
+    let top = r.bottom + 6;
+    if (top + h > window.innerHeight - pad) top = Math.max(pad, r.top - 6 - h);
+    el.style.left = `${Math.round(left)}px`;
+    el.style.top = `${Math.round(top)}px`;
+  }
+
+  function hideCdTip() {
+    _cdTipAnchor = null;
+    if (_cdTipTimer) { clearInterval(_cdTipTimer); _cdTipTimer = null; }
+    if (_cdTipReposition) {
+      window.removeEventListener('scroll', _cdTipReposition, true);
+      window.removeEventListener('resize', _cdTipReposition);
+      _cdTipReposition = null;
+    }
+    const el = document.getElementById(CD_TIP_ID);
+    if (el) el.style.display = 'none';
+  }
+
+  function showCdTip(anchor) {
+    if (!anchor) return;
+    _cdTipAnchor = anchor;
+    const paint = () => {
+      const a = _cdTipAnchor;
+      if (!a || !a.isConnected || !a.getClientRects().length) { hideCdTip(); return; }
+      const el = ensureCdTip();
+      el.style.display = 'block';
+      el.style.left = '0px';
+      el.style.top = '0px';
+      renderCdTip(el, collectCdEntries());
+      placeCdTip(el, a);
+    };
+    paint();
+    if (_cdTipTimer) clearInterval(_cdTipTimer);
+    _cdTipTimer = setInterval(paint, 1000);
+    /* 面板内部可滚动：滚动/缩放时立即跟随，不必等下一秒的定时刷新 */
+    if (!_cdTipReposition) {
+      _cdTipReposition = () => {
+        const a = _cdTipAnchor;
+        const el = document.getElementById(CD_TIP_ID);
+        if (!a || !el || el.style.display === 'none') return;
+        placeCdTip(el, a);
+      };
+      window.addEventListener('scroll', _cdTipReposition, true);
+      window.addEventListener('resize', _cdTipReposition);
+    }
+  }
+
   function injectQuarkSection(host) {
     const sec = document.createElement('div');
     sec.id = 'acgrip-quark-section';
@@ -4465,7 +4671,7 @@
  <button type="button" id="resetQuarkCdBtn">重置 CD</button>
  <button type="button" id="triggerQuarkBtn">立即转存</button>
  <button type="button" id="clearQuarkDebugBtn" title="清空全量重转 Debug，并删除值为 null 的通信残留键">清 Debug</button>
- <span class="hint" id="quarkCdInfo"></span>
+ <span class="hint" id="quarkCdInfo" style="cursor:help;border-bottom:1px dotted #666;"></span>
  <span class="hint" style="margin:2px 0 4px 0;display:block;">
  打开夸克个人页时使用的文件夹路径（留空则不自动触发）。
  </span>
@@ -4485,6 +4691,9 @@
       const dbg = loadFullResaveDebug().length;
       info.textContent = `CD ${Object.keys(state).length} | 已转存 ${Object.keys(recs).length} | 待处理 ${pendCount} | Debug ${dbg}`;
     }
+    /* 悬停“CD N”等统计时，弹出正在 CD 的条目与各自的下次尝试时间（每秒刷新倒计时） */
+    info.addEventListener('mouseenter', () => showCdTip(info));
+    info.addEventListener('mouseleave', hideCdTip);
     inp.addEventListener('input', () => { GM_setValue(GM_FOLDER, inp.value.trim()); refreshInfo(); });
     inp.addEventListener('blur', () => { inp.value = getFolderId().trim(); refreshInfo(); });
     sec.querySelector('#resetQuarkCdBtn').onclick = () => {
@@ -4553,13 +4762,14 @@
         alert('已发送清空请求。');
       });
       GM_registerMenuCommand('📊 查看状态', () => {
-        const state = gmGet(GM_CD, {}) || {};
         const recs = loadRecords({ consumeClear: false });
         const pend = gmGet(GM_PENDING_URLS, {}) || {};
         const auto = Number(GM_getValue(GM_AUTO_TRIGGER, 0) || 0);
+        const cdList = collectCdEntries();
+        const cdActive = cdList.filter(e => e.nextAt > Date.now()).length;
         alert(
           `转存记录：${Object.keys(recs).length} 条\n` +
-          `CD：${Object.keys(state).length} 个 URL\n` +
+          `CD：${cdList.length} 个 URL（进行中 ${cdActive}）\n` +
           `待处理清单：${Array.isArray(pend.urls) ? pend.urls.length : 0} 项\n` +
           `自动触发标记：${auto ? new Date(auto).toLocaleTimeString() : '无'}\n` +
           `全量重转 Debug：${loadFullResaveDebug().length} 条`
@@ -4571,7 +4781,7 @@
     setInterval(() => { try { sweepObsoleteRecords(); } catch (e) { warn('过期清理失败', e); } }, 6 * 60 * 60 * 1000);
     try {
       unsafeWindow.acgripQuarkBridge = {
-        version: '1.4.0',
+        version: '1.5.0',
         trigger: (opts = {}) => runQuarkAutoTrigger({ force: opts.force !== false }),
         status: () => {
           const state = gmGet(GM_CD, {}) || {};
@@ -4586,6 +4796,7 @@
         },
         fullResaveDebug: () => loadFullResaveDebug(),
         clearFullResaveDebug: () => clearFullResaveDebug(),
+        cdEntries: () => collectCdEntries(),
       };
     } catch (e) { warn('暴露 acgripQuarkBridge 失败', e); }
     log('已启动（acg.rip 端）');

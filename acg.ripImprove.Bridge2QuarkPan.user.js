@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.19
+// @version 3.14.20
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -4580,6 +4580,22 @@
     const autoTs = Number(GM_getValue(GM_AUTO_TRIGGER, 0) || 0);
     if (!(autoTs > 0)) return false;
     if ((Date.now() - autoTs) >= AUTO_TTL) { log('自动触发：标记已过期，跳过'); return false; }
+    /* ★ 只有"acg 触发之后才打开"的标签页才有资格消费这个标记。
+     * 自动触发标记是 GM 值，所有已打开的夸克个人页都在监听 GM 变更：
+     * 用户手动开着的个人页会先于 acg 新开的页面收到变更并抢着消费，
+     * 结果就是"不是 acg 打开的页面也在跑转存流程"。
+     * 用页面导航时间区分：老页面 timeOrigin < 触发时间，直接放行给新页面。 */
+    const navTs = (() => {
+      try {
+        if (performance && typeof performance.timeOrigin === 'number' && performance.timeOrigin > 0) return performance.timeOrigin;
+        if (performance && performance.timing && performance.timing.navigationStart) return performance.timing.navigationStart;
+      } catch {}
+      return 0;
+    })();
+    if (navTs > 0 && navTs < autoTs - 3000) {
+      log(`自动触发：本页在触发前 ${Math.round((autoTs - navTs) / 1000)}s 就已打开，不消费（留给 acg 打开的页面）`);
+      return false;
+    }
     _autoRunning = true;
     try {
       const ts2 = Number(GM_getValue(GM_AUTO_TRIGGER, 0) || 0);

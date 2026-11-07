@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.16.0
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”，悬停可看清单/已转存/CD 冷却条目与下次尝试时间）
+// @version 3.17.0
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -472,6 +472,11 @@
         if (prev.space || st.space) win = { ...win, space: 1 };
       }
       out[key] = { ...win };
+      /* 集数进度取两边的最大值，别在合并时把“已处理到哪一集”丢掉 */
+      const doneEp = Math.max(Number(prev.doneEp) || 0, Number(st.doneEp) || 0);
+      if (doneEp > 0) out[key].doneEp = doneEp;
+      const ep = Math.max(Number(prev.ep) || 0, Number(st.ep) || 0);
+      if (ep > 0) out[key].ep = ep;
     }
     if (changed) { try { gmSet(GM_CD, out); } catch {} }
     return out;
@@ -552,12 +557,16 @@
     return shouldIncludeRow(row);
   }
 
-  function collectShareUrls(bd, opts = {}) {
+  /* 带行上下文的分享目标：url + 归一化 key + 该行当前的“下集”集数。
+   * 集数用来判断“这一集是否已经处理过”，也是“没有下一集就停掉 CD”的依据。 */
+  function collectShareTargets(bd, opts = {}) {
     if (!bd || !Array.isArray(bd.rows)) return [];
     const include = opts.onlyAired ? shouldIncludeRowAired : shouldIncludeRow;
-    const urls = new Set();
+    const out = [];
+    const seen = new Set();
     for (const row of bd.rows) {
       if (!include(row)) continue;
+      const ep = Number(row['下集']) || 0;
       for (const f of ['资源', '规则']) {
         const raw = expandUrl(String(row[f] || '').trim(), row);
         const m = raw.match(/https?:\/\/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)([^\s]*)/);
@@ -565,10 +574,48 @@
         const shareId = m[1], suffix = m[2] || '';
         const hashIdx = suffix.indexOf('#');
         const hash = hashIdx >= 0 ? suffix.substring(hashIdx) : '';
-        urls.add(`https://pan.quark.cn/s/${shareId}${hash}`.replace(/\/$/, ''));
+        const url = `https://pan.quark.cn/s/${shareId}${hash}`.replace(/\/$/, '');
+        if (seen.has(url)) continue;
+        seen.add(url);
+        out.push({ url, key: normalizeShareKey(url), ep });
       }
     }
-    return [...urls];
+    return out;
+  }
+
+  function collectShareUrls(bd, opts = {}) {
+    return collectShareTargets(bd, opts).map(t => t.url);
+  }
+
+  /* 当前“有下一集要处理”的分享 key 集合；dataOk=false 表示清单不可用（不要据此删 CD） */
+  function activeShareKeySet(bd) {
+    const rows = (bd && Array.isArray(bd.rows)) ? bd.rows : null;
+    if (!rows || !rows.length) return { ok: false, keys: new Set() };
+    const keys = new Set(collectShareTargets(bd).map(t => t.key));
+    /* 手动“立即转存（已播出）”用的是更宽的口径（只看放送时间），这些条目也要保留 */
+    for (const t of collectShareTargets(bd, { onlyAired: true })) keys.add(t.key);
+    return { ok: true, keys };
+  }
+
+  /* 没有下一集（下一集还没播出/资源时间未到）或已移出清单 → 删掉它的 CD：
+   * 不再排下一轮，也不再出现在悬停明细里。等下一集到点后重新开始检查。 */
+  function pruneCdNotInTargets(bd) {
+    const rows = (bd && Array.isArray(bd.rows)) ? bd.rows : null;
+    if (!rows || !rows.length) return 0;   /* 清单不可用/为空：不动 CD，避免误删 */
+    const keep = activeShareKeySet(bd).keys;
+    const state = loadCdState();
+    let removed = 0;
+    for (const url of Object.keys(state)) {
+      const key = normalizeShareKey(url);
+      if (keep.has(key)) continue;
+      delete state[key];
+      removed++;
+    }
+    if (removed) {
+      gmSet(GM_CD, state);
+      log(`🧹 CD 清理：${removed} 条已无下一集或已移出清单`);
+    }
+    return removed;
   }
 
   /* ===== 转存记录 ===== */
@@ -3112,30 +3159,52 @@
   /* 根据单次结果回写 CD 状态。
    *  - 空间不足：本轮**不算失败次数**（attempts 归零），下次最多 BASE_CD(30min) 后重试。
    *    否则 attempts 一直 +1，CD 会翻倍到 7 天，空间腾出来了也不会再试。
-   *  - 成功 / 部分成功：attempts 归零，按 BASE_CD 起算。
-   *  - 其它失败：保持指数退避，并清掉 space 标记。 */
+   *  - 成功 / 部分成功：attempts 归零，按 BASE_CD 起算，并记下已处理到哪一集（doneEp）。
+   *  - 其它失败：保持指数退避，并清掉 space 标记。
+   * ep/doneEp 用来算“有下一集待转”：doneEp < 表格里的下集 → 仍算待处理。 */
   function updateCdAfterResult(key, r) {
     if (!key || !r) return;
     key = normalizeShareKey(key);
     try {
       const st = loadCdState();
       const prev = st[key] || { ts: 0, attempts: 0 };
+      const attemptedEp = Number(prev.ep) || 0;
+      const keepEps = (obj) => {
+        if (attemptedEp > 0) obj.ep = attemptedEp;
+        const doneEp = Number(prev.doneEp) || 0;
+        if (doneEp > 0) obj.doneEp = doneEp;
+        return obj;
+      };
       const reasons = Array.isArray(r.failedReasons) ? r.failedReasons : [];
       if (reasons.includes('space')) {
-        st[key] = { ts: Date.now(), attempts: 0, space: 1 };
+        st[key] = keepEps({ ts: Date.now(), attempts: 0, space: 1 });
         gmSet(GM_CD, st);
         log(`⏳ 空间不足：${key} → 下次最多 ${Math.round(BASE_CD / 60000)} 分钟后重试（attempts 不累加）`);
         return;
       }
       if (r.kind === 'success' || r.kind === 'partial' || r.kind === 'all-saved') {
-        if (prev.attempts || prev.space) {
-          st[key] = { ts: Date.now(), attempts: 0 };
-          gmSet(GM_CD, st);
+        const next = keepEps({ ts: Date.now(), attempts: 0 });
+        const savedSome = Array.isArray(r.savedFiles)
+          ? r.savedFiles.length > 0
+          : (Number(r.saved) || 0) > 0;
+        /* all-saved 表示“没抓到新文件”：只有当这个分享本来就有记录时，才算这一集已处理完；
+         * 否则保留原 doneEp，让它在待处理里继续显示（分享页可能还没上传新集）。 */
+        if (attemptedEp > 0 && (r.kind !== 'all-saved' || savedSome || hasShareRecord(key))) {
+          next.doneEp = Math.max(attemptedEp, Number(prev.doneEp) || 0);
         }
+        st[key] = next;
+        gmSet(GM_CD, st);
         return;
       }
-      if (prev.space) { st[key] = { ts: prev.ts || Date.now(), attempts: prev.attempts || 0 }; gmSet(GM_CD, st); }
+      if (prev.space) { st[key] = keepEps({ ts: prev.ts || Date.now(), attempts: prev.attempts || 0 }); gmSet(GM_CD, st); }
     } catch (e) { warn('回写 CD 失败', e); }
+  }
+
+  function hasShareRecord(key) {
+    try {
+      const rec = (loadRecords({ consumeClear: false }) || {})[normalizeShareKey(key)];
+      return !!(rec && Array.isArray(rec.fileInfos) && rec.fileInfos.length);
+    } catch { return false; }
   }
 
   function describeExec(exec) {
@@ -3906,10 +3975,14 @@
           }
         } else if (r.kind === 'all-saved') {
           log(`⏭️ 该 URL 所有文件都已转存：${url}`);
-          /* all-saved：重置 CD 避免下次触发被拖长 */
+          /* all-saved：重置 CD 避免下次触发被拖长（保留 ep/doneEp，别把“已处理到哪一集”冲掉） */
           try {
             const st = loadCdState();
-            if (st[key]) { st[key] = { ts: Date.now(), attempts: 0 }; gmSet(GM_CD, st); }
+            if (st[key]) {
+              st[key] = { ...st[key], ts: Date.now(), attempts: 0 };
+              delete st[key].space;
+              gmSet(GM_CD, st);
+            }
           } catch {}
         } else if (r.kind === 'paused') {
           log(`⏸ 子任务因暂停直接关闭：${url}`);
@@ -4365,40 +4438,47 @@
     if (!folderId) return { triggered: false, reason: 'no-folder' };
     const bd = loadBangumiData();
     if (!bd || !Array.isArray(bd.rows)) return { triggered: false, reason: 'no-data' };
-    const urls = collectShareUrls(bd, { onlyAired });
-    if (!urls.length) return { triggered: false, reason: 'no-urls' };
+
+    /* 先按“有没有下一集”清理 CD：没有下一集（未播出/时间未到）或已移出清单的条目，
+     * 不该再排下一轮，也不该继续显示。等下一集到点后重新开始检查。 */
+    try { pruneCdNotInTargets(bd); } catch (e) { warn('清理 CD 失败', e); }
+
+    const targets = collectShareTargets(bd, { onlyAired });
+    if (!targets.length) return { triggered: false, reason: 'no-urls' };
     const state = loadCdState();
     const now = Date.now();
     const need = [];
     let skippedByCD = 0;
     /* CD 按 shareId 归属：带 `#/list/share/<guid>` 的链接与裸链接共用同一条记录，
-     * 否则同一条目会占 2 条 CD（且空间不足的 30 分钟重试会失效）。 */
-    for (const u of urls) {
-      const key = normalizeShareKey(u);
-      const s = state[key] || { ts: 0, attempts: 0 };
+     * 否则同一条目会占 2 条 CD（且空间不足的 30 分钟重试会失效）。
+     * 另外：表格里的“下集”变了（用户手动更新了集数）就不再等 CD，立即重新检查。 */
+    for (const t of targets) {
+      const s = state[t.key] || { ts: 0, attempts: 0 };
+      const epChanged = t.ep > 0 && Number(s.ep) > 0 && Number(s.ep) !== t.ep;
       const cd = Math.min(BASE_CD * Math.pow(2, s.attempts), MAX_CD);
-      if (!force && now - s.ts < cd) { skippedByCD++; continue; }
-      need.push(u);
+      if (!force && !epChanged && now - s.ts < cd) { skippedByCD++; continue; }
+      need.push(t);
     }
-    log(`触发${onlyAired ? '(已播出)' : ''}：CD 内跳过 ${skippedByCD}，待检查 ${need.length}（共 ${urls.length} 个 URL）`);
-    if (!need.length) return { triggered: false, reason: 'all-cd', total: urls.length };
+    log(`触发${onlyAired ? '(已播出)' : ''}：CD 内跳过 ${skippedByCD}，待检查 ${need.length}（共 ${targets.length} 个 URL）`);
+    if (!need.length) return { triggered: false, reason: 'all-cd', total: targets.length };
     const touched = new Set();
-    for (const u of need) {
-      const key = normalizeShareKey(u);
-      const s = state[key] || { ts: 0, attempts: 0 };
-      if (!touched.has(key)) {
+    for (const t of need) {
+      const s = state[t.key] || { ts: 0, attempts: 0 };
+      if (!touched.has(t.key)) {
+        if (t.ep > 0 && Number(s.ep) > 0 && Number(s.ep) !== t.ep) s.attempts = 0;
         s.ts = now;
         s.attempts = (Number(s.attempts) || 0) + 1;
-        touched.add(key);
+        if (t.ep > 0) s.ep = t.ep;
+        touched.add(t.key);
       }
-      state[key] = s;
+      state[t.key] = s;
     }
     gmSet(GM_CD, state);
-    gmSet(GM_PENDING_URLS, { ts: now, urls: need });
+    gmSet(GM_PENDING_URLS, { ts: now, urls: need.map(t => t.url) });
     GM_setValue(GM_AUTO_TRIGGER, now);
     const url = `https://pan.quark.cn/list#/list/all/${folderId}/`;
     GM_openInTab(url, { active: false, insert: true, setParent: true });
-    return { triggered: true, count: need.length, total: urls.length };
+    return { triggered: true, count: need.length, total: targets.length };
   }
 
   function watchEditPanel() {
@@ -4572,31 +4652,49 @@
     return idx;
   }
 
-  /* 统一“待处理”口径：清单里还没有转存记录（从未成功过）的条目数。
-   * 其它统计（清单总数 / 已转存 / CD 冷却 / 本次待触发 / Debug）只放在悬浮提示里。 */
-  function collectPendingStats() {
-    const listKeys = new Set();
-    let hasData = false;
-    try {
-      const bd = loadBangumiData();
-      if (bd && Array.isArray(bd.rows) && bd.rows.length) {
-        hasData = true;
-        for (const u of collectShareUrls(bd)) listKeys.add(normalizeShareKey(u));
-      }
-    } catch {}
-    const recs = loadRecords({ consumeClear: false });
-    let saved = 0;
-    for (const k of listKeys) {
-      if (recs[k] && Array.isArray(recs[k].fileInfos) && recs[k].fileInfos.length) saved++;
+  /* 统一“待处理”口径：当前**有下一集**（已播出/资源时间已到）且这一集还没处理成功的条目数。
+   *  - 有下一集：行通过 shouldIncludeRow；下一集还没播出 → 不算待处理，也不排 CD；
+   *  - 已处理：CD 里记的 doneEp 已覆盖表格里的“下集”（success/partial 由结果回写时记录）；
+   *  - 其它口径（CD 冷却 / 本次待触发 / Debug）只在悬浮提示里展开。 */
+  function isEpHandled(key, ep, state) {
+    if (ep > 0) {
+      const st = state && state[key];
+      const doneEp = st ? (Number(st.doneEp) || 0) : 0;
+      return doneEp >= ep;
     }
+    return hasShareRecord(key);
+  }
+
+  function collectPendingStats() {
+    const bd = loadBangumiData();
+    const rows = (bd && Array.isArray(bd.rows)) ? bd.rows : null;
     const pend = gmGet(GM_PENDING_URLS, {}) || {};
-    return {
-      hasData,
-      total: listKeys.size,
-      saved,
-      pending: Math.max(0, listKeys.size - saved),
+    const base = {
+      hasData: !!(rows && rows.length),
+      total: 0,
+      done: 0,
+      pending: 0,
       batch: Array.isArray(pend.urls) ? pend.urls.length : 0,
       debug: loadFullResaveDebug().length,
+    };
+    if (!base.hasData) return base;
+
+    /* 同一分享多行（不同集数）时取最大集数：doneEp 覆盖它才算处理完 */
+    const byKey = new Map();
+    for (const t of collectShareTargets(bd)) {
+      const prev = byKey.get(t.key);
+      if (!prev || t.ep > prev.ep) byKey.set(t.key, t);
+    }
+    const state = loadCdState();
+    let done = 0;
+    for (const [key, t] of byKey) {
+      if (isEpHandled(key, t.ep, state)) done++;
+    }
+    return {
+      ...base,
+      total: byKey.size,
+      done,
+      pending: Math.max(0, byKey.size - done),
     };
   }
 
@@ -4604,11 +4702,14 @@
     const state = loadCdState();
     const now = Date.now();
     const idx = cdNameIndex();
+    /* 没有下一集（未播出）或已移出清单的条目不再显示；等下一集到点后重新出现 */
+    const active = activeShareKeySet(loadBangumiData());
     const out = [];
     for (const url of Object.keys(state)) {
       const st = state[url];
       if (!st || typeof st !== 'object') continue;
       const key = normalizeShareKey(url);
+      if (active.ok && !active.keys.has(key)) continue;
       const meta = idx.get(key) || null;
       const eps = meta ? [...meta.eps].sort((a, b) => a - b) : [];
       const nextAt = cdNextAtOf(st);
@@ -4662,7 +4763,7 @@
     if (!stats || !stats.hasData) {
       add('待处理 —（清单数据不可用）', 'font-weight:bold;color:#e6e6e6;');
     } else {
-      add(`待处理 ${stats.pending} 条（清单 ${stats.total} · 已转存 ${stats.saved}）`, 'font-weight:bold;color:#e6e6e6;');
+      add(`待处理 ${stats.pending} 条（有下一集 ${stats.total} · 已处理 ${stats.done}）`, 'font-weight:bold;color:#e6e6e6;');
     }
     const sub = [`CD 冷却中 ${active.length} 条`];
     if (stats && stats.batch > 0) sub.push(`本次待触发 ${stats.batch} 条`);
@@ -4764,14 +4865,20 @@
     const inp = sec.querySelector('#inpQuarkFolder');
     const info = sec.querySelector('#quarkCdInfo');
     function refreshInfo() {
-      /* 只留一个统一口径：待处理（清单里还没有转存记录的条目数）。
-       * CD / 已转存 / 本次待触发 / Debug 明细放到悬停提示里。 */
+      /* 只留一个统一口径：待处理（有下一集、但这一集还没处理成功的条目数）。
+       * CD / 已处理 / 本次待触发 / Debug 明细放到悬停提示里。 */
+      try { pruneCdNotInTargets(loadBangumiData()); } catch {}
       const st = collectPendingStats();
       info.textContent = st.hasData ? `待处理 ${st.pending}` : '待处理 —';
     }
-    /* 悬停“待处理”时展开其余口径：清单/已转存、CD 冷却条目与下次尝试时间（每秒刷新倒计时） */
+    /* 悬停“待处理”时展开其余口径：有下一集/已处理、CD 冷却条目与下次尝试时间（每秒刷新倒计时） */
     info.addEventListener('mouseenter', () => showCdTip(info));
     info.addEventListener('mouseleave', hideCdTip);
+    /* 转存结果由夸克端写 GM，acg 页收不到事件；面板开着时定期刷新一次，别让数字停在旧值 */
+    const infoTimer = setInterval(() => {
+      if (!info.isConnected) { clearInterval(infoTimer); return; }
+      refreshInfo();
+    }, 10000);
     inp.addEventListener('input', () => { GM_setValue(GM_FOLDER, inp.value.trim()); refreshInfo(); });
     inp.addEventListener('blur', () => { inp.value = getFolderId().trim(); refreshInfo(); });
     sec.querySelector('#resetQuarkCdBtn').onclick = () => {
@@ -4846,7 +4953,7 @@
         const cdList = collectCdEntries();
         const cdActive = cdList.filter(e => e.nextAt > Date.now()).length;
         alert(
-          `待处理：${st.hasData ? `${st.pending} 条（清单 ${st.total}，已转存 ${st.saved}）` : '清单数据不可用'}\n` +
+          `待处理：${st.hasData ? `${st.pending} 条（有下一集 ${st.total}，已处理 ${st.done}）` : '清单数据不可用'}\n` +
           `CD：${cdList.length} 个 URL（冷却中 ${cdActive}）\n` +
           `本次待触发：${st.batch} 项\n` +
           `转存记录：${Object.keys(recs).length} 条\n` +
@@ -4869,7 +4976,7 @@
           return {
             todo: stp.pending,
             list: stp.total,
-            savedInList: stp.saved,
+            doneInList: stp.done,
             cd: Object.keys(state).length,
             saved: Object.keys(recs).length,
             pending: stp.batch,

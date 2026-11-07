@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.4.1
+// @version      6.4.2
 // @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -720,12 +720,28 @@
     if (popup.querySelector('.swal2-icon.swal2-error, .swal2-icon.swal2-warning')) return null;
     const links = [...popup.querySelectorAll('.listener-link-api')];
     return links.map(a => {
-      const original = a.dataset.link || '';
-      const fixed = fixFilenamePlusInUrl(original);
-      if (fixed !== original) {
+      /* panlinker 各版本把直链放在不同位置：data-link / data-url / href / 文本。
+       * 旧实现只读 data-link，遇到没有该属性的版本会存下空 link，
+       * 后续按 URL path 匹配 FDM 异常任务就永远匹配不上。 */
+      const raw = (() => {
+        const cands = [
+          a.dataset && a.dataset.link,
+          a.dataset && a.dataset.url,
+          a.getAttribute && a.getAttribute('href'),
+          a.getAttribute && a.getAttribute('data-href'),
+          a.textContent,
+        ];
+        for (const c of cands) {
+          const s = String(c || '').trim();
+          if (/^https?:\/\//i.test(s)) return s;
+        }
+        return '';
+      })();
+      const fixed = fixFilenamePlusInUrl(raw);
+      if (fixed && fixed !== raw) {
         try { a.dataset.link = fixed; } catch {}
         try { a.setAttribute('data-link', fixed); } catch {}
-        if (a.getAttribute('href') === original) {
+        if (raw && a.getAttribute('href') === raw) {
           try { a.setAttribute('href', fixed); } catch {}
         }
       }
@@ -733,7 +749,7 @@
         el: a,
         fid: a.dataset.fid || '',
         filename: a.dataset.filename || '',
-        link: fixed,
+        link: fixed || raw || '',
       };
     });
   }
@@ -845,12 +861,25 @@
     try { return new URL(s, location.href).pathname || ''; } catch { return ''; }
   }
 
+  /* FDM 任务的显示名：title 经常是空的（刚入队/种子），
+   * 但 URL 里带着 `filename=` 参数，才是可靠的文件名来源 */
+  function fdmErrNameOf(it) {
+    if (!it) return '';
+    if (it.name) return String(it.name);
+    try {
+      const u = new URL(String(it.url || ''));
+      const f = u.searchParams.get('filename');
+      if (f) return String(f);
+    } catch {}
+    return '';
+  }
+
   /* 纯函数：把 /errors 的条目与下载记录做匹配（独立出来便于回放验证）
    * 规则：
    *   1) 记录有直链 → 用 URL path 精确匹配（同一文件 path 稳定，只有签名参数会变）
-   *   2) 记录没有直链（手动标记的旧记录）→ 退回按文件名匹配
-   *   3) **失败时间必须晚于记录创建时间**：更早的失败属于上一轮遗留，
-   *      拿它清当前记录会"每轮都重下"，412 之后尤其容易死循环
+   *   2) 记录没有直链（旧记录/panlinker 不给 data-link）→ 退回按文件名匹配，
+   *      但**只在该记录属于当前目录时**才算，避免跨目录同名误清
+   *   3) 失败时间必须晚于记录创建时间：更早的失败属于上一轮遗留
    *   4) opts.skip 里的 fid 直接忽略（重试次数已用尽） */
   function matchFdmErrors(items, recs, opts = {}) {
     const byPath = new Map();
@@ -858,21 +887,29 @@
     for (const it of items) {
       if (!it) continue;
       if (it.path) byPath.set(it.path, it);
-      if (it.name) byName.set(it.name, it);
+      const nm = fdmErrNameOf(it);
+      if (nm) byName.set(nm, it);
     }
     const skip = opts.skip instanceof Set ? opts.skip : null;
+    const scope = String(opts.scope || '');
     const hit = [];
     for (const [fid, rec] of Object.entries(recs || {})) {
       if (!rec || typeof rec !== 'object') continue;
       if (skip && skip.has(fid)) continue;
       const p = urlPathOf(rec.link || '');
       const nm = String(rec.name || '').trim();
-      const it = (p && byPath.get(p)) || (!p && nm ? byName.get(nm) : null);
+      let it = null;
+      if (p) it = byPath.get(p) || null;
+      if (!it && nm) {
+        /* 按名兜底只在本目录内成立：别的目录的同名文件不能拿来清 */
+        const sameScope = !scope || String(rec.scope || '') === scope;
+        if (sameScope) it = byName.get(nm) || null;
+      }
       if (!it) continue;
       const recTs = recordTs(rec);
       const failTs = Number(it.lastResultTime || 0) * 1000;
       if (recTs > 0 && failTs > 0 && failTs < recTs) continue;   /* 遗留的旧失败 */
-      hit.push({ fid, item: it, name: nm || String(it.name || '') });
+      hit.push({ fid, item: it, name: nm || fdmErrNameOf(it) });
     }
     return hit;
   }
@@ -895,7 +932,7 @@
     const items = Array.isArray(r.items) ? r.items : [];
     if (!items.length) return { ok: true, cleared: 0, errors: 0, fids: [] };
 
-    const hit = matchFdmErrors(items, loadDlRecords(), { skip: opts.skip });
+    const hit = matchFdmErrors(items, loadDlRecords(), { skip: opts.skip, scope: currentListScope() });
     if (!hit.length) {
       log(`♻️ FDM 异常任务 ${items.length} 个，但当前下载记录里没有需要重下的匹配项`);
       return { ok: true, cleared: 0, errors: items.length, fids: [] };
@@ -911,17 +948,26 @@
   /* ===== FDM 失败看门狗 =====
    * FDM 报 HttpError（典型：直链 412 过期）通常发生在页面"已经触发完、进入空闲"之后，
    * 没有任何东西会再跑一轮 autoDownloadWorkflow，于是永远不重下。
-   * 这里定时查一次异常任务，清掉对应记录并定向重下；每个 fid 每页最多重试 3 次防死循环。 */
-  const _errRetry = new Map();      /* fid -> 本页已重试次数 */
+   * 这里定时查一次异常任务，清掉对应记录并定向重下。
+   * 防死循环：同一 fid 每页最多 3 次，且两次之间至少间隔 10 分钟。 */
+  const _errRetry = new Map();      /* fid -> { n, at } */
   const ERR_RETRY_MAX = 3;
+  const ERR_RETRY_GAP_MS = 10 * 60 * 1000;
   let _errWatchBusy = false;
 
-  function errRetryCount(fid) { return _errRetry.get(fid) || 0; }
+  function errRetryState(fid) { return _errRetry.get(fid) || { n: 0, at: 0 }; }
+  function errRetryCount(fid) { return errRetryState(fid).n; }
+  function errRetryBlocked(fid) {
+    const s = errRetryState(fid);
+    if (s.n >= ERR_RETRY_MAX) return true;
+    return s.n > 0 && (Date.now() - s.at) < ERR_RETRY_GAP_MS;
+  }
 
   async function fdmErrorWatchdog() {
     if (_errWatchBusy) return { ok: false, reason: 'busy' };
     if (!isListPage() || !fdmAvailable()) return { ok: false, reason: 'no-api' };
-    if (document.hidden) return { ok: false, reason: 'hidden' };
+    /* 不看 document.hidden：acg 打开的页面本来就是后台标签页，
+     * 后台若直接跳过，这个看门狗在最需要它的场景里永远不会跑 */
     if (downloadRunning || _cleanupRunning) return { ok: false, reason: 'busy-local' };
     if (!isTransferTreeView()) return { ok: false, reason: 'not-transfer-dir' };
     if (isPaused()) return { ok: false, reason: 'paused' };
@@ -931,15 +977,15 @@
     }
 
     const skip = new Set();
-    for (const [fid, n] of _errRetry) if (n >= ERR_RETRY_MAX) skip.add(fid);
+    for (const [fid] of _errRetry) if (errRetryBlocked(fid)) skip.add(fid);
 
     _errWatchBusy = true;
     try {
       const r = await reconcileFdmErrors({ skip });
       if (!r.ok || !r.cleared) return r;
-      const fids = (r.fids || []).filter(f => errRetryCount(f) < ERR_RETRY_MAX);
+      const fids = (r.fids || []).filter(f => !errRetryBlocked(f));
       if (!fids.length) return Object.assign({}, r, { retried: 0 });
-      for (const f of fids) _errRetry.set(f, errRetryCount(f) + 1);
+      for (const f of fids) _errRetry.set(f, { n: errRetryCount(f) + 1, at: Date.now() });
       const maxRound = Math.max.apply(null, fids.map(errRetryCount));
       log(`♻️ 看门狗：${fids.length} 个文件因 FDM 失败需重下（本页第 ${maxRound} 次）`);
       setStatus('重新下载失败的文件...', 'running');
@@ -3109,7 +3155,7 @@
   unsafeWindow[GATE_KEY] = GATE;
 
   unsafeWindow.quarkAssistant = {
-    version: '6.4.1',
+    version: '6.4.2',
     isReady: () => true,
     isListPage, isSharePage,
     mountPanel, setStatus, setProgress, setActions,
@@ -3143,7 +3189,7 @@
       setProgressLabel('已下载');
       installListPageActions();
       setStatus(isPaused() ? '已暂停' : '待机（个人页）', isPaused() ? 'running' : '');
-      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.4.1`);
+      log(`平台层就绪（个人页${isPaused() ? '，暂停中' : ''}）v6.4.2`);
       runPersonalController();
       /* 后台补删：FDM 完成时机不受页面控制（可能在关页后、或下次打开时才完成），
        * 所以靠定时轮询把已完成的云端副本删掉，全程不阻塞界面 */
@@ -3154,9 +3200,9 @@
       setTimeout(() => { fdmErrorWatchdog().catch(() => {}); }, 15000);
       setInterval(() => { fdmErrorWatchdog().catch(() => {}); }, FDM_ERR_POLL_MS);
     } else if (isSharePage()) {
-      log('平台层就绪（分享页，等待桥接 mountPanel）v6.4.1');
+      log('平台层就绪（分享页，等待桥接 mountPanel）v6.4.2');
     } else {
-      log('平台层就绪（其他页）v6.4.1');
+      log('平台层就绪（其他页）v6.4.2');
     }
     startGrayPolling();
   })();

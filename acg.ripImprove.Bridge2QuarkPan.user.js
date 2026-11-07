@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.17.0
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间）
+// @version 3.17.1
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间；转存记录不再冗余 names，文件名清单由 fileInfos[].name 动态生成）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -619,6 +619,20 @@
   }
 
   /* ===== 转存记录 ===== */
+  /* 记录里只存 fileInfos（含 name），不再冗余 names 数组；
+   * 需要文件名清单时直接 rec.fileInfos.map(f => f.name) 动态生成。 */
+  let _recordsNamesMigrated = false;
+  function stripRecordNames(recs) {
+    let changed = false;
+    for (const k of Object.keys(recs || {})) {
+      const r = recs[k];
+      if (r && typeof r === 'object' && Object.prototype.hasOwnProperty.call(r, 'names')) {
+        delete r.names;
+        changed = true;
+      }
+    }
+    return changed;
+  }
   function loadRecords(opts = {}) {
     const consumeClear = opts.consumeClear !== false;
     const clearTs = Number(GM_getValue(GM_CLEAR_FLAG, 0) || 0);
@@ -628,7 +642,18 @@
       log(`★ 响应清空请求，转存记录已清空（ts=${clearTs}）`);
       return {};
     }
-    return gmGet(GM_RECORDS, {}) || {};
+    const recs = gmGet(GM_RECORDS, {}) || {};
+    /* 旧版本把文件名列表整份冗余进 names；首次读到就顺手删掉并回写，避免 GM 存两份 */
+    if (!_recordsNamesMigrated) {
+      _recordsNamesMigrated = true;
+      try {
+        if (stripRecordNames(recs)) {
+          saveRecords(recs);
+          log('🧹 转存记录已去掉冗余的 names 字段（改由 fileInfos[].name 动态生成）');
+        }
+      } catch (e) { warn('清理记录 names 失败', e); }
+    }
+    return recs;
   }
   function saveRecords(recs) { gmSet(GM_RECORDS, recs); }
 
@@ -650,7 +675,7 @@
       recs[key] = {
         ...prev, ts: Date.now(),
         shareId: extra.shareId || prev.shareId || extractShareId(key),
-        fileInfos: merged, names: merged.map(x => x.name),
+        fileInfos: merged,
       };
       saveRecords(recs);
       if (!wanted.length) return recs[key];
@@ -4308,7 +4333,7 @@
         }
         recs[url] = {
           ...prev, ts: Date.now(), shareId: extractShareId(url),
-          fileInfos: merged, names: merged.map(x => x.name),
+          fileInfos: merged,
         };
         saveRecords(recs);
         log(`✅ 已记录 ${merged.length} 条到 ${url}`);
@@ -4372,7 +4397,7 @@
     }
     recs[url] = {
       ...prev, ts: Date.now(), shareId: extractShareId(url),
-      fileInfos: merged, names: merged.map(x => x.name), manual: true,
+      fileInfos: merged, manual: true,
     };
     saveRecords(recs);
     refreshShareUI(qa);
@@ -4423,7 +4448,7 @@
       delete recs[url];
       alert(`🗑️ 已移除 ${hitCount} 个，记录已清空\n\n本次移除（${removedNames.length}）：${fmtNames(removedNames)}`);
     } else {
-      recs[url] = { ...rec, ts: Date.now(), fileInfos: keep, names: keep.map(x => x.name) };
+      recs[url] = { ...rec, ts: Date.now(), fileInfos: keep };
       alert(`🗑️ 已移除 ${hitCount} 个（剩余 ${keep.length} 条）\n\n本次移除（${removedNames.length}）：${fmtNames(removedNames)}`);
     }
     saveRecords(recs);

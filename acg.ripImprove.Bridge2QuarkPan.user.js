@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.14.20
+// @version 3.14.21
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -9,6 +9,8 @@
 // @updateURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
 // @grant GM_setValue
 // @grant GM_getValue
+// @grant GM_deleteValue
+// @grant GM_listValues
 // @grant GM_openInTab
 // @grant GM_registerMenuCommand
 // @grant GM_addValueChangeListener
@@ -197,6 +199,46 @@
     } catch { return def; }
   }
   function gmSet(key, val) { try { GM_setValue(key, val); } catch {} }
+  /* 真正的删除。旧代码用 GM_setValue(key, null) 当作"清空"，但 TM 只是把值写成 null，
+   * 键会一直留着 —— 这就是满屏 `acgrip_bridge_result_xxx: null` 的来源。 */
+  function gmDel(key) {
+    if (!key) return false;
+    try {
+      if (typeof GM_deleteValue === 'function') { GM_deleteValue(key); return true; }
+    } catch {}
+    try { GM_setValue(key, null); } catch {}
+    return false;
+  }
+
+  /* 清掉所有"值为 null"的通信键（结果/任务）。返回删除个数。
+   * 需要 GM_listValues；没有该权限时退回按索引清理。 */
+  function sweepEmptyCommKeys() {
+    let n = 0;
+    try {
+      if (typeof GM_listValues === 'function') {
+        for (const k of GM_listValues()) {
+          if (!k || (!k.startsWith(GM_RESULT_PREFIX) && !k.startsWith(GM_TASK_PREFIX))) continue;
+          let v;
+          try { v = GM_getValue(k, undefined); } catch { continue; }
+          if (v === null || v === undefined) { if (gmDel(k)) n++; }
+        }
+      }
+    } catch {}
+    if (!n) {
+      /* 没有 listValues 权限：只能按索引尽力清（索引里没记录的就清不到） */
+      try {
+        const idx = gmGet(GM_COMM_INDEX, {}) || {};
+        for (const sid of Object.keys(idx)) {
+          for (const p of [GM_RESULT_PREFIX, GM_TASK_PREFIX]) {
+            let v;
+            try { v = GM_getValue(p + sid, undefined); } catch { continue; }
+            if (v === null || v === undefined) { if (gmDel(p + sid)) n++; }
+          }
+        }
+      } catch {}
+    }
+    return n;
+  }
 
   /* ===== 跨标签页通信 ===== */
   function _pruneByTTL(m, ttl) {
@@ -232,14 +274,14 @@
     }
     /* 没有任务就不要写存储：轮询已改为 0ms，无谓的写会被放大成每秒数百次 */
     if (!t) return null;
-    try { GM_setValue(GM_TASK_PREFIX + shareId, null); } catch {}
+    gmDel(GM_TASK_PREFIX + shareId);
     if (!(t.ts > 0)) return null;
     if (Date.now() - t.ts > TASK_TTL) return null;
     return t;
   }
   function clearTask(shareId) {
     if (!shareId) return;
-    try { GM_setValue(GM_TASK_PREFIX + shareId, null); } catch {}
+    gmDel(GM_TASK_PREFIX + shareId);
     const m = gmGet(GM_TASKS, {}) || {};
     if (m[shareId]) { delete m[shareId]; gmSet(GM_TASKS, m); }
   }
@@ -259,14 +301,14 @@
     }
     /* 没有结果就不要写存储：0ms 轮询下每次写 null 会被放大成每秒数百次 */
     if (!r) return null;
-    try { GM_setValue(GM_RESULT_PREFIX + shareId, null); } catch {}
+    gmDel(GM_RESULT_PREFIX + shareId);
     /* 上一轮遗留的陈旧结果不能当作本轮结果 */
     if (!(r.ts > 0) || Date.now() - r.ts > RESULT_STALE_MS) return null;
     return r;
   }
   function clearResult(shareId) {
     if (!shareId) return;
-    try { GM_setValue(GM_RESULT_PREFIX + shareId, null); } catch {}
+    gmDel(GM_RESULT_PREFIX + shareId);
     const m = gmGet(GM_RESULTS, {}) || {};
     if (m[shareId]) { delete m[shareId]; gmSet(GM_RESULTS, m); }
   }
@@ -284,12 +326,16 @@
       if (now - (idx[sid] || 0) <= keep) continue;
       delete idx[sid];
       changed = true;
-      try {
-        GM_setValue(GM_TASK_PREFIX + sid, null);
-        GM_setValue(GM_RESULT_PREFIX + sid, null);
-      } catch {}
+      gmDel(GM_TASK_PREFIX + sid);
+      gmDel(GM_RESULT_PREFIX + sid);
     }
     if (changed) gmSet(GM_COMM_INDEX, idx);
+    /* 历史遗留：旧版把"清空"写成 GM_setValue(key, null)，留下大量 `...result_xxx: null`
+     * 之类的空键。这里顺手真删一次（有 GM_listValues 才能扫全）。 */
+    try {
+      const swept = sweepEmptyCommKeys();
+      if (swept > 0) log(`🧹 已清理 ${swept} 个空通信键`);
+    } catch {}
   }
 
   function getFolderId() {
@@ -3031,6 +3077,34 @@
     return { ok: true, kind: 'done', savedFiles, batchResults, result: overall, details: [] };
   }
 
+  /* 根据单次结果回写 CD 状态。
+   *  - 空间不足：本轮**不算失败次数**（attempts 归零），下次最多 BASE_CD(30min) 后重试。
+   *    否则 attempts 一直 +1，CD 会翻倍到 7 天，空间腾出来了也不会再试。
+   *  - 成功 / 部分成功：attempts 归零，按 BASE_CD 起算。
+   *  - 其它失败：保持指数退避，并清掉 space 标记。 */
+  function updateCdAfterResult(key, r) {
+    if (!key || !r) return;
+    try {
+      const st = gmGet(GM_CD, {}) || {};
+      const prev = st[key] || { ts: 0, attempts: 0 };
+      const reasons = Array.isArray(r.failedReasons) ? r.failedReasons : [];
+      if (reasons.includes('space')) {
+        st[key] = { ts: Date.now(), attempts: 0, space: 1 };
+        gmSet(GM_CD, st);
+        log(`⏳ 空间不足：${key} → 下次最多 ${Math.round(BASE_CD / 60000)} 分钟后重试（attempts 不累加）`);
+        return;
+      }
+      if (r.kind === 'success' || r.kind === 'partial' || r.kind === 'all-saved') {
+        if (prev.attempts || prev.space) {
+          st[key] = { ts: Date.now(), attempts: 0 };
+          gmSet(GM_CD, st);
+        }
+        return;
+      }
+      if (prev.space) { st[key] = { ts: prev.ts || Date.now(), attempts: prev.attempts || 0 }; gmSet(GM_CD, st); }
+    } catch (e) { warn('回写 CD 失败', e); }
+  }
+
   function describeExec(exec) {
     const saved = (exec.savedFiles || []).length;
     const batches = exec.batchResults || [];
@@ -3779,6 +3853,8 @@
         log(`--- [${i + 1}/${jobs.length}] ${url} → ${r.kind}`);
 
         const key = normalizeShareKey(url);
+        /* 回写 CD：空间不足不累加 attempts，最多 30 分钟后再试 */
+        updateCdAfterResult(key, r);
         if (r.kind === 'success' || r.kind === 'partial') {
           if (r.kind === 'success') successCount++;
           else partialCount++;
@@ -4388,6 +4464,7 @@
  <label><strong>夸克网盘</strong></label>：
  <button type="button" id="resetQuarkCdBtn">重置 CD</button>
  <button type="button" id="triggerQuarkBtn">立即转存</button>
+ <button type="button" id="clearQuarkDebugBtn" title="清空全量重转 Debug，并删除值为 null 的通信残留键">清 Debug</button>
  <span class="hint" id="quarkCdInfo"></span>
  <span class="hint" style="margin:2px 0 4px 0;display:block;">
  打开夸克个人页时使用的文件夹路径（留空则不自动触发）。
@@ -4405,7 +4482,8 @@
       const recs = loadRecords({ consumeClear: false });
       const pend = gmGet(GM_PENDING_URLS, {}) || {};
       const pendCount = Array.isArray(pend.urls) ? pend.urls.length : 0;
-      info.textContent = `CD ${Object.keys(state).length} | 已转存 ${Object.keys(recs).length} | 待处理 ${pendCount}`;
+      const dbg = loadFullResaveDebug().length;
+      info.textContent = `CD ${Object.keys(state).length} | 已转存 ${Object.keys(recs).length} | 待处理 ${pendCount} | Debug ${dbg}`;
     }
     inp.addEventListener('input', () => { GM_setValue(GM_FOLDER, inp.value.trim()); refreshInfo(); });
     inp.addEventListener('blur', () => { inp.value = getFolderId().trim(); refreshInfo(); });
@@ -4417,6 +4495,14 @@
       const r = runQuarkAutoTrigger({ force: true });
       alert(r.triggered ? `已打开夸克处理 ${r.count} 个链接` : `未触发：${r.reason}`);
       refreshInfo();
+    };
+    sec.querySelector('#clearQuarkDebugBtn').onclick = () => {
+      const dbg = loadFullResaveDebug().length;
+      if (!confirm(`清理调试数据？\n\n全量重转 Debug：${dbg} 条\n以及所有值为 null 的通信残留键`)) return;
+      clearFullResaveDebug();
+      const n = sweepEmptyCommKeys();
+      refreshInfo();
+      alert(`已清理：全量重转 Debug ${dbg} 条，空通信键 ${n} 个`);
     };
     refreshInfo();
     try { injectTriggerQuarkButton(); } catch {}
@@ -4447,6 +4533,8 @@
   }
 
   async function initAcgRipSide() {
+    /* 顺手做一次通信残留清理（含值为 null 的历史空键），不必等打开夸克页 */
+    try { cleanupBridgeComm(); } catch {}
     if (location.href.replace('page/1', '').endsWith('.rip/')) {
       setTimeout(() => { try { runQuarkAutoTrigger(); } catch (e) { warn(e); } }, 5000);
     }

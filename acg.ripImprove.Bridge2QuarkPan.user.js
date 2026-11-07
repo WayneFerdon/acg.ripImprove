@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.15.0
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；悬停面板里的 CD 统计可看正在 CD 的条目与下次尝试时间）
+// @version 3.15.1
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；悬停面板里的 CD 统计可看正在 CD 的条目与下次尝试时间；CD 状态按 shareId 去重）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -444,6 +444,38 @@
     return m ? m[1] : '';
   }
   function currentCacheKey() { return extractShareId(location.href) || 'default'; }
+
+  /* CD 状态统一按 shareId 存：同一分享的 `#/list/share/<guid>` 与裸链接必须是同一条。
+   * 否则会出现两条记录（触发时写带 hash 的键、结果回写写不带 hash 的键），
+   * 且“空间不足 30 分钟后再试”会失效——触发时查的是另一条。
+   * 历史数据里两种键都写过，读取时合并（以 ts 较新的那条为准）并回写。 */
+  function loadCdState() {
+    const raw = gmGet(GM_CD, {}) || {};
+    const out = {};
+    let changed = false;
+    for (const url of Object.keys(raw)) {
+      const st = raw[url];
+      if (!st || typeof st !== 'object') { changed = true; continue; }
+      const key = normalizeShareKey(url);
+      if (key !== url) changed = true;
+      const prev = out[key];
+      if (!prev) { out[key] = { ...st }; continue; }
+      changed = true;
+      const prevTs = Number(prev.ts) || 0;
+      const curTs = Number(st.ts) || 0;
+      let win;
+      if (curTs > prevTs) win = st;
+      else if (curTs < prevTs) win = prev;
+      else {
+        const takeCur = (Number(st.attempts) || 0) > (Number(prev.attempts) || 0);
+        win = takeCur ? st : prev;
+        if (prev.space || st.space) win = { ...win, space: 1 };
+      }
+      out[key] = { ...win };
+    }
+    if (changed) { try { gmSet(GM_CD, out); } catch {} }
+    return out;
+  }
 
   /* ===== bangumiData ===== */
   function loadBangumiData() {
@@ -3084,8 +3116,9 @@
    *  - 其它失败：保持指数退避，并清掉 space 标记。 */
   function updateCdAfterResult(key, r) {
     if (!key || !r) return;
+    key = normalizeShareKey(key);
     try {
-      const st = gmGet(GM_CD, {}) || {};
+      const st = loadCdState();
       const prev = st[key] || { ts: 0, attempts: 0 };
       const reasons = Array.isArray(r.failedReasons) ? r.failedReasons : [];
       if (reasons.includes('space')) {
@@ -3875,7 +3908,7 @@
           log(`⏭️ 该 URL 所有文件都已转存：${url}`);
           /* all-saved：重置 CD 避免下次触发被拖长 */
           try {
-            const st = gmGet(GM_CD, {}) || {};
+            const st = loadCdState();
             if (st[key]) { st[key] = { ts: Date.now(), attempts: 0 }; gmSet(GM_CD, st); }
           } catch {}
         } else if (r.kind === 'paused') {
@@ -4334,21 +4367,31 @@
     if (!bd || !Array.isArray(bd.rows)) return { triggered: false, reason: 'no-data' };
     const urls = collectShareUrls(bd, { onlyAired });
     if (!urls.length) return { triggered: false, reason: 'no-urls' };
-    const state = gmGet(GM_CD, {}) || {};
+    const state = loadCdState();
     const now = Date.now();
     const need = [];
     let skippedByCD = 0;
+    /* CD 按 shareId 归属：带 `#/list/share/<guid>` 的链接与裸链接共用同一条记录，
+     * 否则同一条目会占 2 条 CD（且空间不足的 30 分钟重试会失效）。 */
     for (const u of urls) {
-      const s = state[u] || { ts: 0, attempts: 0 };
+      const key = normalizeShareKey(u);
+      const s = state[key] || { ts: 0, attempts: 0 };
       const cd = Math.min(BASE_CD * Math.pow(2, s.attempts), MAX_CD);
       if (!force && now - s.ts < cd) { skippedByCD++; continue; }
       need.push(u);
     }
     log(`触发${onlyAired ? '(已播出)' : ''}：CD 内跳过 ${skippedByCD}，待检查 ${need.length}（共 ${urls.length} 个 URL）`);
     if (!need.length) return { triggered: false, reason: 'all-cd', total: urls.length };
+    const touched = new Set();
     for (const u of need) {
-      const s = state[u] || { ts: 0, attempts: 0 };
-      s.ts = now; s.attempts += 1; state[u] = s;
+      const key = normalizeShareKey(u);
+      const s = state[key] || { ts: 0, attempts: 0 };
+      if (!touched.has(key)) {
+        s.ts = now;
+        s.attempts = (Number(s.attempts) || 0) + 1;
+        touched.add(key);
+      }
+      state[key] = s;
     }
     gmSet(GM_CD, state);
     gmSet(GM_PENDING_URLS, { ts: now, urls: need });
@@ -4530,7 +4573,7 @@
   }
 
   function collectCdEntries() {
-    const state = gmGet(GM_CD, {}) || {};
+    const state = loadCdState();
     const now = Date.now();
     const idx = cdNameIndex();
     const out = [];
@@ -4597,7 +4640,7 @@
       add(title, 'margin-top:5px;color:#dcdcdc;word-break:break-all;');
       const bits = [`下次尝试 ${fmtClock(e.nextAt)}（还剩 ${fmtRemain(e.nextAt - now)}）`];
       if (e.attempts > 0) bits.push(`已尝试 ${e.attempts} 次`);
-      if (e.space) bits.push('空间不足，最多 30 分钟后再试');
+      if (e.space) bits.push('上次因空间不足失败');
       add(bits.join(' · '), 'color:#9a9a9a;font-variant-numeric:tabular-nums;');
     }
     if (active.length > CD_TIP_MAX_ROWS) {
@@ -4684,7 +4727,7 @@
     const inp = sec.querySelector('#inpQuarkFolder');
     const info = sec.querySelector('#quarkCdInfo');
     function refreshInfo() {
-      const state = gmGet(GM_CD, {}) || {};
+      const state = loadCdState();
       const recs = loadRecords({ consumeClear: false });
       const pend = gmGet(GM_PENDING_URLS, {}) || {};
       const pendCount = Array.isArray(pend.urls) ? pend.urls.length : 0;
@@ -4784,7 +4827,7 @@
         version: '1.5.0',
         trigger: (opts = {}) => runQuarkAutoTrigger({ force: opts.force !== false }),
         status: () => {
-          const state = gmGet(GM_CD, {}) || {};
+          const state = loadCdState();
           const recs = loadRecords({ consumeClear: false });
           const pend = gmGet(GM_PENDING_URLS, {}) || {};
           return {

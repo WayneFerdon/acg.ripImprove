@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.15.1
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；悬停面板里的 CD 统计可看正在 CD 的条目与下次尝试时间；CD 状态按 shareId 去重）
+// @version 3.16.0
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”，悬停可看清单/已转存/CD 冷却条目与下次尝试时间）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -4572,6 +4572,34 @@
     return idx;
   }
 
+  /* 统一“待处理”口径：清单里还没有转存记录（从未成功过）的条目数。
+   * 其它统计（清单总数 / 已转存 / CD 冷却 / 本次待触发 / Debug）只放在悬浮提示里。 */
+  function collectPendingStats() {
+    const listKeys = new Set();
+    let hasData = false;
+    try {
+      const bd = loadBangumiData();
+      if (bd && Array.isArray(bd.rows) && bd.rows.length) {
+        hasData = true;
+        for (const u of collectShareUrls(bd)) listKeys.add(normalizeShareKey(u));
+      }
+    } catch {}
+    const recs = loadRecords({ consumeClear: false });
+    let saved = 0;
+    for (const k of listKeys) {
+      if (recs[k] && Array.isArray(recs[k].fileInfos) && recs[k].fileInfos.length) saved++;
+    }
+    const pend = gmGet(GM_PENDING_URLS, {}) || {};
+    return {
+      hasData,
+      total: listKeys.size,
+      saved,
+      pending: Math.max(0, listKeys.size - saved),
+      batch: Array.isArray(pend.urls) ? pend.urls.length : 0,
+      debug: loadFullResaveDebug().length,
+    };
+  }
+
   function collectCdEntries() {
     const state = loadCdState();
     const now = Date.now();
@@ -4618,7 +4646,7 @@
     return el;
   }
 
-  function renderCdTip(el, entries) {
+  function renderCdTip(el, entries, stats) {
     const now = Date.now();
     const active = entries.filter(e => e.nextAt > now);
     const expired = entries.length - active.length;
@@ -4630,11 +4658,20 @@
       el.appendChild(d);
       return d;
     };
-    if (!entries.length) {
-      add('暂无 CD 记录', 'font-weight:bold;color:#e6e6e6;');
-      return;
+    /* 面板上只显示统一的“待处理”，其余口径都在这里展开 */
+    if (!stats || !stats.hasData) {
+      add('待处理 —（清单数据不可用）', 'font-weight:bold;color:#e6e6e6;');
+    } else {
+      add(`待处理 ${stats.pending} 条（清单 ${stats.total} · 已转存 ${stats.saved}）`, 'font-weight:bold;color:#e6e6e6;');
     }
-    add(`CD 进行中 ${active.length} 个 / 共 ${entries.length} 个`, 'font-weight:bold;color:#e6e6e6;margin-bottom:2px;');
+    const sub = [`CD 冷却中 ${active.length} 条`];
+    if (stats && stats.batch > 0) sub.push(`本次待触发 ${stats.batch} 条`);
+    if (stats && stats.debug > 0) sub.push(`Debug ${stats.debug} 条`);
+    add(sub.join(' · '), 'color:#9a9a9a;font-variant-numeric:tabular-nums;');
+
+    if (!active.length) {
+      add(entries.length ? '当前没有处于 CD 的条目' : '暂无 CD 记录', 'margin-top:5px;color:#dcdcdc;');
+    }
     for (const e of active.slice(0, CD_TIP_MAX_ROWS)) {
       const title = e.name ? (e.epText ? `${e.name} · ${e.epText}` : e.name) : e.key;
       add(title, 'margin-top:5px;color:#dcdcdc;word-break:break-all;');
@@ -4644,7 +4681,7 @@
       add(bits.join(' · '), 'color:#9a9a9a;font-variant-numeric:tabular-nums;');
     }
     if (active.length > CD_TIP_MAX_ROWS) {
-      add(`… 另有 ${active.length - CD_TIP_MAX_ROWS} 个进行中未显示`, 'margin-top:5px;color:#7f7f7f;');
+      add(`… 另有 ${active.length - CD_TIP_MAX_ROWS} 个冷却中未显示`, 'margin-top:5px;color:#7f7f7f;');
     }
     if (expired > 0) {
       add(`另有 ${expired} 个已过 CD，下次自动触发会重新检查`, 'margin-top:6px;padding-top:5px;border-top:1px dashed #3a3a3a;color:#7f7f7f;');
@@ -4685,7 +4722,7 @@
       el.style.display = 'block';
       el.style.left = '0px';
       el.style.top = '0px';
-      renderCdTip(el, collectCdEntries());
+      renderCdTip(el, collectCdEntries(), collectPendingStats());
       placeCdTip(el, a);
     };
     paint();
@@ -4727,14 +4764,12 @@
     const inp = sec.querySelector('#inpQuarkFolder');
     const info = sec.querySelector('#quarkCdInfo');
     function refreshInfo() {
-      const state = loadCdState();
-      const recs = loadRecords({ consumeClear: false });
-      const pend = gmGet(GM_PENDING_URLS, {}) || {};
-      const pendCount = Array.isArray(pend.urls) ? pend.urls.length : 0;
-      const dbg = loadFullResaveDebug().length;
-      info.textContent = `CD ${Object.keys(state).length} | 已转存 ${Object.keys(recs).length} | 待处理 ${pendCount} | Debug ${dbg}`;
+      /* 只留一个统一口径：待处理（清单里还没有转存记录的条目数）。
+       * CD / 已转存 / 本次待触发 / Debug 明细放到悬停提示里。 */
+      const st = collectPendingStats();
+      info.textContent = st.hasData ? `待处理 ${st.pending}` : '待处理 —';
     }
-    /* 悬停“CD N”等统计时，弹出正在 CD 的条目与各自的下次尝试时间（每秒刷新倒计时） */
+    /* 悬停“待处理”时展开其余口径：清单/已转存、CD 冷却条目与下次尝试时间（每秒刷新倒计时） */
     info.addEventListener('mouseenter', () => showCdTip(info));
     info.addEventListener('mouseleave', hideCdTip);
     inp.addEventListener('input', () => { GM_setValue(GM_FOLDER, inp.value.trim()); refreshInfo(); });
@@ -4805,17 +4840,18 @@
         alert('已发送清空请求。');
       });
       GM_registerMenuCommand('📊 查看状态', () => {
+        const st = collectPendingStats();
         const recs = loadRecords({ consumeClear: false });
-        const pend = gmGet(GM_PENDING_URLS, {}) || {};
         const auto = Number(GM_getValue(GM_AUTO_TRIGGER, 0) || 0);
         const cdList = collectCdEntries();
         const cdActive = cdList.filter(e => e.nextAt > Date.now()).length;
         alert(
+          `待处理：${st.hasData ? `${st.pending} 条（清单 ${st.total}，已转存 ${st.saved}）` : '清单数据不可用'}\n` +
+          `CD：${cdList.length} 个 URL（冷却中 ${cdActive}）\n` +
+          `本次待触发：${st.batch} 项\n` +
           `转存记录：${Object.keys(recs).length} 条\n` +
-          `CD：${cdList.length} 个 URL（进行中 ${cdActive}）\n` +
-          `待处理清单：${Array.isArray(pend.urls) ? pend.urls.length : 0} 项\n` +
           `自动触发标记：${auto ? new Date(auto).toLocaleTimeString() : '无'}\n` +
-          `全量重转 Debug：${loadFullResaveDebug().length} 条`
+          `全量重转 Debug：${st.debug} 条`
         );
       });
     } catch {}
@@ -4829,12 +4865,15 @@
         status: () => {
           const state = loadCdState();
           const recs = loadRecords({ consumeClear: false });
-          const pend = gmGet(GM_PENDING_URLS, {}) || {};
+          const stp = collectPendingStats();
           return {
+            todo: stp.pending,
+            list: stp.total,
+            savedInList: stp.saved,
             cd: Object.keys(state).length,
             saved: Object.keys(recs).length,
-            pending: Array.isArray(pend.urls) ? pend.urls.length : 0,
-            fullResaveDebug: loadFullResaveDebug().length,
+            pending: stp.batch,
+            fullResaveDebug: stp.debug,
           };
         },
         fullResaveDebug: () => loadFullResaveDebug(),

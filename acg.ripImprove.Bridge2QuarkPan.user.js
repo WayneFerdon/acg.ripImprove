@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.17.1
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间；转存记录不再冗余 names，文件名清单由 fileInfos[].name 动态生成）
+// @version 3.18.0
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间；转存记录以 shareId 为 key（不带 URL 前缀）且不再冗余 names/shareId 字段）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -443,6 +443,12 @@
     const m = String(url || '').match(/\/s\/([a-zA-Z0-9]+)/);
     return m ? m[1] : '';
   }
+  /* 转存记录以 shareId 直接作 key（不再带 https://pan.quark.cn/s/ 前缀，也不存 shareId 字段）。
+   * 传完整 URL / 带 hash 的 URL / 裸 shareId 都能落到同一个 key。 */
+  function recordKey(url) {
+    const id = extractShareId(url);
+    return id || normalizeShareKey(url);
+  }
   function currentCacheKey() { return extractShareId(location.href) || 'default'; }
 
   /* CD 状态统一按 shareId 存：同一分享的 `#/list/share/<guid>` 与裸链接必须是同一条。
@@ -619,19 +625,43 @@
   }
 
   /* ===== 转存记录 ===== */
-  /* 记录里只存 fileInfos（含 name），不再冗余 names 数组；
-   * 需要文件名清单时直接 rec.fileInfos.map(f => f.name) 动态生成。 */
-  let _recordsNamesMigrated = false;
-  function stripRecordNames(recs) {
+  /* 记录结构：{ [shareId]: { ts, fileInfos, manual?, obsoleteAt? } }
+   *  - key 直接用 shareId，不再带 https://pan.quark.cn/s/ 前缀；
+   *  - 不再冗余 names（由 fileInfos[].name 动态生成）与 shareId（就是 key 本身）。 */
+  let _recordsMigrated = false;
+  function migrateRecords(recs) {
     let changed = false;
+    const out = {};
     for (const k of Object.keys(recs || {})) {
       const r = recs[k];
-      if (r && typeof r === 'object' && Object.prototype.hasOwnProperty.call(r, 'names')) {
-        delete r.names;
+      if (!r || typeof r !== 'object') { changed = true; continue; }
+      try {
+        if (Object.prototype.hasOwnProperty.call(r, 'names')) { delete r.names; changed = true; }
+        if (Object.prototype.hasOwnProperty.call(r, 'shareId')) { delete r.shareId; changed = true; }
+        const nk = recordKey(k);
+        if (nk !== k) changed = true;
+        const prev = out[nk];
+        if (!prev) { out[nk] = r; continue; }
+        /* 同一分享的旧 URL 键与新 shareId 键并存：取较新的元数据，文件列表取并集 */
+        changed = true;
+        const newer = (Number(r.ts) || 0) >= (Number(prev.ts) || 0) ? r : prev;
+        const older = newer === r ? prev : r;
+        const merged = Array.isArray(newer.fileInfos) ? newer.fileInfos.slice() : [];
+        const seen = new Set(merged.map(fi => normalizeFileName(fi && fi.name)));
+        for (const f of (Array.isArray(older.fileInfos) ? older.fileInfos : [])) {
+          const nkf = normalizeFileName(f && f.name);
+          if (!nkf || seen.has(nkf)) continue;
+          seen.add(nkf);
+          merged.push({ ...f });
+        }
+        out[nk] = { ...newer, fileInfos: merged };
+      } catch (e) {
+        /* 单条异常就原样保留，别因为一条脏数据把整表迁移搞崩 */
+        out[k] = r;
         changed = true;
       }
     }
-    return changed;
+    return { recs: out, changed };
   }
   function loadRecords(opts = {}) {
     const consumeClear = opts.consumeClear !== false;
@@ -643,15 +673,17 @@
       return {};
     }
     const recs = gmGet(GM_RECORDS, {}) || {};
-    /* 旧版本把文件名列表整份冗余进 names；首次读到就顺手删掉并回写，避免 GM 存两份 */
-    if (!_recordsNamesMigrated) {
-      _recordsNamesMigrated = true;
+    /* 旧格式（URL 作 key、冗余 names/shareId）首次读到就迁移并回写，避免 GM 存冗余 */
+    if (!_recordsMigrated) {
+      _recordsMigrated = true;
       try {
-        if (stripRecordNames(recs)) {
-          saveRecords(recs);
-          log('🧹 转存记录已去掉冗余的 names 字段（改由 fileInfos[].name 动态生成）');
+        const mig = migrateRecords(recs);
+        if (mig.changed) {
+          saveRecords(mig.recs);
+          log('🧹 转存记录已迁移：key 改为 shareId，去掉冗余 names/shareId 字段');
         }
-      } catch (e) { warn('清理记录 names 失败', e); }
+        return mig.recs;
+      } catch (e) { warn('迁移转存记录失败', e); }
     }
     return recs;
   }
@@ -659,8 +691,9 @@
 
   /* 并行转存时多个子标签页会同时改 GM_RECORDS（共享 map：后写的会覆盖先写的）。
    * 写完回读校验，发现本次写入被覆盖就重试，保证最终生效。 */
-  async function mergeShareRecord(key, files, extra = {}) {
+  async function mergeShareRecord(key, files) {
     if (!key) return null;
+    key = recordKey(key);
     const wanted = (files || []).map(f => normalizeFileName(f && f.name)).filter(Boolean);
     for (let attempt = 1; attempt <= 4; attempt++) {
       const recs = loadRecords();
@@ -674,7 +707,6 @@
       }
       recs[key] = {
         ...prev, ts: Date.now(),
-        shareId: extra.shareId || prev.shareId || extractShareId(key),
         fileInfos: merged,
       };
       saveRecords(recs);
@@ -694,11 +726,12 @@
   }
   function getShareFileInfos(shareKey) {
     const recs = loadRecords();
-    const r = shareKey ? recs[shareKey] : null;
+    const r = shareKey ? recs[recordKey(shareKey)] : null;
     return (r && Array.isArray(r.fileInfos)) ? r.fileInfos : [];
   }
 
   function healShareRecords(shareKey, files) {
+    shareKey = recordKey(shareKey);
     const recs = loadRecords();
     const rec = shareKey ? recs[shareKey] : null;
     if (!rec || !Array.isArray(rec.fileInfos)) return [];
@@ -866,12 +899,12 @@
       log('★ 过期清理：数据不可用，跳过');
       return { removed: 0, marked: 0, unmarked: 0 };
     }
-    const live = collectAllShareKeys(bd);
+    const live = new Set([...collectAllShareKeys(bd)].map(recordKey));
     if (!live.size) {
       log('★ 过期清理：清单无夸克链接，跳过');
       return { removed: 0, marked: 0, unmarked: 0 };
     }
-    const recs = gmGet(GM_RECORDS, {}) || {};
+    const recs = loadRecords({ consumeClear: false });
     const now = Date.now();
     const allKeys = Object.keys(recs);
     const recCount = allKeys.length;
@@ -884,8 +917,7 @@
     for (const key of allKeys) {
       const rec = recs[key];
       if (!rec || typeof rec !== 'object') continue;
-      const norm = normalizeShareKey(key);
-      if (live.has(norm)) {
+      if (live.has(recordKey(key))) {
         if (rec.obsoleteAt) { delete rec.obsoleteAt; unmarked++; }
       } else {
         if (!rec.obsoleteAt || typeof rec.obsoleteAt !== 'number') {
@@ -895,7 +927,7 @@
         }
       }
     }
-    if (marked || unmarked || removed) gmSet(GM_RECORDS, recs);
+    if (marked || unmarked || removed) saveRecords(recs);
     log(`★ 过期清理：标记 ${marked}，清除标记 ${unmarked}，删除 ${removed}`);
     return { removed, marked, unmarked };
   }
@@ -3227,7 +3259,7 @@
 
   function hasShareRecord(key) {
     try {
-      const rec = (loadRecords({ consumeClear: false }) || {})[normalizeShareKey(key)];
+      const rec = (loadRecords({ consumeClear: false }) || {})[recordKey(key)];
       return !!(rec && Array.isArray(rec.fileInfos) && rec.fileInfos.length);
     } catch { return false; }
   }
@@ -3401,7 +3433,7 @@
       const savedFiles = exec.savedFiles || [];
       if (savedFiles.length) {
         const key = normalizeShareKey(location.href);
-        const rec = await mergeShareRecord(key, savedFiles, { shareId });
+        const rec = await mergeShareRecord(key, savedFiles);
         log(` 记录已更新：${key} → ${((rec && rec.fileInfos) || []).length} 条`);
       }
       const summary = describeExec(exec);
@@ -3930,8 +3962,7 @@
       log('=== 手动触发：队列分析 ===');
       pending = [];
       for (const u of urls) {
-        const key = normalizeShareKey(u);
-        if (records[key]) log(` [已存在] ${u}`);
+        if (records[recordKey(u)]) log(` [已存在] ${u}`);
         else { log(` [待转存] ${u}`); pending.push(u); }
       }
       if (!pending.length) {
@@ -3985,7 +4016,7 @@
         if (r.kind === 'success' || r.kind === 'partial') {
           if (r.kind === 'success') successCount++;
           else partialCount++;
-          const rec = await mergeShareRecord(key, r.savedFiles || [], { shareId: extractShareId(key) });
+          const rec = await mergeShareRecord(key, r.savedFiles || []);
           const merged = (rec && rec.fileInfos) || [];
           if (r.kind === 'partial') warn(`⚠️ 部分成功（${(r.savedFiles || []).length}/${r.totalPlanned}）：${url}`);
           else log(`✅ 已记录 ${merged.length} 条到 ${key}`);
@@ -4248,6 +4279,7 @@
   async function runSaveCurrentPage(qa) {
     await ensureTimeDescSort(qa, document);
     const url = normalizeShareKey(location.href);
+    const rkey = recordKey(location.href);
     const cacheKey = currentCacheKey();
 
     let allFiles = (await scanAllRowsByScroll(qa, document, { key: cacheKey, useCache: true }) || []).filter(f => !isFolderFile(f));
@@ -4323,7 +4355,7 @@
       const savedFiles = exec.savedFiles || [];
       if (savedFiles.length) {
         const recs = loadRecords();
-        const prev = recs[url] || {};
+        const prev = recs[rkey] || {};
         const merged = Array.isArray(prev.fileInfos) ? prev.fileInfos.slice() : [];
         for (const f of savedFiles) {
           upsertFileInfo(merged, {
@@ -4331,8 +4363,8 @@
             fid: f.fid || '', mtime: f.mtime || '',
           });
         }
-        recs[url] = {
-          ...prev, ts: Date.now(), shareId: extractShareId(url),
+        recs[rkey] = {
+          ...prev, ts: Date.now(),
           fileInfos: merged,
         };
         saveRecords(recs);
@@ -4370,6 +4402,7 @@
   async function runMarkFlow(qa) {
     await ensureTimeDescSort(qa, document);
     const url = normalizeShareKey(location.href);
+    const rkey = recordKey(location.href);
     const cacheKey = currentCacheKey();
     const allFiles = (await scanAllRowsByScroll(qa, document, { key: cacheKey, useCache: true }) || []).filter(f => !isFolderFile(f));
     if (!allFiles.length) { alert('无文件'); return; }
@@ -4386,7 +4419,7 @@
     const msg = usingAll ? `无勾选，标记全部 ${allFiles.length} 个文件为已转存？` : `标记勾选的 ${scope.length} 个文件为已转存？`;
     if (!confirm(msg)) return;
     const recs = loadRecords();
-    const prev = recs[url] || {};
+    const prev = recs[rkey] || {};
     const merged = Array.isArray(prev.fileInfos) ? prev.fileInfos.slice() : [];
     let added = 0;
     for (const f of scope) {
@@ -4395,8 +4428,8 @@
         fid: f.fid || '', mtime: f.mtime || '',
       })) added++;
     }
-    recs[url] = {
-      ...prev, ts: Date.now(), shareId: extractShareId(url),
+    recs[rkey] = {
+      ...prev, ts: Date.now(),
       fileInfos: merged, manual: true,
     };
     saveRecords(recs);
@@ -4409,6 +4442,7 @@
   async function runClearShareFlow(qa) {
     await ensureTimeDescSort(qa, document);
     const url = normalizeShareKey(location.href);
+    const rkey = recordKey(location.href);
     const cacheKey = currentCacheKey();
     const allFiles = (await scanAllRowsByScroll(qa, document, { key: cacheKey, useCache: true }) || []).filter(f => !isFolderFile(f));
     const headerState = getHeaderCheckState(document);
@@ -4422,11 +4456,11 @@
       else { usingAll = false; scope = checkedAll; }
     }
     const recs = loadRecords();
-    const rec = recs[url];
+    const rec = recs[rkey];
     if (!rec) { qa.refreshGray(); await refreshShareFullCounts(qa); alert('当前分享无记录'); return; }
     if (usingAll) {
       if (!confirm(`当前分享无勾选，将删除全部记录（共 ${(rec.fileInfos || []).length} 条）？`)) return;
-      delete recs[url];
+      delete recs[rkey];
       saveRecords(recs);
       refreshShareUI(qa);
       await refreshShareFullCounts(qa);
@@ -4445,10 +4479,10 @@
     const removedNames = removedInfos.map(fi => fi.name);
     const keep = existing.filter(fi => !toRemove.some(tr => isSameFile(tr, fi)));
     if (!keep.length) {
-      delete recs[url];
+      delete recs[rkey];
       alert(`🗑️ 已移除 ${hitCount} 个，记录已清空\n\n本次移除（${removedNames.length}）：${fmtNames(removedNames)}`);
     } else {
-      recs[url] = { ...rec, ts: Date.now(), fileInfos: keep };
+      recs[rkey] = { ...rec, ts: Date.now(), fileInfos: keep };
       alert(`🗑️ 已移除 ${hitCount} 个（剩余 ${keep.length} 条）\n\n本次移除（${removedNames.length}）：${fmtNames(removedNames)}`);
     }
     saveRecords(recs);

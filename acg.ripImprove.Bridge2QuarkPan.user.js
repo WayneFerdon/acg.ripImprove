@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.18.0
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间；转存记录以 shareId 为 key（不带 URL 前缀）且不再冗余 names/shareId 字段）
+// @version 3.19.0
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间；转存记录以 shareId 为 key（不带 URL 前缀）且不再冗余 names/shareId 字段；链接规则行按“播出时间+资源偏移”到点才触发）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -536,20 +536,54 @@
     return target.getTime() <= now.getTime();
   }
 
-  /* 是否应处理该行（关键修复：优先看 _airDate）
-   * _airDate 是"下集"的放送时间；如果下集还没放送，即使每周轮询时间已到也不该处理。 */
+  /* 规则是分享链接时，资源列填的是“相对播出时间的偏移”，5 位 DHHMM（D=天、HH=时、MM=分）。
+   * 例：00300 = +3 小时；10200 = +1 天 2 小时；00000 = 与播出同时。
+   * 只有 5 位纯数字才认（带前导 0 的 "00300" 也是合法偏移）。 */
+  function parseDeltaDHHMM(raw) {
+    const t = String(raw ?? '').trim();
+    if (!/^\d{5}$/.test(t)) return null;
+    const d = Number(t[0]);
+    const hh = Number(t.slice(1, 3));
+    const mm = Number(t.slice(3, 5));
+    if (!(d >= 0 && d <= 9) || !(hh >= 0 && hh <= 23) || !(mm >= 0 && mm <= 59)) return null;
+    return { d, hh, mm, ms: ((d * 24 + hh) * 60 + mm) * 60000 };
+  }
+
+  /* 规则列是链接（分享页）还是纯规则（正则/文本） */
+  function isUrlRuleRow(row) {
+    const rule = expandUrl(String((row && row.规则) || '').trim(), row);
+    return /^https?:\/\//i.test(rule);
+  }
+
+  /* 该行资源真正可用的时间戳；0 = 无法判断（退回旧逻辑）
+   *  - 链接规则：播出时间(_airDate) + 资源偏移
+   *  - 纯规则：资源列本身是绝对 DHHMM，交给 dhhmmIsPassed 按周内时段判断 */
+  function resourceReadyTs(row) {
+    if (!isUrlRuleRow(row)) return 0;
+    const air = Number(row && row._airDate) || 0;
+    if (!(air > 0)) return 0;
+    const delta = parseDeltaDHHMM(row.资源);
+    return air + (delta ? delta.ms : 0);
+  }
+
+  /* 是否应处理该行：
+   *  - 链接规则：等“播出时间 + 资源偏移”（资源时间）到了才处理；
+   *  - 纯规则：仍按“下集已播出 + 周内绝对时段”。
+   * 关键：链接规则下资源列是偏移，"00300" 这类带前导 0 的不能再当绝对时刻丢弃，
+   * 否则会退回只看 _airDate，导致资源还没出来就提前触发。 */
   function shouldIncludeRow(row) {
     if (!row) return true;
-    const airTs = row._airDate;
-    if (typeof airTs === 'number' && Number.isFinite(airTs) && airTs > 0 && airTs > Date.now()) {
-      return false;
-    }
+    const now = Date.now();
+    const airTs = Number(row._airDate) || 0;
+    const readyAt = resourceReadyTs(row);
+    if (readyAt > 0) return readyAt <= now;
+    if (airTs > 0 && airTs > now) return false;
     const resVal = String(row.资源 ?? '').trim();
     if (resVal && isDHHMMValue(resVal)) {
       const passed = dhhmmIsPassed(resVal);
       if (passed != null) return passed;
     }
-    if (typeof airTs === 'number' && airTs > 0) return airTs <= Date.now();
+    if (airTs > 0) return airTs <= now;
     return true;
   }
 
@@ -593,13 +627,12 @@
     return collectShareTargets(bd, opts).map(t => t.url);
   }
 
-  /* 当前“有下一集要处理”的分享 key 集合；dataOk=false 表示清单不可用（不要据此删 CD） */
+  /* 当前“仍在清单且已播出”的分享 key 集合（CD 清理/显示用）。
+   * 刻意比触发口径宽：已播出但资源偏移还没到的条目，不该被当成“没有下一集”清掉。 */
   function activeShareKeySet(bd) {
     const rows = (bd && Array.isArray(bd.rows)) ? bd.rows : null;
     if (!rows || !rows.length) return { ok: false, keys: new Set() };
-    const keys = new Set(collectShareTargets(bd).map(t => t.key));
-    /* 手动“立即转存（已播出）”用的是更宽的口径（只看放送时间），这些条目也要保留 */
-    for (const t of collectShareTargets(bd, { onlyAired: true })) keys.add(t.key);
+    const keys = new Set(collectShareTargets(bd, { onlyAired: true }).map(t => t.key));
     return { ok: true, keys };
   }
 
@@ -3957,7 +3990,8 @@
     } else {
       const bd = loadBangumiData();
       if (!bd) { alert('无 bangumiData'); return; }
-      const urls = collectShareUrls(bd);
+      /* 手动入口用“已播出”口径：不因资源偏移还没到而漏掉条目 */
+      const urls = collectShareUrls(bd, { onlyAired: true });
       const records = loadRecords();
       log('=== 手动触发：队列分析 ===');
       pending = [];
@@ -4491,6 +4525,30 @@
   }
 
   /* ===== acg.rip 端 ===== */
+  /* 链接规则的行要等到“播出时间 + 资源偏移”才处理。页面一直开着时，
+   * 到点自动再跑一次触发（只安排 6 小时内的，避免超长定时器空转）。 */
+  let _resourceTriggerTimer = null;
+  function scheduleResourceTrigger(bd) {
+    try {
+      if (_resourceTriggerTimer) { clearTimeout(_resourceTriggerTimer); _resourceTriggerTimer = null; }
+      const now = Date.now();
+      let next = 0;
+      for (const row of ((bd && Array.isArray(bd.rows)) ? bd.rows : [])) {
+        const readyAt = resourceReadyTs(row);
+        if (!(readyAt > now)) continue;
+        if (!next || readyAt < next) next = readyAt;
+      }
+      if (!next) return;
+      const wait = next - now;
+      if (wait > 6 * 60 * 60 * 1000) return;
+      _resourceTriggerTimer = setTimeout(() => {
+        _resourceTriggerTimer = null;
+        try { runQuarkAutoTrigger(); } catch (e) { warn('资源时间到点触发失败', e); }
+      }, Math.max(5000, wait + 5000));
+      log(`⏰ 资源时间到点再触发：${new Date(next).toLocaleString()}（约 ${Math.max(1, Math.round(wait / 60000))} 分钟后）`);
+    } catch (e) { warn('安排资源时间触发失败', e); }
+  }
+
   function runQuarkAutoTrigger(opts = {}) {
     const { force = false, onlyAired = false } = opts;
     const folderId = getFolderId().trim();
@@ -4498,11 +4556,14 @@
     const bd = loadBangumiData();
     if (!bd || !Array.isArray(bd.rows)) return { triggered: false, reason: 'no-data' };
 
-    /* 先按“有没有下一集”清理 CD：没有下一集（未播出/时间未到）或已移出清单的条目，
+    /* 先按“有没有下一集”清理 CD：没有下一集（未播出）或已移出清单的条目，
      * 不该再排下一轮，也不该继续显示。等下一集到点后重新开始检查。 */
     try { pruneCdNotInTargets(bd); } catch (e) { warn('清理 CD 失败', e); }
+    try { scheduleResourceTrigger(bd); } catch (e) { warn(e); }
 
-    const targets = collectShareTargets(bd, { onlyAired });
+    /* 自动触发：按“播出时间 + 资源偏移”判断是否到点；
+     * 手动触发（force）用更宽的“已播出”口径，避免手动时被资源偏移挡住。 */
+    const targets = collectShareTargets(bd, { onlyAired: onlyAired || force });
     if (!targets.length) return { triggered: false, reason: 'no-urls' };
     const state = loadCdState();
     const now = Date.now();
@@ -4518,7 +4579,7 @@
       if (!force && !epChanged && now - s.ts < cd) { skippedByCD++; continue; }
       need.push(t);
     }
-    log(`触发${onlyAired ? '(已播出)' : ''}：CD 内跳过 ${skippedByCD}，待检查 ${need.length}（共 ${targets.length} 个 URL）`);
+    log(`触发${onlyAired ? '(已播出)' : (force ? '(手动)' : '')}：CD 内跳过 ${skippedByCD}，待检查 ${need.length}（共 ${targets.length} 个 URL）`);
     if (!need.length) return { triggered: false, reason: 'all-cd', total: targets.length };
     const touched = new Set();
     for (const t of need) {
@@ -4711,8 +4772,9 @@
     return idx;
   }
 
-  /* 统一“待处理”口径：当前**有下一集**（已播出/资源时间已到）且这一集还没处理成功的条目数。
-   *  - 有下一集：行通过 shouldIncludeRow；下一集还没播出 → 不算待处理，也不排 CD；
+  /* 统一“待处理”口径：当前**有下一集（已播出）**且这一集还没处理成功的条目数。
+   *  - 有下一集：下集播出时间已到（资源偏移未到也算，触发时机会另行等资源时间）；
+   *    下一集还没播出 → 不算待处理，也不排 CD；
    *  - 已处理：CD 里记的 doneEp 已覆盖表格里的“下集”（success/partial 由结果回写时记录）；
    *  - 其它口径（CD 冷却 / 本次待触发 / Debug）只在悬浮提示里展开。 */
   function isEpHandled(key, ep, state) {
@@ -4738,9 +4800,11 @@
     };
     if (!base.hasData) return base;
 
-    /* 同一分享多行（不同集数）时取最大集数：doneEp 覆盖它才算处理完 */
+    /* 同一分享多行（不同集数）时取最大集数：doneEp 覆盖它才算处理完。
+     * 这里用“已播出”口径（不看资源偏移）：刚播完、等资源的那一集同样算待处理，
+     * 具体什么时候触发由 shouldIncludeRow（播出时间+偏移）决定。 */
     const byKey = new Map();
-    for (const t of collectShareTargets(bd)) {
+    for (const t of collectShareTargets(bd, { onlyAired: true })) {
       const prev = byKey.get(t.key);
       if (!prev || t.ep > prev.ep) byKey.set(t.key, t);
     }

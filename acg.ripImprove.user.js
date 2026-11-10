@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.3.9
-// @description  acg.rip torrent auto download
+// @version      1.4.0
+// @description  acg.rip torrent auto download（记录列同时显示夸克已转存文件名）
 // @author       WayneFerdon
 // @include      *acg.rip*
 // @include      /^https?:\/\/(?:www\.)?(?:bgm|bangumi)\.tv\/subject\/\d+\/?$/
@@ -216,10 +216,44 @@ function parseDownloadedToList(v) {
 function parseDownloadedToText(v) { return parseDownloadedToList(v).join('\n'); }
 function parseTextToDownloaded(text) {
   const norm = s => { const n = String(s).replace(/^\/t\//, '').trim(); return /^\d+$/.test(n) ? Number(n) : null; };
-  const parts = String(text ?? '').split(/[\s,;]+/).map(norm).filter(n => n !== null);
+  /* 记录列展开时会附一段“夸克转存（未改名）”只读清单（桥接提供），提交时不能把它当 id 解析 */
+  const raw = String(text ?? '');
+  const cut = raw.indexOf('夸克转存（未改名）');
+  const body = cut >= 0 ? raw.slice(0, cut) : raw;
+  const parts = body.split(/[\s,;]+/).map(norm).filter(n => n !== null);
   return Array.from(new Set(parts));
 }
 function toDownloadedIndex(arr) { return parseDownloadedToList(arr).map(n => '/t/' + n); }
+
+/* ===== 夸克转存记录（桥接脚本提供）=====
+ * 记录列除了 acg 的下载 id，还要显示这个分享里已转存的文件名（未改名前的名字）。
+ * GM 值是按脚本隔离的，主脚本读不到桥接的数据，只能走它暴露在 unsafeWindow 的 API。 */
+function getQuarkRecordNames(row) {
+  try {
+    const api = unsafeWindow && unsafeWindow.acgripQuarkBridge;
+    if (!api || typeof api.recordNamesFor !== 'function') return [];
+    const names = api.recordNamesFor(String((row && row.规则) || ''), String((row && row.资源) || ''));
+    return Array.isArray(names) ? names.filter(Boolean) : [];
+  } catch (e) { return []; }
+}
+/* 未聚焦时的紧凑显示：`14+13` / `14+13 · 夸克 6` / `夸克 6` */
+function buildDownloadedCompact(items, quarkNames) {
+  const base = items.length === 0
+    ? ''
+    : (items.length === 1 ? String(items[0]) : `${items[items.length - 1]}+${items.length - 1}`);
+  if (!quarkNames.length) return base;
+  return base ? `${base} · 夸克 ${quarkNames.length}` : `夸克 ${quarkNames.length}`;
+}
+/* 聚焦/展开时的文本：数字 id 每行一个，空行后附上夸克文件名（提交时只解析数字，附件不会写回） */
+function buildDownloadedExpanded(row) {
+  const nums = parseDownloadedToText(row.已下载);
+  const names = getQuarkRecordNames(row);
+  if (!names.length) return nums;
+  const shown = names.slice(0, 20);
+  const more = names.length > shown.length ? `\n… 共 ${names.length} 个` : '';
+  const head = nums ? `${nums}\n\n` : '';
+  return `${head}夸克转存（未改名）：\n${shown.join('\n')}${more}`;
+}
 function normRuleKey(s) { return String(s ?? '').replace(/^\/|\/$/g, ''); }
 function getDownloadedList(found) {
   if (!found) return null;
@@ -4200,11 +4234,12 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     if (dlInput) {
       const isFocused = document.activeElement === dlInput;
       const items = parseDownloadedToList(row.已下载);
-      dlInput.title = items.join('\n');
+      const quarkNames = getQuarkRecordNames(row);
+      dlInput.title = items.join('\n') + (quarkNames.length
+        ? `\n\n夸克转存（未改名，${quarkNames.length}）：\n${quarkNames.slice(0, 60).join('\n')}${quarkNames.length > 60 ? '\n…' : ''}`
+        : '');
       if (!isFocused) {
-        dlInput.value = items.length === 0
-          ? ''
-          : (items.length === 1 ? String(items[0]) : `${items[items.length - 1]}+${items.length - 1}`);
+        dlInput.value = buildDownloadedCompact(items, quarkNames);
         dlInput.style.height = '20px';
       }
     }
@@ -4916,7 +4951,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     dlInput.cols = 1;
     dlInput.style.cssText = 'width:100%;height:20px;line-height:20px;padding:0 1px;box-sizing:border-box;border:none;outline:none;background:transparent;font-size:12pt;font-family:inherit;text-align:left;resize:none;overflow:hidden;white-space:pre;display:block;';
     dlInput.addEventListener('focus', () => {
-      dlInput.value = parseDownloadedToText(row.已下载);
+      dlInput.value = buildDownloadedExpanded(row);
       requestAnimationFrame(() => autoResizeTextarea(dlInput));
     });
     dlInput.addEventListener('input', () => {
@@ -4935,9 +4970,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
         dlInput.style.width = '';
         dlInput.style.maxWidth = '';
         const items = parseDownloadedToList(row.已下载);
-        dlInput.value = items.length === 0
-          ? ''
-          : (items.length === 1 ? String(items[0]) : `${items[items.length - 1]}+${items.length - 1}`);
+        dlInput.value = buildDownloadedCompact(items, getQuarkRecordNames(row));
         dlInput.style.height = '20px';
       }, 0);
     });
@@ -4962,7 +4995,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
 
       const stillFocused = document.activeElement === dlInput;
       if (stillFocused) {
-        dlInput.value = parseDownloadedToText(row.已下载);
+        dlInput.value = buildDownloadedExpanded(row);
         tdDownloaded.classList.add('u-focus-expand');
         requestAnimationFrame(() => autoResizeTextarea(dlInput));
       } else {
@@ -4976,14 +5009,12 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
         if (nowFocused) {
           if (!tdDownloaded.classList.contains('u-focus-expand')) {
             tdDownloaded.classList.add('u-focus-expand');
-            dlInput.value = parseDownloadedToText(row.已下载);
+            dlInput.value = buildDownloadedExpanded(row);
             autoResizeTextarea(dlInput);
           }
         } else {
           tdDownloaded.classList.remove('u-focus-expand');
-          dlInput.value = items.length === 0
-            ? ''
-            : (items.length === 1 ? String(items[0]) : `${items[items.length - 1]}+${items.length - 1}`);
+          dlInput.value = buildDownloadedCompact(items, getQuarkRecordNames(row));
           dlInput.style.height = '20px';
         }
       }, 0);
@@ -6139,7 +6170,7 @@ function initAjax() {
  * ===================================================================== */
 if (/^acg\.rip$/i.test(location.hostname)) {
   unsafeWindow.acgripApi = {
-    version: '1.4.1',
+    version: '1.5.0',
 
     getBangumiData: () => getValue('bangumiData'),
 
@@ -6160,7 +6191,17 @@ if (/^acg\.rip$/i.test(location.hostname)) {
     getValue,
     setValue,
   };
-  console.log('[acgripApi] 已暴露 v1.4.1');
+  console.log('[acgripApi] 已暴露 v1.5.0');
+
+  /* 桥接脚本写/改了夸克转存记录 → 刷新编辑面板里的记录列（显示最新的已转存文件名） */
+  window.addEventListener('acgrip-quark-records-changed', () => {
+    try {
+      if (!_gmEditOverlay || !_gmEditOverlay.isConnected || _gmEditOverlay.style.display === 'none') return;
+      for (const tr of _gmEditOverlay.querySelectorAll('tbody tr')) {
+        if (typeof tr._updateDerived === 'function') tr._updateDerived();
+      }
+    } catch (e) {}
+  });
 }
 
 /* =====================================================================

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.20.1
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间；转存记录以 shareId 为 key（不带 URL 前缀）且不再冗余 names/shareId 字段；链接规则行按“播出时间+资源偏移”到点才触发；记录列显示夸克已转存文件名，纯数字文件名自动推进下集）
+// @version 3.21.0
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间；转存记录以 shareId 为 key（不带 URL 前缀）且不再冗余 names/shareId 字段；链接规则行按“播出时间+资源偏移”到点才触发；记录列显示夸克已转存文件名，纯数字文件名或规则里的 ?match= 正则自动推进下集）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -597,6 +597,17 @@
     return shouldIncludeRow(row);
   }
 
+  /* 规则里可以带 ?match=<regexp> 指定“怎么从文件名里认集数”（给自动更新下集用）。
+   * 这个参数只在本地用，打开分享页前要摘掉，别让夸克路由去解析它。 */
+  function stripMatchFromHash(hash) {
+    const s = String(hash || '');
+    const q = s.indexOf('?');
+    if (q < 0) return s;
+    const head = s.slice(0, q);
+    const params = s.slice(q + 1).split('&').filter(p => p && !/^match=/i.test(p));
+    return params.length ? `${head}?${params.join('&')}` : head;
+  }
+
   /* 带行上下文的分享目标：url + 归一化 key + 该行当前的“下集”集数。
    * 集数用来判断“这一集是否已经处理过”，也是“没有下一集就停掉 CD”的依据。 */
   function collectShareTargets(bd, opts = {}) {
@@ -613,7 +624,7 @@
         if (!m) continue;
         const shareId = m[1], suffix = m[2] || '';
         const hashIdx = suffix.indexOf('#');
-        const hash = hashIdx >= 0 ? suffix.substring(hashIdx) : '';
+        const hash = hashIdx >= 0 ? stripMatchFromHash(suffix.substring(hashIdx)) : '';
         const url = `https://pan.quark.cn/s/${shareId}${hash}`.replace(/\/$/, '');
         if (seen.has(url)) continue;
         seen.add(url);
@@ -4633,6 +4644,42 @@
     return max;
   }
 
+  /* 规则（或资源）里的 ?match=<regexp>：用它从文件名里认集数，捕获组 1 就是集数。
+   * 例：#/list/share/<guid>?match=公司职员.EP(\d+)_婚姻与健美字幕组.mp4 */
+  function rowMatchRegex(row) {
+    for (const f of ['规则', '资源']) {
+      const raw = String((row && row[f]) || '').trim();
+      const m = raw.match(/[?&]match=([^&#\s]*)/i);
+      if (!m) continue;
+      let pat = m[1];
+      try { pat = decodeURIComponent(pat); } catch {}
+      if (!pat) continue;
+      try { return new RegExp(pat); } catch { return null; }
+    }
+    return null;
+  }
+
+  /* 用 match 正则从记录文件名（含曾用名）里取集数，取最大值；一个都没匹配到 → 0 */
+  function maxEpByRegex(fileInfos, re) {
+    let max = 0;
+    for (const fi of (fileInfos || [])) {
+      const names = [fi && fi.name].concat(Array.isArray(fi && fi.formerNames) ? fi.formerNames : []);
+      for (const n of names) {
+        const str = String(n || '').trim();
+        if (!str) continue;
+        let m = null;
+        try { m = str.match(re); } catch { continue; }
+        if (!m) continue;
+        const raw = m[1] != null ? m[1] : m[0];
+        const ep = Number(String(raw == null ? '' : raw).replace(/[^\d]/g, ''));
+        if (!Number.isFinite(ep) || ep <= 0) continue;
+        if (ep > max) max = ep;
+        break;
+      }
+    }
+    return max;
+  }
+
   function acgHostApi() {
     try {
       const api = unsafeWindow.acgripApi;
@@ -4683,7 +4730,11 @@
       if (!key) continue;
       const rec = recs[recordKey(key)];
       if (!rec || !Array.isArray(rec.fileInfos) || !rec.fileInfos.length) continue;
-      const maxEp = numericEpFromNames(rec.fileInfos.map(f => f && f.name));
+      /* 有 ?match= 就按它认集数（比如 公司职员.EP(\d+)_字幕组.mp4）；否则走纯数字文件名 */
+      const re = rowMatchRegex(row);
+      const maxEp = re
+        ? maxEpByRegex(rec.fileInfos, re)
+        : numericEpFromNames(rec.fileInfos.map(f => f && f.name));
       if (!maxEp) continue;
       const cur = Number(row.下集) || 0;
       if (maxEp !== cur) continue;

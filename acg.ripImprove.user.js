@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.4.0
-// @description  acg.rip torrent auto download（记录列同时显示夸克已转存文件名）
+// @version      1.4.1
+// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注）
 // @author       WayneFerdon
 // @include      *acg.rip*
 // @include      /^https?:\/\/(?:www\.)?(?:bgm|bangumi)\.tv\/subject\/\d+\/?$/
@@ -214,45 +214,59 @@ function parseDownloadedToList(v) {
   return Array.from(new Set(items.map(norm).filter(n => n !== null)));
 }
 function parseDownloadedToText(v) { return parseDownloadedToList(v).join('\n'); }
+
+/* ===== 记录列备注（由外部脚本 push，主脚本不关心来源）=====
+ * acgripApi.setRecordNotes({ [规则]: { compact, header, lines } }) 写入；
+ * 记录列把它显示在数字 id 后面（紧凑显示 compact，展开/悬停显示 header + lines）。 */
+const recordNotes = new Map();
+const recordNoteHeaders = new Set();
+function recordNoteFor(row) {
+  const key = String((row && row.规则) || '').trim();
+  return key ? (recordNotes.get(key) || null) : null;
+}
 function parseTextToDownloaded(text) {
   const norm = s => { const n = String(s).replace(/^\/t\//, '').trim(); return /^\d+$/.test(n) ? Number(n) : null; };
-  /* 记录列展开时会附一段“夸克转存（未改名）”只读清单（桥接提供），提交时不能把它当 id 解析 */
-  const raw = String(text ?? '');
-  const cut = raw.indexOf('夸克转存（未改名）');
-  const body = cut >= 0 ? raw.slice(0, cut) : raw;
-  const parts = body.split(/[\s,;]+/).map(norm).filter(n => n !== null);
+  /* 展开时会在数字后面附一段只读备注（header + 文件名清单），提交时不能当 id 解析 */
+  let raw = String(text ?? '');
+  let cut = -1;
+  for (const h of recordNoteHeaders) {
+    const i = h ? raw.indexOf(h) : -1;
+    if (i >= 0 && (cut < 0 || i < cut)) cut = i;
+  }
+  if (cut >= 0) raw = raw.slice(0, cut);
+  const parts = raw.split(/[\s,;]+/).map(norm).filter(n => n !== null);
   return Array.from(new Set(parts));
 }
 function toDownloadedIndex(arr) { return parseDownloadedToList(arr).map(n => '/t/' + n); }
 
-/* ===== 夸克转存记录（桥接脚本提供）=====
- * 记录列除了 acg 的下载 id，还要显示这个分享里已转存的文件名（未改名前的名字）。
- * GM 值是按脚本隔离的，主脚本读不到桥接的数据，只能走它暴露在 unsafeWindow 的 API。 */
-function getQuarkRecordNames(row) {
-  try {
-    const api = unsafeWindow && unsafeWindow.acgripQuarkBridge;
-    if (!api || typeof api.recordNamesFor !== 'function') return [];
-    const names = api.recordNamesFor(String((row && row.规则) || ''), String((row && row.资源) || ''));
-    return Array.isArray(names) ? names.filter(Boolean) : [];
-  } catch (e) { return []; }
-}
-/* 未聚焦时的紧凑显示：`14+13` / `14+13 · 夸克 6` / `夸克 6` */
-function buildDownloadedCompact(items, quarkNames) {
+/* 未聚焦时的紧凑显示：`14+13` / `14+13 · 备注` / `备注` */
+function buildDownloadedCompact(items, note) {
   const base = items.length === 0
     ? ''
     : (items.length === 1 ? String(items[0]) : `${items[items.length - 1]}+${items.length - 1}`);
-  if (!quarkNames.length) return base;
-  return base ? `${base} · 夸克 ${quarkNames.length}` : `夸克 ${quarkNames.length}`;
+  if (!note || !note.compact) return base;
+  return base ? `${base} · ${note.compact}` : note.compact;
 }
-/* 聚焦/展开时的文本：数字 id 每行一个，空行后附上夸克文件名（提交时只解析数字，附件不会写回） */
+/* 聚焦/展开时的文本：数字 id 每行一个，空行后附备注清单（提交时按 header 截断，不会写回） */
 function buildDownloadedExpanded(row) {
   const nums = parseDownloadedToText(row.已下载);
-  const names = getQuarkRecordNames(row);
-  if (!names.length) return nums;
-  const shown = names.slice(0, 20);
-  const more = names.length > shown.length ? `\n… 共 ${names.length} 个` : '';
+  const note = recordNoteFor(row);
+  if (!note || !note.lines.length) return nums;
+  const shown = note.lines.slice(0, 20);
+  const more = note.lines.length > shown.length ? `\n… 共 ${note.lines.length} 个` : '';
   const head = nums ? `${nums}\n\n` : '';
-  return `${head}夸克转存（未改名）：\n${shown.join('\n')}${more}`;
+  return `${head}${note.header}：\n${shown.join('\n')}${more}`;
+}
+/* 备注或下集变化后刷新记录列 */
+function refreshRecordCells() {
+  try {
+    if (!_gmEditOverlay || !_gmEditOverlay.isConnected || _gmEditOverlay.style.display === 'none') return 0;
+    let n = 0;
+    for (const tr of _gmEditOverlay.querySelectorAll('tbody tr')) {
+      if (typeof tr._updateDerived === 'function') { tr._updateDerived(); n++; }
+    }
+    return n;
+  } catch (e) { return 0; }
 }
 function normRuleKey(s) { return String(s ?? '').replace(/^\/|\/$/g, ''); }
 function getDownloadedList(found) {
@@ -4234,12 +4248,12 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     if (dlInput) {
       const isFocused = document.activeElement === dlInput;
       const items = parseDownloadedToList(row.已下载);
-      const quarkNames = getQuarkRecordNames(row);
-      dlInput.title = items.join('\n') + (quarkNames.length
-        ? `\n\n夸克转存（未改名，${quarkNames.length}）：\n${quarkNames.slice(0, 60).join('\n')}${quarkNames.length > 60 ? '\n…' : ''}`
+      const note = recordNoteFor(row);
+      dlInput.title = items.join('\n') + (note && note.lines.length
+        ? `\n\n${note.header}（${note.lines.length}）：\n${note.lines.slice(0, 60).join('\n')}${note.lines.length > 60 ? '\n…' : ''}`
         : '');
       if (!isFocused) {
-        dlInput.value = buildDownloadedCompact(items, quarkNames);
+        dlInput.value = buildDownloadedCompact(items, note);
         dlInput.style.height = '20px';
       }
     }
@@ -4970,7 +4984,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
         dlInput.style.width = '';
         dlInput.style.maxWidth = '';
         const items = parseDownloadedToList(row.已下载);
-        dlInput.value = buildDownloadedCompact(items, getQuarkRecordNames(row));
+        dlInput.value = buildDownloadedCompact(items, recordNoteFor(row));
         dlInput.style.height = '20px';
       }, 0);
     });
@@ -5014,7 +5028,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
           }
         } else {
           tdDownloaded.classList.remove('u-focus-expand');
-          dlInput.value = buildDownloadedCompact(items, getQuarkRecordNames(row));
+          dlInput.value = buildDownloadedCompact(items, recordNoteFor(row));
           dlInput.style.height = '20px';
         }
       }, 0);
@@ -6170,7 +6184,7 @@ function initAjax() {
  * ===================================================================== */
 if (/^acg\.rip$/i.test(location.hostname)) {
   unsafeWindow.acgripApi = {
-    version: '1.5.0',
+    version: '1.6.0',
 
     getBangumiData: () => getValue('bangumiData'),
 
@@ -6190,18 +6204,74 @@ if (/^acg\.rip$/i.test(location.hostname)) {
 
     getValue,
     setValue,
-  };
-  console.log('[acgripApi] 已暴露 v1.5.0');
 
-  /* 桥接脚本写/改了夸克转存记录 → 刷新编辑面板里的记录列（显示最新的已转存文件名） */
-  window.addEventListener('acgrip-quark-records-changed', () => {
-    try {
-      if (!_gmEditOverlay || !_gmEditOverlay.isConnected || _gmEditOverlay.style.display === 'none') return;
-      for (const tr of _gmEditOverlay.querySelectorAll('tbody tr')) {
-        if (typeof tr._updateDerived === 'function') tr._updateDerived();
+    /* ---- 给其它脚本用的行级写接口 ----
+     * 记录列备注：{ [规则]: { compact, header, lines } }，整体替换；
+     * 传空对象即清空。主脚本只负责显示，不关心数据来自哪个业务。 */
+    setRecordNotes: (map) => {
+      recordNotes.clear();
+      recordNoteHeaders.clear();
+      let n = 0;
+      for (const [rule, note] of Object.entries(map || {})) {
+        const key = String(rule || '').trim();
+        if (!key || !note) continue;
+        const lines = Array.isArray(note.lines) ? note.lines.map(x => String(x ?? '')).filter(Boolean) : [];
+        if (!lines.length) continue;
+        const item = {
+          compact: String(note.compact || ''),
+          header: String(note.header || '备注'),
+          lines,
+        };
+        recordNotes.set(key, item);
+        recordNoteHeaders.add(item.header);
+        n++;
       }
-    } catch (e) {}
-  });
+      refreshRecordCells();
+      return n;
+    },
+
+    /* 面板开着时刷新记录列（备注内容没变也可以调，幂等） */
+    refreshRecords: () => refreshRecordCells(),
+
+    /* 改某一行的下集：写 bangumiData（GM+localStorage）、刷新面板、同步草稿 */
+    updateRowNext: (rule, next) => {
+      const key = String(rule || '').trim();
+      const val = Number(next);
+      if (!key || !Number.isFinite(val)) return false;
+      const bd = getValue('bangumiData');
+      if (!bd || !Array.isArray(bd.rows)) return false;
+      const row = bd.rows.find(r => String((r && r.规则) || '').trim() === key);
+      if (!row) return false;
+      if (String(row.下集 ?? '') === String(val)) return false;
+      row.下集 = String(val);
+      setValue('bangumiData', bd);
+      if (_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none'
+          && typeof _gmEditOverlay._syncRowUpdate === 'function') {
+        _gmEditOverlay._syncRowUpdate(key, val);
+      } else {
+        /* 面板没开：顺手改掉可能残留的草稿，避免下次打开面板把它覆盖回去 */
+        try {
+          const raw = localStorage.getItem(DRAFT_KEY);
+          if (raw) {
+            const draft = JSON.parse(raw);
+            if (draft && Array.isArray(draft.rows)) {
+              let ch = false;
+              for (const r of draft.rows) {
+                if (String((r && r.规则) || '').trim() === key && String(r.下集 || '') !== String(val)) {
+                  r.下集 = String(val);
+                  ch = true;
+                  break;
+                }
+              }
+              if (ch) { draft.ts = Date.now(); localStorage.setItem(DRAFT_KEY, JSON.stringify(draft)); }
+            }
+          }
+        } catch (e) {}
+      }
+      return true;
+    },
+  };
+  console.log('[acgripApi] 已暴露 v1.6.0');
 }
 
 /* =====================================================================

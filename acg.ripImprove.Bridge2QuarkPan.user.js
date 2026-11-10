@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.20.0
+// @version 3.20.1
 // @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间；转存记录以 shareId 为 key（不带 URL 前缀）且不再冗余 names/shareId 字段；链接规则行按“播出时间+资源偏移”到点才触发；记录列显示夸克已转存文件名，纯数字文件名自动推进下集）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
@@ -4601,8 +4601,12 @@
     return { triggered: true, count: need.length, total: targets.length };
   }
 
-  /* ===== acg 表格回写：记录列 / 下集 ===== */
-  let _recNamesCache = { at: 0, recs: null };
+  /* ===== acg 表格回写：记录列备注 / 下集 =====
+   * 主机（acg 主脚本）不感知夸克业务，只暴露 acgripApi 上的通用写接口：
+   *   setRecordNotes({ [规则]: { compact, header, lines } })  → 记录列显示只读清单
+   *   updateRowNext(rule, next)                                → 改下集并刷新面板/草稿
+   * 这里只负责算数据、调接口。 */
+
   /* 行对应哪个夸克分享：规则/资源里第一个 pan.quark.cn/s/<id> */
   function rowQuarkKey(row) {
     for (const f of ['规则', '资源']) {
@@ -4629,56 +4633,52 @@
     return max;
   }
 
-  /* 写 bangumiData：优先走主脚本的 setValue（它同时写 GM 与 localStorage，面板能读到） */
-  function persistBangumiData(bd) {
+  function acgHostApi() {
     try {
       const api = unsafeWindow.acgripApi;
-      if (api && typeof api.setValue === 'function') { api.setValue(GM_BANGUMI, bd); return true; }
-    } catch {}
-    try { localStorage.setItem(GM_BANGUMI, JSON.stringify(bd)); } catch {}
-    try { GM_setValue(GM_BANGUMI, bd); } catch {}
-    return false;
+      return api && typeof api === 'object' ? api : null;
+    } catch { return null; }
   }
 
-  /* 让面板里的行跟着变（下集输入框 + 记录列），并同步未保存草稿 */
-  function notifyRowNext(rule, next) {
-    const overlay = document.getElementById('gmEditOverlay');
-    if (rule && overlay && typeof overlay._syncRowUpdate === 'function') {
-      try { overlay._syncRowUpdate(rule, next); } catch {}
+  /* 把每个带夸克分享的行“已转存文件名（未改名）”推给主脚本的记录列 */
+  let _notesSig = '';
+  function pushRecordNotesToHost(force) {
+    const api = acgHostApi();
+    if (!api || typeof api.setRecordNotes !== 'function') return 0;
+    const bd = loadBangumiData();
+    if (!bd || !Array.isArray(bd.rows) || !bd.rows.length) return 0;
+    const recs = loadRecords({ consumeClear: false });
+    const map = {};
+    for (const row of bd.rows) {
+      const rule = String((row && row.规则) || '').trim();
+      if (!rule) continue;
+      const key = rowQuarkKey(row);
+      if (!key) continue;
+      const rec = recs[recordKey(key)];
+      if (!rec || !Array.isArray(rec.fileInfos) || !rec.fileInfos.length) continue;
+      const names = rec.fileInfos.map(f => (f && f.name) || '').filter(Boolean);
+      if (!names.length) continue;
+      map[rule] = { compact: `夸克 ${names.length}`, header: '夸克转存（未改名）', lines: names };
     }
-    try {
-      const raw = localStorage.getItem('acgrip_draft_edit');
-      if (!raw) return;
-      const draft = JSON.parse(raw);
-      if (!draft || !Array.isArray(draft.rows)) return;
-      let changed = false;
-      for (const r of draft.rows) {
-        if (String(r.规则 || '').trim() === rule && String(r.下集 || '') !== String(next)) {
-          r.下集 = String(next);
-          changed = true;
-          break;
-        }
-      }
-      if (changed) { draft.ts = Date.now(); localStorage.setItem('acgrip_draft_edit', JSON.stringify(draft)); }
-    } catch {}
-  }
-
-  function refreshAcgPanelRecords() {
-    try { window.dispatchEvent(new CustomEvent('acgrip-quark-records-changed')); } catch {}
+    const sig = JSON.stringify(map);
+    if (!force && sig === _notesSig) return 0;
+    _notesSig = sig;
+    try { return api.setRecordNotes(map) || 0; } catch { return 0; }
   }
 
   /* 纯数字文件名时按 torrent 的做法推进“下集”：
    * 最大集数 == 当前下集 → 下集 +1；不等就不动（不会重复加，也不会回退）。 */
   function syncNextEpFromRecords() {
+    const api = acgHostApi();
+    if (!api || typeof api.updateRowNext !== 'function') return 0;
     let bd = null;
     try { bd = loadBangumiData(); } catch {}
     if (!bd || !Array.isArray(bd.rows) || !bd.rows.length) return 0;
     const recs = loadRecords({ consumeClear: false });
-    let changed = 0;
     const updates = [];
     for (const row of bd.rows) {
       const rule = String((row && row.规则) || '').trim();
-      if (!rule) continue;   /* 面板按规则定位行；没有规则就不动，避免写回后被面板覆盖 */
+      if (!rule) continue;
       const key = rowQuarkKey(row);
       if (!key) continue;
       const rec = recs[recordKey(key)];
@@ -4689,16 +4689,15 @@
       if (maxEp !== cur) continue;
       const total = Number(row.最大) || 0;
       if (total > 0 && maxEp + 1 > total) continue;   /* 到总集数就停 */
-      const next = maxEp + 1;
-      row.下集 = String(next);
-      changed++;
-      updates.push({ rule, next, ep: maxEp, name: getAcgDisplayName(row) || key });
+      updates.push({ rule, next: maxEp + 1, ep: maxEp, name: getAcgDisplayName(row) || key });
     }
-    if (!changed) return 0;
-    persistBangumiData(bd);
+    let changed = 0;
     for (const u of updates) {
+      let ok = false;
+      try { ok = api.updateRowNext(u.rule, u.next) === true; } catch {}
+      if (!ok) continue;
+      changed++;
       log(`⏭ 下集自动 +1：${u.name}（第 ${u.ep} 集已转存 → ${u.next}）`);
-      notifyRowNext(u.rule, u.next);
     }
     return changed;
   }
@@ -4708,8 +4707,8 @@
     if (_recordsSyncTimer) return;
     _recordsSyncTimer = setTimeout(() => {
       _recordsSyncTimer = null;
+      try { pushRecordNotesToHost(true); } catch (e) { warn('推送记录列失败', e); }
       try { syncNextEpFromRecords(); } catch (e) { warn('同步下集失败', e); }
-      refreshAcgPanelRecords();
     }, 800);
   }
 
@@ -5103,6 +5102,7 @@
       /* 只留一个统一口径：待处理（有下一集、但这一集还没处理成功的条目数）。
        * CD / 已处理 / 本次待触发 / Debug 明细放到悬停提示里。 */
       try { pruneCdNotInTargets(loadBangumiData()); } catch {}
+      try { pushRecordNotesToHost(); } catch {}
       try { syncNextEpFromRecords(); } catch {}
       const st = collectPendingStats();
       info.textContent = st.hasData ? `待处理 ${st.pending}` : '待处理 —';
@@ -5170,11 +5170,16 @@
     }
     /* 子任务在别的标签页写转存记录 → 这里收到 GM 变更：刷新记录列，纯数字文件名顺便推进“下集” */
     try { GM_addValueChangeListener(GM_RECORDS, () => { try { onQuarkRecordsChanged(); } catch (e) { warn(e); } }); } catch {}
-    setTimeout(() => { try { syncNextEpFromRecords(); } catch (e) { warn(e); } }, 3000);
+    setTimeout(() => {
+      try { pushRecordNotesToHost(true); } catch (e) { warn(e); }
+      try { syncNextEpFromRecords(); } catch (e) { warn(e); }
+    }, 3000);
     window.addEventListener('acgrip-bangumi-saved', () => {
       try {
         unsafeWindow.acgripApi?.refreshAirDates?.();
         runQuarkAutoTrigger();
+        /* 规则/集数可能刚被编辑过：按最新清单重推一次记录列备注 */
+        pushRecordNotesToHost(true);
       } catch (e) { warn(e); }
     });
     watchEditPanel();
@@ -5225,25 +5230,12 @@
         fullResaveDebug: () => loadFullResaveDebug(),
         clearFullResaveDebug: () => clearFullResaveDebug(),
         cdEntries: () => collectCdEntries(),
-        /* 记录列用：按分享 URL / shareId 取“未改名前的文件名”清单 */
-        recordNamesFor: (...urls) => {
-          try {
-            const now = Date.now();
-            if (!_recNamesCache.recs || now - _recNamesCache.at > 500) {
-              _recNamesCache = { at: now, recs: loadRecords({ consumeClear: false }) };
-            }
-            for (const u of urls) {
-              const key = recordKey(u);
-              if (!key) continue;
-              const rec = _recNamesCache.recs[key];
-              if (rec && Array.isArray(rec.fileInfos) && rec.fileInfos.length) {
-                return rec.fileInfos.map(f => (f && f.name) || '').filter(Boolean);
-              }
-            }
-          } catch {}
-          return [];
+        /* 调试/手动用：把记录列备注和下集同步立刻跑一遍 */
+        syncAcgTable: () => {
+          const n = pushRecordNotesToHost(true);
+          const m = syncNextEpFromRecords();
+          return { notes: n, nextEp: m };
         },
-        syncNextEp: () => syncNextEpFromRecords(),
       };
     } catch (e) { warn('暴露 acgripQuarkBridge 失败', e); }
     log('已启动（acg.rip 端）');

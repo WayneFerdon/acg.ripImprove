@@ -4705,7 +4705,7 @@
       if (!rec || !Array.isArray(rec.fileInfos) || !rec.fileInfos.length) continue;
       const names = rec.fileInfos.map(f => (f && f.name) || '').filter(Boolean);
       if (!names.length) continue;
-      map[rule] = { compact: `夸克 ${names.length}`, header: '夸克转存（未改名）', lines: names };
+      map[rule] = { compact: `夸克 ${names.length}`, header: '夸克', lines: names };
     }
     const sig = JSON.stringify(map);
     if (!force && sig === _notesSig) return 0;

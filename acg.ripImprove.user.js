@@ -21,7 +21,7 @@
 // ==/UserScript==
 
 const _1s = 1000, _1m = 60 * _1s, _1h = 60 * _1m, _1d = 24 * _1h;
-const colors = { last: 'palegreen', tracking: 'crimson', downloaded: 'rebeccapurple', unviewed: 'cyan' };
+const colors = { last: 'palegreen', tracking: 'crimson', downloaded: 'rebeccapurple', viewed: 'grey' };
 const timeOpt = { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
 const url2num = url => 1 * `${url ?? ''}`.replace('/t/', '');
 const WEEKDAY_LABEL = ['日七', '月一', '火二', '水三', '木四', '金五', '土六'];
@@ -660,7 +660,7 @@ function setDisplayHighlight({ item, found, href }) {
     switch (true) {
       case !!found: return isDownloaded(found, href) ? colors.downloaded : colors.tracking;
       case href === last: return colors.last;
-      case !isViewed(href): return colors.unviewed;
+      case isViewed(href): return colors.viewed;
     }
   }
 }
@@ -2250,7 +2250,7 @@ function showEditDialog() {
       box-sizing: border-box;
       line-height: 1.4;
     }
-    #gmEditOverlay .u-main-table th:nth-child(1), #gmEditOverlay .u-main-table td:nth-child(1) { width: 230px !important; min-width: 230px !important; max-width: 230px !important; }
+    #gmEditOverlay .u-main-table th:nth-child(1), #gmEditOverlay .u-main-table td:nth-child(1) { width: 210px !important; min-width: 210px !important; max-width: 210px !important; }
     #gmEditOverlay .u-main-table th:nth-child(2), #gmEditOverlay .u-main-table td:nth-child(2) { width: 76px !important; max-width: 76px !important; }
     #gmEditOverlay .u-main-table th:nth-child(5), #gmEditOverlay .u-main-table td:nth-child(5) { width: 135px !important; max-width: 135px !important; }
     #gmEditOverlay .u-main-table th:nth-child(8), #gmEditOverlay .u-main-table td:nth-child(8) { width: 100px !important; min-width: 100px !important; max-width: 100px !important; }
@@ -5109,7 +5109,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   /* ===== 表格骨架 ===== */
   const header = cE('thead'); const hr = cE('tr');
   const headerCols = [
-    ['名称', '230px'], ['资源', '76px'],
+    ['名称', '210px'], ['资源', '76px'],
     ['下集', '36px'], ['总集', '36px'], ['播出', '135px'],
     ['延周', '36px'], ['延日', '36px'], ['BGMID', '100px'],
     ['名称', '64px'], ['中文', '64px'],

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.4.1
+// @version      1.4.2
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注）
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -1873,6 +1873,37 @@ async function updateFromBangumiSubjectPage() {
     console.log('[SubjectPage] 无需更新', subjectId);
   }
 }
+/* 表格列定义（唯一来源）：[表头, 宽度, 约束]
+ *  约束 'pin'：width / min-width / max-width 全部 !important，列宽完全固定
+ *       'lock'：锁 width / max-width，内容不会把列撑宽
+ *       'min' ：只锁 min-width，内容多时可以自行变宽
+ *       省略   ：只给表头 th 写内联宽度
+ * 表头宽度和列宽 CSS 都由这份数组生成，调整宽度只改这里。 */
+const headerCols = [
+  ['名称', '210px', 'pin'], ['资源', '76px', 'lock'],
+  ['下集', '36px'], ['总集', '36px'], ['播出', '135px', 'lock'],
+  ['延周', '36px'], ['延日', '36px'], ['BGMID', '100px', 'pin'],
+  ['名称', '64px', 'lock'], ['中文', '64px'],
+  ['年', '36px'], ['开播', '46px', 'min'], ['放送', '46px', 'min'], ['最大', '36px'],
+  ['更新', '36px'], ['初始', '36px'], ['前季', '36px'], ['记录', '38px'],
+];
+
+/* 由 headerCols 生成列宽 CSS（阈值写死的行宽规则据此淘汰，避免同一宽度两处维护） */
+function buildColumnWidthCss(cols) {
+  const rules = [];
+  cols.forEach(([, w, mode], i) => {
+    const px = parseInt(w, 10) || 0;
+    if (!px || !mode) return;
+    const decl = [];
+    if (mode === 'pin' || mode === 'lock') decl.push(`width: ${px}px !important`);
+    if (mode === 'pin' || mode === 'min') decl.push(`min-width: ${px}px !important`);
+    if (mode === 'pin' || mode === 'lock') decl.push(`max-width: ${px}px !important`);
+    const n = i + 1;
+    rules.push(`#gmEditOverlay .u-main-table th:nth-child(${n}), #gmEditOverlay .u-main-table td:nth-child(${n}) { ${decl.join('; ')}; }`);
+  });
+  return rules.join('\n    ');
+}
+
 /* ============ 编辑对话框 ============ */
 function showEditDialog() {
   if (_gmEditShow) { _gmEditShow(); return; }
@@ -2250,13 +2281,7 @@ function showEditDialog() {
       box-sizing: border-box;
       line-height: 1.4;
     }
-    #gmEditOverlay .u-main-table th:nth-child(1), #gmEditOverlay .u-main-table td:nth-child(1) { width: 210px !important; min-width: 210px !important; max-width: 210px !important; }
-    #gmEditOverlay .u-main-table th:nth-child(2), #gmEditOverlay .u-main-table td:nth-child(2) { width: 76px !important; max-width: 76px !important; }
-    #gmEditOverlay .u-main-table th:nth-child(5), #gmEditOverlay .u-main-table td:nth-child(5) { width: 135px !important; max-width: 135px !important; }
-    #gmEditOverlay .u-main-table th:nth-child(8), #gmEditOverlay .u-main-table td:nth-child(8) { width: 100px !important; min-width: 100px !important; max-width: 100px !important; }
-    #gmEditOverlay .u-main-table th:nth-child(9), #gmEditOverlay .u-main-table td:nth-child(9) { width: 64px !important; max-width: 64px !important; }
-    #gmEditOverlay .u-main-table th:nth-child(12), #gmEditOverlay .u-main-table td:nth-child(12),
-    #gmEditOverlay .u-main-table th:nth-child(13), #gmEditOverlay .u-main-table td:nth-child(13) { min-width: 46px !important; }
+    ${buildColumnWidthCss(headerCols)}
 
     #gmEditOverlay .u-cell textarea.u-downloaded {
       width: 100%;
@@ -5108,14 +5133,6 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
 
   /* ===== 表格骨架 ===== */
   const header = cE('thead'); const hr = cE('tr');
-  const headerCols = [
-    ['名称', '210px'], ['资源', '76px'],
-    ['下集', '36px'], ['总集', '36px'], ['播出', '135px'],
-    ['延周', '36px'], ['延日', '36px'], ['BGMID', '100px'],
-    ['名称', '64px'], ['中文', '64px'],
-    ['年', '36px'], ['开播', '46px'], ['放送', '46px'], ['最大', '36px'],
-    ['更新', '36px'], ['初始', '36px'], ['前季', '36px'], ['记录', '38px'],
-  ];
   for (const [label, w] of headerCols) {
     const th = cE('th'); th.textContent = label;
     if (w) { th.style.width = w; th._initialWidth = parseInt(w) || 38; }
@@ -5156,7 +5173,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   }
   function makeDividerRow(label, bgColor) {
     const tr = cE('tr'); tr.className = 'divider-row';
-    const td = cE('td'); td.colSpan = 18;
+    const td = cE('td'); td.colSpan = headerCols.length;
     td.style.cssText = `padding:0;border:1px solid #444;background:${bgColor};color:#cfcfcf;font-weight:bold;font-size:12pt;line-height:22px;`;
     const inner = cE('div');
     inner.className = 'divider-inner';

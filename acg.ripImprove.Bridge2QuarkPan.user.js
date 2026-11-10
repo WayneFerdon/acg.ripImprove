@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name acg.ripImprove.Bridge2QuarkPan
 // @namespace http://tampermonkey.net/
-// @version 3.21.0
-// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间；转存记录以 shareId 为 key（不带 URL 前缀）且不再冗余 names/shareId 字段；链接规则行按“播出时间+资源偏移”到点才触发；记录列显示夸克已转存文件名，纯数字文件名或规则里的 ?match= 正则自动推进下集）
+// @version 3.22.0
+// @description acg.rip 桥接：夸克转存业务编排（全表一次滚动 + 内存缓存；单行定位优先可见区 + 估计位置；表头状态快速返回；记录不按时间过期，过期只依据 acg.rip 清单；转存刷新后按 acg 最终名称改名 acg名称+原始文件名；跨标签页即时触发；多个子任务并行转存（同时打开全部分享页；任务/结果按 shareId 独立存键避免并发覆盖）；子任务前等待夸克助手 unsafeWindow 挂起门（清理完成才动子任务）；子任务/刷新/改名确认后放行挂起门，自动下载与关页交给夸克助手；改名时记录曾用名；匹配按最新名→曾用名→[bgm]兜底；全量重转时写入诊断 Debug；扫描不完整时中止转存；后台标签页加大步进与超时；关键等待严格化：超时≠成功；CD 状态按 shareId 去重；面板只显示统一的“待处理”（有下一集且该集未处理）；没有下一集时清掉 CD 且不再显示，悬停可看有下一集/已处理/冷却条目与下次尝试时间；转存记录以 shareId 为 key（不带 URL 前缀）且不再冗余 names/shareId 字段；链接规则行按“播出时间+资源偏移”到点才触发；记录列显示夸克已转存文件名，纯数字文件名或规则里的 ?match= 正则自动推进下集；页面常开时 5 分钟心跳，资源时间/CD 到期自动检查并同步表格）
 // @match *://acg.rip/*
 // @match https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/acg.ripImprove.Bridge2QuarkPan.user.js
@@ -4098,6 +4098,9 @@
       }
 
       qa.setStatus('转存完成', 'done');
+      /* 结果已在本页合并完：立刻同步记录列与下集（不依赖 GM 变更事件，那个事件只发给其它标签页） */
+      try { pushRecordNotesToHost(true); } catch (e) { warn('同步记录列失败', e); }
+      try { syncNextEpFromRecords(); } catch (e) { warn('同步下集失败', e); }
       qa.setProgress('-');
 
       if (scanIncompleteCount > 0) {
@@ -4536,32 +4539,69 @@
   }
 
   /* ===== acg.rip 端 ===== */
-  /* 链接规则的行要等到“播出时间 + 资源偏移”才处理。页面一直开着时，
-   * 到点自动再跑一次触发（只安排 6 小时内的，避免超长定时器空转）。 */
+  /* 页面连续开着时，要能在“到点”后自己再检查一轮：
+   *  - 链接规则行等资源时间（播出 + 资源偏移）
+   *  - CD 冷却中的条目等 CD 到期
+   * 精确定时只排 6 小时内的；更远的由 5 分钟心跳兜住（进入窗口后会自然排上精确定时）。 */
   let _resourceTriggerTimer = null;
-  function scheduleResourceTrigger(bd) {
+  let _autoCheckHeartbeat = null;
+  let _autoCheckScheduledAt = 0;
+  const AUTO_CHECK_TICK_MS = 5 * 60 * 1000;
+  const AUTO_CHECK_HORIZON_MS = 6 * 60 * 60 * 1000;
+
+  /* 自动触发只属于列表首页（/page/1 视同首页）；其它页面只留手动入口 */
+  function isAutoTriggerPage() {
+    return location.href.replace('page/1', '').endsWith('.rip/');
+  }
+
+  function scheduleAutoCheck(bd) {
     try {
+      if (!isAutoTriggerPage()) return;
       if (_resourceTriggerTimer) { clearTimeout(_resourceTriggerTimer); _resourceTriggerTimer = null; }
       const now = Date.now();
-      let next = 0;
+      let next = 0, why = '';
+      const consider = (t, reason) => {
+        if (!(t > now)) return;
+        if (!next || t < next) { next = t; why = reason; }
+      };
       for (const row of ((bd && Array.isArray(bd.rows)) ? bd.rows : [])) {
-        const readyAt = resourceReadyTs(row);
-        if (!(readyAt > now)) continue;
-        if (!next || readyAt < next) next = readyAt;
+        consider(resourceReadyTs(row), '资源时间');
       }
-      if (!next) return;
+      const state = loadCdState();
+      for (const key of Object.keys(state)) consider(cdNextAtOf(state[key]), 'CD 到期');
+      if (!next) { _autoCheckScheduledAt = 0; return; }
       const wait = next - now;
-      if (wait > 6 * 60 * 60 * 1000) return;
+      if (wait > AUTO_CHECK_HORIZON_MS) { _autoCheckScheduledAt = 0; return; }   /* 太远：交给心跳，进入 6 小时窗口再精确排 */
       _resourceTriggerTimer = setTimeout(() => {
         _resourceTriggerTimer = null;
-        try { runQuarkAutoTrigger(); } catch (e) { warn('资源时间到点触发失败', e); }
+        if (!isAutoTriggerPage()) return;
+        try { runQuarkAutoTrigger({ quiet: true }); } catch (e) { warn('到点自动检查失败', e); }
       }, Math.max(5000, wait + 5000));
-      log(`⏰ 资源时间到点再触发：${new Date(next).toLocaleString()}（约 ${Math.max(1, Math.round(wait / 60000))} 分钟后）`);
-    } catch (e) { warn('安排资源时间触发失败', e); }
+      /* 心跳每 5 分钟会重排一次定时器，只有目标时间真的变了才打日志 */
+      if (Math.abs(next - _autoCheckScheduledAt) > 5000) {
+        _autoCheckScheduledAt = next;
+        log(`⏰ 下次自动检查（${why}）：${new Date(next).toLocaleString()}（约 ${Math.max(1, Math.round(wait / 60000))} 分钟后）`);
+      }
+    } catch (e) { warn('安排自动检查失败', e); }
+  }
+
+  /* 5 分钟心跳：页面一直开着也不会漏掉资源时间 / CD 到期；
+   * 同时把夸克侧写好的转存记录同步到表格（面板没开也会更新下集）。 */
+  function startAutoCheckHeartbeat() {
+    if (_autoCheckHeartbeat) return;
+    _autoCheckHeartbeat = setInterval(() => {
+      if (!isAutoTriggerPage()) return;
+      /* 下集可能刚被推进，先让主脚本重算 _airDate（资源时间按新集数算），再判断是否到点 */
+      try { unsafeWindow.acgripApi?.refreshAirDates?.(); } catch {}
+      try { runQuarkAutoTrigger({ quiet: true }); } catch (e) { warn('自动检查失败', e); }
+      try { pushRecordNotesToHost(true); } catch (e) { warn('同步记录列失败', e); }
+      try { syncNextEpFromRecords(); } catch (e) { warn('同步下集失败', e); }
+    }, AUTO_CHECK_TICK_MS);
+    log(`💓 自动检查心跳已启动（每 ${Math.round(AUTO_CHECK_TICK_MS / 60000)} 分钟）`);
   }
 
   function runQuarkAutoTrigger(opts = {}) {
-    const { force = false, onlyAired = false } = opts;
+    const { force = false, onlyAired = false, quiet = false } = opts;
     const folderId = getFolderId().trim();
     if (!folderId) return { triggered: false, reason: 'no-folder' };
     const bd = loadBangumiData();
@@ -4570,7 +4610,7 @@
     /* 先按“有没有下一集”清理 CD：没有下一集（未播出）或已移出清单的条目，
      * 不该再排下一轮，也不该继续显示。等下一集到点后重新开始检查。 */
     try { pruneCdNotInTargets(bd); } catch (e) { warn('清理 CD 失败', e); }
-    try { scheduleResourceTrigger(bd); } catch (e) { warn(e); }
+    try { scheduleAutoCheck(bd); } catch (e) { warn(e); }
 
     /* 自动触发：按“播出时间 + 资源偏移”判断是否到点；
      * 手动触发（force）用更宽的“已播出”口径，避免手动时被资源偏移挡住。 */
@@ -4590,7 +4630,10 @@
       if (!force && !epChanged && now - s.ts < cd) { skippedByCD++; continue; }
       need.push(t);
     }
-    log(`触发${onlyAired ? '(已播出)' : (force ? '(手动)' : '')}：CD 内跳过 ${skippedByCD}，待检查 ${need.length}（共 ${targets.length} 个 URL）`);
+    /* 心跳每 5 分钟会调一次；没有待检查项时不打日志，免得刷屏 */
+    if (!quiet || need.length) {
+      log(`触发${onlyAired ? '(已播出)' : (force ? '(手动)' : '')}：CD 内跳过 ${skippedByCD}，待检查 ${need.length}（共 ${targets.length} 个 URL）`);
+    }
     if (!need.length) return { triggered: false, reason: 'all-cd', total: targets.length };
     const touched = new Set();
     for (const t of need) {
@@ -5216,9 +5259,11 @@
   async function initAcgRipSide() {
     /* 顺手做一次通信残留清理（含值为 null 的历史空键），不必等打开夸克页 */
     try { cleanupBridgeComm(); } catch {}
-    if (location.href.replace('page/1', '').endsWith('.rip/')) {
+    if (isAutoTriggerPage()) {
       setTimeout(() => { try { runQuarkAutoTrigger(); } catch (e) { warn(e); } }, 5000);
     }
+    /* 页面一直开着也要能到点触发（资源时间/CD 到期），并定期把记录同步进表格 */
+    try { startAutoCheckHeartbeat(); } catch (e) { warn('启动自动检查心跳失败', e); }
     /* 子任务在别的标签页写转存记录 → 这里收到 GM 变更：刷新记录列，纯数字文件名顺便推进“下集” */
     try { GM_addValueChangeListener(GM_RECORDS, () => { try { onQuarkRecordsChanged(); } catch (e) { warn(e); } }); } catch {}
     setTimeout(() => {
@@ -5262,7 +5307,7 @@
     setInterval(() => { try { sweepObsoleteRecords(); } catch (e) { warn('过期清理失败', e); } }, 6 * 60 * 60 * 1000);
     try {
       unsafeWindow.acgripQuarkBridge = {
-        version: '1.6.0',
+        version: '1.7.0',
         trigger: (opts = {}) => runQuarkAutoTrigger({ force: opts.force !== false }),
         status: () => {
           const state = loadCdState();
@@ -5287,6 +5332,13 @@
           const m = syncNextEpFromRecords();
           return { notes: n, nextEp: m };
         },
+        /* 自动检查状态：心跳是否在跑、下一次定时检查排到什么时候 */
+        autoCheck: () => ({
+          page: isAutoTriggerPage(),
+          heartbeat: !!_autoCheckHeartbeat,
+          nextAt: _autoCheckScheduledAt || 0,
+          nextText: _autoCheckScheduledAt ? new Date(_autoCheckScheduledAt).toLocaleString() : '',
+        }),
       };
     } catch (e) { warn('暴露 acgripQuarkBridge 失败', e); }
     log('已启动（acg.rip 端）');

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.4.2
-// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注）
+// @version      1.4.3
+// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时同步刷新面板）
 // @author       WayneFerdon
 // @include      *acg.rip*
 // @include      /^https?:\/\/(?:www\.)?(?:bgm|bangumi)\.tv\/subject\/\d+\/?$/
@@ -6028,7 +6028,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
       });
     });
   };
-  overlay._syncRowUpdate = (rule, newNext) => {
+  overlay._syncRowUpdate = (rule, newNext, opts = {}) => {
     let changed = false;
     for (const tr of tbody.querySelectorAll('tr')) {
       const row = tr._row;
@@ -6052,7 +6052,8 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
 
       if (typeof tr._updateDerived === 'function') tr._updateDerived();
 
-      scheduleDraftSave();
+      /* 隐藏的面板不要整表写草稿：面板里的其它字段可能已经过时 */
+      if (opts.saveDraft !== false) scheduleDraftSave();
       if (oldVal !== String(newNext)) changed = true;
       break;
     }
@@ -6250,7 +6251,9 @@ if (/^acg\.rip$/i.test(location.hostname)) {
     /* 面板开着时刷新记录列（备注内容没变也可以调，幂等） */
     refreshRecords: () => refreshRecordCells(),
 
-    /* 改某一行的下集：写 bangumiData（GM+localStorage）、刷新面板、同步草稿 */
+    /* 改某一行的下集：写 bangumiData（GM+localStorage）、刷新面板、同步草稿。
+     * 即使 bangumiData 里已经是这个值，也要把面板/草稿同步一次——
+     * 面板可能停在一份旧草稿上，否则会一直显示旧集数。 */
     updateRowNext: (rule, next) => {
       const key = String(rule || '').trim();
       const val = Number(next);
@@ -6259,14 +6262,23 @@ if (/^acg\.rip$/i.test(location.hostname)) {
       if (!bd || !Array.isArray(bd.rows)) return false;
       const row = bd.rows.find(r => String((r && r.规则) || '').trim() === key);
       if (!row) return false;
-      if (String(row.下集 ?? '') === String(val)) return false;
-      row.下集 = String(val);
-      setValue('bangumiData', bd);
-      if (_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none'
+      const changed = String(row.下集 ?? '') !== String(val);
+      if (changed) {
+        row.下集 = String(val);
+        setValue('bangumiData', bd);
+      }
+
+      /* 面板存在就同步这一行（隐藏着也同步，重新打开时不会又变回旧值）。
+       * 隐藏时不让面板整表写草稿：它里面的其它字段可能已经过时。 */
+      const panelVisible = !!(_gmEditOverlay && _gmEditOverlay.style.display !== 'none');
+      let panelHit = false;
+      if (_gmEditOverlay && _gmEditOverlay.isConnected
           && typeof _gmEditOverlay._syncRowUpdate === 'function') {
-        _gmEditOverlay._syncRowUpdate(key, val);
-      } else {
-        /* 面板没开：顺手改掉可能残留的草稿，避免下次打开面板把它覆盖回去 */
+        try { panelHit = _gmEditOverlay._syncRowUpdate(key, val, { saveDraft: panelVisible }) === true; } catch (e) {}
+      }
+
+      /* 面板没开 / 隐藏 / 没命中这一行：改掉草稿里这一行，避免下次打开面板把它覆盖回去 */
+      if (!panelHit || !panelVisible) {
         try {
           const raw = localStorage.getItem(DRAFT_KEY);
           if (raw) {
@@ -6285,7 +6297,7 @@ if (/^acg\.rip$/i.test(location.hostname)) {
           }
         } catch (e) {}
       }
-      return true;
+      return changed || panelHit;
     },
   };
   console.log('[acgripApi] 已暴露 v1.6.0');

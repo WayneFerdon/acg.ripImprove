@@ -17,6 +17,7 @@ import json
 import ctypes
 import hashlib
 import sqlite3
+import struct
 import shutil
 import threading
 import urllib.parse
@@ -29,6 +30,18 @@ TARGET_DIR = r"F:\番組"
 FILENAME_REGEX = r"\[(Ani|Nekomoe kissaten)\]|1080p\.mp4"
 URL_REGEX = r"quark\.c"
 DEFAULT_DOWNLOAD_DIR = r"C:\Users\WayneFerdon\Downloads"
+
+# ===== 回收站里的种子元数据（.torrent）=====
+# FDM / 浏览器把 .torrent 导入后，常把这个元数据文件直接丢进系统回收站；
+# 种子任务完成、媒体文件搬走后它已无用处，却一直占着回收站（普通"清空回收站"
+# 会连别的东西一起删，所以基本没人清）。这里按"已完成的种子任务"精确匹配后
+# 永久删除这些 .torrent —— 只动 .torrent，其它回收站内容一律不碰。
+PURGE_RECYCLED_TORRENTS = True
+# 兼容历史：FDM 已从任务列表里删掉的旧种子，按 acg.rip 的命名签名兜底
+PURGE_RECYCLED_TORRENTS_BY_SIGNATURE = True
+TORRENT_TRASH_SIGNATURE_PREFIX = "[acgrip]"
+TORRENT_TRASH_PURGE_INTERVAL = 60     # 两次扫描回收站的最小间隔（秒）
+TORRENT_TRASH_PURGE_MAX = 50          # 单次最多清理多少个，异常时也炸不了
 
 FORCE_SCAN_INTERVAL = 1
 if getattr(sys, 'frozen', False):
@@ -1008,17 +1021,164 @@ def clean_torrent_files(directory, filename):
 
     pattern = re.compile(rf"^{re.escape(base_name)}(?:\s*\(\d+\))?{re.escape(ext)}$", re.IGNORECASE)
 
+    hit = 0
     try:
         for f in os.listdir(directory):
             if pattern.match(f) and not is_temp_file(f):
                 full_path = os.path.join(directory, f)
                 if os.path.isfile(full_path):
+                    hit += 1
                     if move_to_recycle_bin(full_path):
                         log_msg(f"🗑️ 已移入回收站: {f}")
                     else:
                         log_msg(f"❌ 移入回收站失败: {f}")
+        if not hit:
+            # FDM 通常在导入种子后就把 .torrent 丢进回收站了，这里必然找不到；
+            # 那些条目由 purge_recycled_torrents() 按已完成任务匹配后清掉。
+            log_msg(f"ℹ️ 下载目录无种子文件（多半已被 FDM 移入回收站）: {filename}")
     except Exception as e:
         log_msg(f"清理种子文件时出错: {e}")
+
+# ===== 回收站种子元数据清理 =====
+_RECYCLE_ROOT = r"C:\$Recycle.Bin"
+_torrent_purge_at = 0.0
+
+
+def _recycle_bin_dirs():
+    """当前用户可读的回收站目录（C:\\$Recycle.Bin\\<SID>）"""
+    out = []
+    try:
+        for sid in os.listdir(_RECYCLE_ROOT):
+            p = os.path.join(_RECYCLE_ROOT, sid)
+            if os.path.isdir(p):
+                out.append(p)
+    except Exception:
+        pass
+    return out
+
+
+def _recycle_original_path(info_path):
+    """解析 $I 元数据，返回被删文件的原始完整路径；失败返回空串。
+
+    v2（Win10+）：24 字节头 + 4 字节字符数 + UTF-16LE 路径
+    v1（Vista/7）：ANSI 路径
+    """
+    try:
+        with open(info_path, 'rb') as f:
+            raw = f.read()
+        if len(raw) < 28:
+            return ''
+        name_len = struct.unpack('<I', raw[24:28])[0]
+        body = raw[28:]
+        text = body[:name_len * 2].decode('utf-16-le', 'ignore').rstrip('\x00')
+        if not text or (':' not in text and '\\' not in text):
+            text = body[:name_len].decode('mbcs', 'ignore').rstrip('\x00')
+        return text.strip()
+    except Exception:
+        return ''
+
+
+def _finished_torrent_names():
+    """已完成种子任务对应的 .torrent 文件名（小写 basename）集合。"""
+    names = set()
+    if not os.path.exists(DB_PATH):
+        return names
+    conn = None
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        cur = conn.cursor()
+        cur.execute("SELECT url, webPageUrl, title, preferredFileTitle, "
+                    "finishedTime FROM downloads")
+        for url, web_url, title, pref, finished in cur.fetchall():
+            if (finished or 0) <= 0:
+                continue
+            for raw_url in (url or '', web_url or ''):
+                if '.torrent' not in raw_url.lower():
+                    continue
+                base = extract_filename_from_url(raw_url)
+                if base and base.lower().endswith('.torrent'):
+                    names.add(base.lower())
+            for t in (title or '', pref or ''):
+                t = (t or '').strip()
+                if t and t.lower().endswith('.torrent'):
+                    names.add(t.lower())
+    except Exception:
+        pass
+    finally:
+        if conn:
+            conn.close()
+    return names
+
+
+def purge_recycled_torrents(force=False):
+    """永久删除回收站里「已完成种子任务」的 .torrent 元数据，返回清理个数。
+
+    匹配条件（缺一不可）：
+      1) 条目原始文件名是 .torrent；
+      2) 且命中以下之一：
+         a. 文件名与 FDM 库里已完成种子任务的 .torrent 完全一致；
+         b. 以 "[acgrip]" 开头（acg.rip 自动下载的命名签名，兼容 FDM
+            已从任务列表删掉的历史种子）。
+    其余回收站内容一律不动；单次最多 TORRENT_TRASH_PURGE_MAX 个。
+    """
+    global _torrent_purge_at
+    if not PURGE_RECYCLED_TORRENTS:
+        return 0
+    now = time.time()
+    if not force and now - _torrent_purge_at < TORRENT_TRASH_PURGE_INTERVAL:
+        return 0
+    _torrent_purge_at = now
+
+    names = _finished_torrent_names()
+    if not names and not PURGE_RECYCLED_TORRENTS_BY_SIGNATURE:
+        return 0
+
+    removed = failed = 0
+    samples = []
+    for bin_dir in _recycle_bin_dirs():
+        try:
+            entries = os.listdir(bin_dir)
+        except Exception:
+            continue          # 其它用户的 SID 目录，跳过
+        for entry in entries:
+            if not entry.startswith('$I'):
+                continue
+            info_path = os.path.join(bin_dir, entry)
+            orig = _recycle_original_path(info_path)
+            if not orig:
+                continue
+            base = os.path.basename(orig)
+            low = base.lower()
+            if not low.endswith('.torrent'):
+                continue
+
+            matched = low in names
+            if (not matched and PURGE_RECYCLED_TORRENTS_BY_SIGNATURE
+                    and low.startswith(TORRENT_TRASH_SIGNATURE_PREFIX.lower())):
+                matched = True
+            if not matched:
+                continue
+
+            data_path = os.path.join(bin_dir, '$R' + entry[2:])
+            try:
+                if os.path.isfile(data_path):
+                    os.remove(data_path)
+                os.remove(info_path)
+                removed += 1
+                if len(samples) < 5:
+                    samples.append(base)
+            except Exception:
+                failed += 1
+            if removed >= TORRENT_TRASH_PURGE_MAX:
+                break
+
+    if removed or failed:
+        detail = f"（如 {', '.join(samples)}）" if samples else ""
+        tail = f"，{failed} 个失败（可能被占用）" if failed else ""
+        log_msg(f"🧹 回收站种子清理：永久删除 {removed} 个 .torrent{detail}{tail}")
+    return removed
+
+
 
 def process_db():
     if not os.path.exists(DB_PATH):
@@ -1235,6 +1395,10 @@ def main():
     cleanup_stale_parts()
     log_msg("执行首次扫描...")
     process_db()
+    try:
+        purge_recycled_torrents(force=True)
+    except Exception as e:
+        log_msg(f"[回收站清理异常] {e}")
     log_msg("首次扫描完成，进入监控循环。")
     last_sig = get_db_file_signature()
     last_force_scan_time = time.time()
@@ -1251,6 +1415,10 @@ def main():
                 
                 process_db()
                 last_force_scan_time = current_time
+                try:
+                    purge_recycled_torrents()
+                except Exception as e:
+                    log_msg(f"[回收站清理异常] {e}")
                 
         except KeyboardInterrupt:
             log_msg("用户中断，退出。")

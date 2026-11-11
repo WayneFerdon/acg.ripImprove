@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.5.1
-// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 按钮，数字转 \d+，180 天未命中自动失效；未查看边界的最旧一条用浅蓝色标注））
+// @version      1.5.2
+// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 按钮，数字转 \d+，仅作用于「未查看」不影响下载，180 天未命中自动失效；未查看边界的最旧一条用浅蓝色标注））
 // @author       WayneFerdon
 // @include      *acg.rip*
 // @include      /^https?:\/\/(?:www\.)?(?:bgm|bangumi)\.tv\/subject\/\d+\/?$/
@@ -636,10 +636,11 @@ function updateViewedButton(btn) {
   btn.textContent = '标记已查看';
 }
 
-/* ===== 排除规则（未查看 / 自动下载共用） =====
+/* ===== 排除规则（只作用于「未查看」，不影响 torrent 下载） =====
  * 列表页每行「下载」按钮旁新增 ⊘：把该条标题转成正则加进排除列表；
  * 转换时把所有连续数字换成 \d+，于是同一部番的 07/08/12 都命中同一条规则；
  * 命中排除、或已经下载过的条目不再算「未查看」，未查看边界会自动后移；
+ * 下载流程完全不看排除列表 —— 该下的照旧下。
  * 规则每命中一次刷新时间，超过 180 天没再命中就整条删掉。 */
 const EXCLUDE_KEY = 'acgrip_exclude_rules';
 const EXCLUDE_TTL = 180 * _1d;
@@ -708,8 +709,6 @@ function matchExcludeRule(title, touch = true) {
   }
   return null;
 }
-
-function isExcludedTitle(title) { return !!matchExcludeRule(title); }
 
 function addExcludeRule(title) {
   const re = titleToExcludePattern(title);
@@ -807,7 +806,7 @@ function decorateExclude(item, title) {
   btn.style.borderColor = hit ? '#e06c75' : '#666';
   btn.title = hit
     ? `已排除：${hit.re}\n再点一次只会刷新排除时间`
-    : '把这条加入排除列表（数字自动换成 \\d+）：不再作为「未查看」，也不触发自动下载';
+    : '把这条加入排除列表（数字自动换成 \\d+）：该条不再算「未查看」，但不影响 torrent 下载';
 }
 
 /* 菜单：查看 / 删除排除规则 */
@@ -942,8 +941,6 @@ async function asyncDownloadTorrents() {
       html = page === 1 ? document.documentElement.outerHTML : await $ajax.fetch(`/page/${page}`);
       onHandleItems(({ item, found, key, title, href }) => {
         if (done = (url2num(href) <= url2num(last))) return;
-        /* 命中排除规则：不下载（matchExcludeRule 顺带刷新该规则的排除时间） */
-        if (isExcludedTitle(title)) return;
         if (!found || isDownloaded(found, href)) return;
 
         const bd = getValue('bangumiData') ?? { rows: [] };
@@ -1015,7 +1012,6 @@ async function downloadSince(sinceUrl, onlyRules = null) {
       if (!Number.isNaN(n) && n < pageMin) pageMin = n;
       if (Number.isNaN(n) || n <= since) return;
       if (onlyRules && !onlyRules.has(key)) return;
-      if (isExcludedTitle(title)) return;
       if (!found || isDownloaded(found, href)) return;
       const torrentLink = item.querySelector('a[href*=".torrent"]');
       if (torrentLink) torrentLink._acgripHandled = true;

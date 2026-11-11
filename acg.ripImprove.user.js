@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.5.2
-// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 按钮，数字转 \d+，仅作用于「未查看」不影响下载，180 天未命中自动失效；未查看边界的最旧一条用浅蓝色标注））
+// @version      1.5.3
+// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
 // @include      /^https?:\/\/(?:www\.)?(?:bgm|bangumi)\.tv\/subject\/\d+\/?$/
@@ -45,7 +45,6 @@ let _gmEditRelayout = null;
 const PANEL_OPEN_KEY = 'acgrip_panel_open';
 
 const $ajax = initAjax();
-onHandle();
 new MutationObserver(muts => muts.forEach(onHandle)).observe(document.documentElement, { childList: true });
 /* ===== 页面内跳转（Turbolinks / SPA）后的 UI 状态恢复 =====
  * acg.rip 用 Turbolinks 做页内跳转（/page/N、index 等），不会重新触发 DOMContentLoaded，
@@ -641,9 +640,12 @@ function updateViewedButton(btn) {
  * 转换时把所有连续数字换成 \d+，于是同一部番的 07/08/12 都命中同一条规则；
  * 命中排除、或已经下载过的条目不再算「未查看」，未查看边界会自动后移；
  * 下载流程完全不看排除列表 —— 该下的照旧下。
- * 规则每命中一次刷新时间，超过 180 天没再命中就整条删掉。 */
+ * 生效中的规则每命中一次刷新时间，超过 180 天没再命中就整条删掉。
+ * ⊘ 是开关：对已排除的条目再点一次 → 立刻按「未排除」显示与判定，
+ * 同时记下取消时间，满 24 小时后才真正删除这条规则及其记录。 */
 const EXCLUDE_KEY = 'acgrip_exclude_rules';
 const EXCLUDE_TTL = 180 * _1d;
+const EXCLUDE_OFF_TTL = 24 * _1h;
 let excludeRules = null;
 let _excludeSaveTid = null;
 
@@ -662,7 +664,7 @@ function loadExcludes() {
     for (const it of raw) {
       const re = String((it && it.re) || '').trim();
       if (!re) continue;
-      list.push({ re, ts: Number(it.ts) || 0, hits: Number(it.hits) || 0, _re: null });
+      list.push({ re, ts: Number(it.ts) || 0, hits: Number(it.hits) || 0, offAt: Number(it.offAt) || 0, _re: null });
     }
   }
   excludeRules = list;
@@ -672,7 +674,7 @@ function loadExcludes() {
 
 function saveExcludes() {
   if (_excludeSaveTid) { clearTimeout(_excludeSaveTid); _excludeSaveTid = null; }
-  setValue(EXCLUDE_KEY, (excludeRules || []).map(r => ({ re: r.re, ts: r.ts, hits: r.hits })));
+  setValue(EXCLUDE_KEY, (excludeRules || []).map(r => ({ re: r.re, ts: r.ts, hits: r.hits, offAt: r.offAt || 0 })));
 }
 
 function scheduleSaveExcludes() {
@@ -680,13 +682,18 @@ function scheduleSaveExcludes() {
   _excludeSaveTid = setTimeout(() => { _excludeSaveTid = null; saveExcludes(); }, 1500);
 }
 
-/* 距上次命中超过 180 天的规则连同记录一并删掉 */
+/* 清理：
+ *  - 已取消排除的规则，满 24 小时整条删除（记录一并删掉）；
+ *  - 生效中的规则，距上次命中超过 180 天删除。 */
 function pruneExcludes() {
   if (!Array.isArray(excludeRules)) return 0;
   const now = Date.now();
-  const kept = excludeRules.filter(r => r.ts > 0 && now - r.ts <= EXCLUDE_TTL);
+  const kept = excludeRules.filter(r => {
+    if (r.offAt) return now - r.offAt < EXCLUDE_OFF_TTL;
+    return r.ts > 0 && now - r.ts <= EXCLUDE_TTL;
+  });
   const removed = excludeRules.length - kept.length;
-  if (removed) { excludeRules = kept; saveExcludes(); console.log(`[排除] 已删除 ${removed} 条过期规则（>180 天未命中）`); }
+  if (removed) { excludeRules = kept; saveExcludes(); console.log(`[排除] 已删除 ${removed} 条过期/已取消的规则`); }
   return removed;
 }
 
@@ -697,17 +704,43 @@ function normExcludeRule(rule) {
   return rule._re;
 }
 
-/* 命中判定：touch=true 时刷新该规则的「上次排除时间」与命中次数 */
-function matchExcludeRule(title, touch = true) {
+/* 找命中的规则。includeOff=false 时跳过「已取消排除」（offAt）的规则，
+ * 所以取消后显示与判定立即按未排除处理，只是记录还留 24 小时。 */
+function findExcludeRule(title, includeOff = false) {
   const s = String(title ?? '');
   if (!s) return null;
   for (const rule of loadExcludes()) {
+    if (!includeOff && rule.offAt) continue;
     const re = normExcludeRule(rule);
     if (!re || !re.test(s)) continue;
-    if (touch) { rule.ts = Date.now(); rule.hits = (rule.hits || 0) + 1; scheduleSaveExcludes(); }
     return rule;
   }
   return null;
+}
+
+/* 命中判定：touch=true 时刷新该规则的「上次排除时间」与命中次数 */
+function matchExcludeRule(title, touch = true) {
+  const rule = findExcludeRule(title, false);
+  if (!rule) return null;
+  if (touch) { rule.ts = Date.now(); rule.hits = (rule.hits || 0) + 1; scheduleSaveExcludes(); }
+  return rule;
+}
+
+/* 取消排除：立即失效（显示/边界都不再生效），记录留到 24 小时后由 pruneExcludes 删除 */
+function deactivateExcludeRule(rule) {
+  if (!rule) return false;
+  rule.offAt = Date.now();
+  saveExcludes();
+  return true;
+}
+
+/* 24 小时内再点一次：恢复为生效 */
+function reactivateExcludeRule(rule) {
+  if (!rule) return false;
+  rule.offAt = 0;
+  rule.ts = Date.now();
+  saveExcludes();
+  return true;
 }
 
 function addExcludeRule(title) {
@@ -715,8 +748,8 @@ function addExcludeRule(title) {
   if (!re) return null;
   loadExcludes();
   let rule = excludeRules.find(r => r.re === re);
-  if (rule) { rule.ts = Date.now(); }
-  else { rule = { re, ts: Date.now(), hits: 0, _re: null }; excludeRules.push(rule); }
+  if (rule) { rule.ts = Date.now(); rule.offAt = 0; }
+  else { rule = { re, ts: Date.now(), hits: 0, offAt: 0, _re: null }; excludeRules.push(rule); }
   saveExcludes();
   return rule;
 }
@@ -767,7 +800,15 @@ function syncViewedBoundary() {
   return advanced;
 }
 
-/* 每行「下载」按钮旁的 ⊘：加入排除列表 */
+/* 该条是否还在「未查看」区间（早于/等于最旧未查看的条目一律按已查看处理） */
+function isInUnviewedRegion(href) {
+  if (lastViewed == null) return false;
+  const v = url2num(lastViewed), n = url2num(href);
+  if (!Number.isFinite(v) || !Number.isFinite(n)) return false;
+  return n > v;
+}
+
+/* 每行「下载」按钮旁的 ⊘：排除 / 取消排除 开关 */
 function ensureExcludeButton(item) {
   if (!item || item.ownerDocument !== document) return null;
   const action = item.querySelector('td.action') || item.querySelector('.action');
@@ -784,9 +825,23 @@ function ensureExcludeButton(item) {
     const a = item.querySelector('.title .title a');
     const title = a ? a.innerHTML.replace(/\s+/g, ' ') : '';
     if (!title) return;
-    const rule = addExcludeRule(title);
-    if (!rule) return;
-    showToast(`已排除：${rule.re}`);
+
+    const active = matchExcludeRule(title, false);
+    if (active) {
+      /* 已排除 → 取消：立刻按未排除显示与判定，记录 24 小时后才删 */
+      deactivateExcludeRule(active);
+      showToast('已取消排除（24 小时后删除该规则）');
+    } else {
+      const offRule = findExcludeRule(title, true);   /* 含已取消的规则 */
+      if (offRule) {
+        reactivateExcludeRule(offRule);
+        showToast(`已重新排除：${offRule.re}`);
+      } else {
+        const rule = addExcludeRule(title);
+        if (!rule) return;
+        showToast(`已排除：${rule.re}`);
+      }
+    }
     const moved = syncViewedBoundary();
     onHandleItems(setDisplayHighlight);
     if (moved) showToast(`未查看边界后移 ${moved} 条`);
@@ -795,18 +850,23 @@ function ensureExcludeButton(item) {
   return btn;
 }
 
-function decorateExclude(item, title) {
+function decorateExclude(item, title, href) {
   if (!item || item.ownerDocument !== document) return;
   const btn = ensureExcludeButton(item);
   const hit = title ? matchExcludeRule(title, false) : null;
-  item.classList.toggle('acgrip-excluded', !!hit);
-  if (hit) item.style.opacity = '0.55'; else item.style.removeProperty('opacity');
+  /* 只有「未查看区间内」的排除才用排除样式；
+   * 早于最旧未查看的条目已经翻篇，按正常的已查看/已下载配色显示。 */
+  const mark = !!hit && isInUnviewedRegion(href);
+  item.classList.toggle('acgrip-excluded', mark);
+  if (mark) item.style.opacity = '0.55'; else item.style.removeProperty('opacity');
   if (!btn) return;
-  btn.style.color = hit ? '#e06c75' : '#999';
-  btn.style.borderColor = hit ? '#e06c75' : '#666';
-  btn.title = hit
-    ? `已排除：${hit.re}\n再点一次只会刷新排除时间`
-    : '把这条加入排除列表（数字自动换成 \\d+）：该条不再算「未查看」，但不影响 torrent 下载';
+  btn.style.color = mark ? '#e06c75' : '#999';
+  btn.style.borderColor = mark ? '#e06c75' : '#666';
+  btn.title = !hit
+    ? '把这条加入排除列表（数字自动换成 \\d+）：该条不再算「未查看」，但不影响 torrent 下载'
+    : (mark
+        ? `已排除：${hit.re}\n点击改为「未排除」（显示与判定立即生效，24 小时后删除该规则）`
+        : `已在排除列表，但该条早于最旧未查看，按已查看样式显示\n${hit.re}\n点击可取消排除`);
 }
 
 /* 菜单：查看 / 删除排除规则 */
@@ -814,11 +874,15 @@ function manageExcludeRules() {
   const list = loadExcludes();
   if (!list.length) { alert('排除列表为空'); return; }
   const lines = list.map((r, i) => {
+    if (r.offAt) {
+      const left = Math.max(0, Math.ceil((EXCLUDE_OFF_TTL - (Date.now() - r.offAt)) / _1h));
+      return `${i + 1}. ${r.re}\n   已取消排除，${left} 小时后删除该规则`;
+    }
     const days = Math.max(0, Math.floor((Date.now() - r.ts) / _1d));
     return `${i + 1}. ${r.re}\n   命中 ${r.hits || 0} 次，上次排除 ${days} 天前`;
   }).join('\n');
   let ans;
-  try { ans = prompt(`排除规则（${list.length} 条，超过 180 天未命中会自动删除）：\n\n${lines}\n\n输入要删除的序号（多个用逗号分隔），输入 all 清空，留空取消：`, ''); }
+  try { ans = prompt(`排除规则（${list.length} 条，生效中：超过 180 天未命中自动删除；已取消：24 小时后删除）：\n\n${lines}\n\n输入要删除的序号（多个用逗号分隔），输入 all 清空，留空取消：`, ''); }
   catch { ans = null; }
   if (ans == null || !ans.trim()) return;
   const v = ans.trim();
@@ -861,7 +925,7 @@ function setDisplayHighlight({ item, found, href, title, oldestUnviewedHref }) {
     if (color) el.style.color = color;
     else el.style.removeProperty('color');
   }
-  try { decorateExclude(item, title); } catch (e) { console.error('[exclude] decorate', e); }
+  try { decorateExclude(item, title, href); } catch (e) { console.error('[exclude] decorate', e); }
   function getColor() {
     switch (true) {
       /* 「未查看」的最旧一条优先标浅蓝：它是继续浏览的起点，不能被番组状态色盖掉 */
@@ -7148,3 +7212,8 @@ if (isBangumiHomeHost()) {
     kickoff();
   }
 }
+/* 启动：必须放在所有模块级 let/const 之后。
+ * 早于声明调用会落进暂时性死区（TDZ）—— 之前 onHandle() 写在文件开头，
+ * 首次加载时 decorateExclude 抛 "Cannot access 'excludeRules' before initialization"，
+ * 被 try/catch 吞掉，表现就是「刷新后排除样式不生效，只有按钮」。 */
+onHandle();

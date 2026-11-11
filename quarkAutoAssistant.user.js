@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.4.2
-// @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
+// @version      6.4.3
+// @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。空目录/少量文件按结构证据判到底，扫描未确认自动重试一轮；含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
 // @updateURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -1237,6 +1237,14 @@
     const w = tableWrap();
     return w ? w.querySelector('.ant-table-body') : null;
   }
+  /* 当前渲染出来的数据行数（不含文件夹/灰框/加载行） */
+  function renderedDataRowCount() {
+    try {
+      const w = tableWrap();
+      if (w) return w.querySelectorAll('tr.ant-table-row').length;
+      return document.querySelectorAll('tr.ant-table-row').length;
+    } catch { return 0; }
+  }
 
   /* 整表 loading（刷新/切目录）才叫 loading。
    * 注意：列表分批加载时，底部"加载更多"行常驻 .ant-spin-spinning，
@@ -1263,27 +1271,49 @@
    * 此时表体 0 行、高度 0，**底部永远不会渲染 tr.drag-bottom**，
    * 所以空目录只能靠这条判据收工（否则会被当成"到底但没有灰框 = 加载停滞"）。
    *
-   * 三个条件缺一不可：
+   * 判定顺序（前三项是硬性前提）：
    *   1) 不在整表 loading（切目录时会先闪 loading，那一拍行数也是 0）
-   *   2) 空列表容器可见（opacity 由 0 动画到 1，>0.01 才算真的显示）
-   *   3) 表格里一个数据行都没有（挡住"动画过渡帧/旧 DOM 残留"的假空） */
+   *   2) 没有"加载更多"行
+   *   3) 表格里一个数据行都没有（挡住"动画过渡帧/旧 DOM 残留"的假空）
+   *   4) 结构证据（ant-table-empty / .ant-table-placeholder）**或**占位层可见
+   *      —— 只认 opacity 不可靠：后台标签页里淡入动画可能停在 0，会把空目录
+   *      误判成加载停滞，清理一直"未就绪" */
   function isEmptyUiVisible() {
     if (isLoadingAnimPresent()) return false;
+    if (hasMoreRow()) return false;            /* 还有下一批：肯定不是空目录 */
     const scope = tableWrap() || document;
-    const wrap = scope.querySelector('.table-empty-wrap') || document.querySelector('.table-empty-wrap');
-    if (!wrap) return false;
-    let op = '';
-    try { op = getComputedStyle(wrap).opacity; } catch {}
-    if (op === '' || op == null) op = (wrap.style && wrap.style.opacity) || '';
-    if (op === '') return false;
-    const n = Number(op);
-    if (!Number.isFinite(n) || n <= 0.01) return false;
-    /* 有数据行就不是空目录：切目录时占位层会先显示、旧行还没卸载 */
+    /* 有数据行就不是空目录：切目录时占位层会先显示、旧行还没卸载。
+     * 只看当前文件表格 —— 页面其它位置（弹窗/隐藏表格）的行不算，
+     * 否则那些残留行会让空目录永远判不出来。 */
     try {
       if (scope.querySelector('tr.ant-table-row')) return false;
-      if (document.querySelectorAll('tr.ant-table-row').length) return false;
     } catch {}
-    return true;
+
+    /* 结构证据：Ant 空表带 ant-table-empty 并渲染 .ant-table-placeholder。
+     * 这比 opacity 可靠 —— 后台标签页里占位层的淡入动画可能停在 opacity:0，
+     * 只看 opacity 会把"确实是空目录"误判成"加载停滞"（清理一直未就绪）。 */
+    let structural = false;
+    try {
+      const table = scope.querySelector('table.ant-table') || scope.querySelector('.ant-table');
+      const emptyClass = !!(table && table.classList && table.classList.contains('ant-table-empty'));
+      /* 占位层必须是"显示中"的；隐藏模板不算 */
+      const ph = scope.querySelector('.ant-table-placeholder');
+      const phShown = !!(ph && ((ph.getClientRects && ph.getClientRects().length > 0) || ph.offsetParent));
+      structural = emptyClass || phShown;
+    } catch {}
+
+    const wrap = scope.querySelector('.table-empty-wrap') || document.querySelector('.table-empty-wrap');
+    let visible = false;
+    if (wrap) {
+      let op = '';
+      try { op = getComputedStyle(wrap).opacity; } catch {}
+      if (op === '' || op == null) op = (wrap.style && wrap.style.opacity) || '';
+      if (op !== '') {
+        const n = Number(op);
+        visible = Number.isFinite(n) && n > 0.01;
+      }
+    }
+    return structural || visible;
   }
 
   function getVirtualScrollInfo(body = null) {
@@ -1428,9 +1458,12 @@
    * 且每批只加载 100 行，必须滚到底、等每一批到达）。
    *
    * 结束判据（全部是 UI 证据，不看耗时）：
+   *   0) 空目录（ant-table-empty / .ant-table-placeholder，0 数据行）连续 2 拍确认；
    *   1) 渲染出底部灰框（tr.drag-bottom）且没有"加载更多"行，行集合/滚动高度连续 3 轮不变；
-   *   2) 几何到底 + 无"加载更多"行，行集合/滚动高度连续 3 轮不变（分享页兜底）；
-   *   3) "加载更多"行还在但 spinner 已停、连续多轮没有新行 → 加载停滞，结束并标记 complete=false。
+   *   2) 一屏内没有滚动空间（scrollHeight ≈ clientHeight）+ 无"加载更多"行，
+   *      行集合/滚动高度连续多轮不变 → 少量文件时底部灰框可能不渲染，按到底收工；
+   *   3) 几何到底 + 无"加载更多"行，行集合/滚动高度连续多轮不变（分享页兜底）；
+   *   4) "加载更多"行还在但 spinner 已停、连续多轮没有新行 → 加载停滞，标记 complete=false。
    *
    * 返回 files：按列表顺序排列的全量文件（含最后一次读到的 checked 状态），
    * 后续勾选/标记/清除都基于它，不再用"当前渲染的十几行"。
@@ -1504,11 +1537,18 @@
       addAll();
       if (report && files.length !== lastReport) { lastReport = files.length; try { report(files.length, allKeys.size); } catch {} }
 
-      /* 空目录：`ant-table-empty` + `.table-empty-wrap`（拖拽/粘贴到灰框内上传），
-       * 表体高度 0 且底部**永远不会**渲染 tr.drag-bottom。
-       * 不在这里直接收工，就会掉进下面"到底但没灰框"的分支，被误判成加载停滞。 */
-      if (!allKeys.size && isEmptyUiVisible()) {
-        if (++emptyStable >= 2) { emptyConfirmed = true; reachedBottom = true; break; }
+      /* 空目录：`ant-table-empty` + 占位层（拖拽/粘贴上传），表体高度 0 且
+       * 底部**永远不会**渲染 tr.drag-bottom。不在这里收工，就会掉进下面
+       * "到底但没灰框"的分支，被误判成加载停滞。
+       * 用"当前渲染行数"而不是 allKeys：扫描早段可能收过旧目录的残留行，
+       * 那些行消失后 allKeys 仍非空，会把空目录挡在门外。 */
+      if (renderedDataRowCount() === 0 && isEmptyUiVisible()) {
+        if (++emptyStable >= 2) {
+          emptyConfirmed = true; reachedBottom = true;
+          /* 残留行属于已消失的旧状态：清掉，别拿它去比记录/删文件 */
+          byFid.clear(); allKeys.clear(); files.length = 0;
+          break;
+        }
         await sleep(150, true);
         continue;
       }
@@ -1540,6 +1580,17 @@
       }
 
       if (atBottom && !more) {
+        /* 一屏内就放得下（scrollHeight ≈ clientHeight，没有滚动空间）且没有更多批次：
+         * 所有行都已渲染。少量文件时 Quark 可能根本不渲染底部灰框，再等只会永远"未确认"。
+         * 必须有至少 1 个已渲染数据行：0 行时只信空目录结构判据，
+         * 否则切目录的瞬间（行还没挂上）会被误判成"到底了"。 */
+        const contentFits = renderedDataRowCount() > 0 && scrollH <= (body.clientHeight || 0) + 4;
+        if (contentFits) {
+          if (!grew) stable++; else stable = 0;
+          if (stable >= bottomStable) { reachedBottom = true; break; }
+          await sleep(160, true);
+          continue;
+        }
         /* 个人页只有"底部灰框"才是到底硬证据。
          * more 行消失可能只是"批次间隙"（下一批还没到），
          * 此时判完成会漏掉后面所有批次 → 进而误删记录。
@@ -1580,7 +1631,7 @@
     try { body.scrollTop = originTop; } catch {}
     await sleep(80, true);
 
-    const empty = emptyConfirmed || (isEmptyUiVisible() && allKeys.size === 0);
+    const empty = emptyConfirmed || (isEmptyUiVisible() && renderedDataRowCount() === 0);
     if (empty) reachedBottom = true;   /* 空目录本身就是"到底" */
     reachedBottom = reachedBottom || isListAtBottom();
     /* 推断值只用于诊断：行高不均会让它偏高/偏低，绝不能拿它当完成判据
@@ -2840,6 +2891,7 @@
     if (_controllerRunning) return;
     if (!isListPage()) return;
     _controllerRunning = true;
+    let scanRetried = false;   /* 扫描"未确认"只自动重开一轮，避免死循环 */
     try {
       GATE.acg = isAcgInvokedFlag();
       if (GATE.acg) log('⛩ 检测到 acg 唤起标记（sessionStorage，不落盘）');
@@ -2863,6 +2915,16 @@
             gateSet('ready', `跳过清理(${reason})`);
             setStatus('非文件夹视图，跳过清理', 'running');
           } else if (GATE.acg) {
+            /* 扫描"未确认"多半是列表还在渲染 / 空目录占位层动画没跑完：
+             * 这时还没删任何文件，重开一轮再试一次是安全的；仍失败才挂起。 */
+            if (reason === 'scan-incomplete' && !scanRetried) {
+              scanRetried = true;
+              gateSet('cleanup', `扫描重试（${reason}）`);
+              setStatus('列表未确认，正在重试...', 'running');
+              warn(`⛩ 清理扫描未确认（${reason}）：2s 后重试一轮`);
+              await sleep(2000, true);
+              continue;
+            }
             /* acg 唤起：清不干净就不动子任务、不下载，挂起等人工/下次重开 */
             gateSet('blocked', reason);
             setStatus(`清理未完成(${reason})`, 'error');
@@ -2874,6 +2936,7 @@
           gateSet('ready', `降级：清理失败(${reason})`);
           setStatus(`清理失败(${reason})，仅下载`, 'running');
         } else {
+          scanRetried = false;
           GATE.readyAt = Date.now();
           const onlyRec = cleanup.fileDeleteSkipped === true;
           gateSet('ready', `${onlyRec ? '仅清记录' : `删文件 ${cleanup.deleted}`} / 清记录 ${cleanup.records}`);

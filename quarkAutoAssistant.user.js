@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.4.3
-// @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。空目录/少量文件按结构证据判到底，扫描未确认自动重试一轮；含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
+// @version      6.4.4
+// @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。空目录按占位层可见性、少量文件按一屏内容判到底，持续 loading 有上限，扫描未确认自动重试一轮；含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
 // @updateURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -1271,13 +1271,14 @@
    * 此时表体 0 行、高度 0，**底部永远不会渲染 tr.drag-bottom**，
    * 所以空目录只能靠这条判据收工（否则会被当成"到底但没有灰框 = 加载停滞"）。
    *
-   * 判定顺序（前三项是硬性前提）：
-   *   1) 不在整表 loading（切目录时会先闪 loading，那一拍行数也是 0）
+   * 判定顺序（都是硬性前提）：
+   *   1) 不在整表 loading（初始加载/切目录时 ant-table-empty 和占位层就已经存在，
+   *      只是 .table-empty-wrap 的内联 opacity 还是 0，绝不能只看类名）
    *   2) 没有"加载更多"行
-   *   3) 表格里一个数据行都没有（挡住"动画过渡帧/旧 DOM 残留"的假空）
-   *   4) 结构证据（ant-table-empty / .ant-table-placeholder）**或**占位层可见
-   *      —— 只认 opacity 不可靠：后台标签页里淡入动画可能停在 0，会把空目录
-   *      误判成加载停滞，清理一直"未就绪" */
+   *   3) 当前文件表格里一个数据行都没有（挡住"动画过渡帧/旧 DOM 残留"的假空）
+   *   4) 占位层可见：computed opacity 或**内联** opacity 任一 > 0.01。
+   *      background 标签页里 CSS 淡入可能不跑，computed 停在 0，但内联已经是 1；
+   *      反过来初始 loading 的内联是 0，所以两种状态不会混淆。 */
   function isEmptyUiVisible() {
     if (isLoadingAnimPresent()) return false;
     if (hasMoreRow()) return false;            /* 还有下一批：肯定不是空目录 */
@@ -1289,31 +1290,17 @@
       if (scope.querySelector('tr.ant-table-row')) return false;
     } catch {}
 
-    /* 结构证据：Ant 空表带 ant-table-empty 并渲染 .ant-table-placeholder。
-     * 这比 opacity 可靠 —— 后台标签页里占位层的淡入动画可能停在 opacity:0，
-     * 只看 opacity 会把"确实是空目录"误判成"加载停滞"（清理一直未就绪）。 */
-    let structural = false;
-    try {
-      const table = scope.querySelector('table.ant-table') || scope.querySelector('.ant-table');
-      const emptyClass = !!(table && table.classList && table.classList.contains('ant-table-empty'));
-      /* 占位层必须是"显示中"的；隐藏模板不算 */
-      const ph = scope.querySelector('.ant-table-placeholder');
-      const phShown = !!(ph && ((ph.getClientRects && ph.getClientRects().length > 0) || ph.offsetParent));
-      structural = emptyClass || phShown;
-    } catch {}
-
     const wrap = scope.querySelector('.table-empty-wrap') || document.querySelector('.table-empty-wrap');
-    let visible = false;
-    if (wrap) {
-      let op = '';
-      try { op = getComputedStyle(wrap).opacity; } catch {}
-      if (op === '' || op == null) op = (wrap.style && wrap.style.opacity) || '';
-      if (op !== '') {
-        const n = Number(op);
-        visible = Number.isFinite(n) && n > 0.01;
-      }
-    }
-    return structural || visible;
+    if (!wrap) return false;
+    /* 占位层可见 = 真空目录。computed 与内联两个来源都看：
+     *  - 正常：CSS 淡入完成，computed = 1；
+     *  - 后台标签页：动画可能不跑、computed 停在 0，但 React 已把内联设为 1；
+     *  - 初始 loading：内联仍是 0 → 不会被误判成空目录。 */
+    let computed = '';
+    try { computed = getComputedStyle(wrap).opacity; } catch {}
+    const inline = (wrap.style && wrap.style.opacity != null) ? String(wrap.style.opacity) : '';
+    const shown = (v) => v !== '' && Number.isFinite(Number(v)) && Number(v) > 0.01;
+    return shown(computed) || shown(inline);
   }
 
   function getVirtualScrollInfo(body = null) {
@@ -1529,10 +1516,26 @@
     let noMove = 0;          /* 滚动位置推不动、且没有新行：虚拟容器异常/已无更多内容 */
     let emptyStable = 0;     /* 空目录占位连续确认次数 */
     let emptyConfirmed = false;
+    let loadingSince = 0;    /* 整表 loading 从什么时候开始（防止永远等下去） */
 
     for (;;) {
-      /* 整表 loading（刷新/切目录）：行不可信，等它结束；加载更多不算 */
-      if (isLoadingAnimPresent()) { stable = 0; emptyStable = 0; await sleep(160, true); continue; }
+      /* 整表 loading（刷新/切目录）：行不可信，等它结束；加载更多不算。
+       * 但 loading 不能无限等：账号受限/网络卡住时列表会一直转圈，
+       * 超过一个列表等待周期就按"未确认"收工，让挂起门尽快 blocked，
+       * 而不是把桥接拖到 4 分钟超时（表现就是一直"清理未就绪"）。 */
+      if (isLoadingAnimPresent()) {
+        const nowTs = Date.now();
+        if (!loadingSince) loadingSince = nowTs;
+        else if (nowTs - loadingSince >= LIST_WAIT_MS) {
+          warn(`  [${tag}] 整表 loading 已持续 ${Math.round((nowTs - loadingSince) / 1000)}s → 按未确认结束（列表没加载出来）`);
+          stalled = true;
+          break;
+        }
+        stable = 0; emptyStable = 0;
+        await sleep(160, true);
+        continue;
+      }
+      loadingSince = 0;
 
       addAll();
       if (report && files.length !== lastReport) { lastReport = files.length; try { report(files.length, allKeys.size); } catch {} }

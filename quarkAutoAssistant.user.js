@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         QuarkAutoAssistant
 // @namespace    quark-auto-save
-// @version      6.4.4
-// @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。空目录按占位层可见性、少量文件按一屏内容判到底，持续 loading 有上限，扫描未确认自动重试一轮；含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
+// @version      6.4.5
+// @description  夸克网盘平台层：个人页清理（等列表就绪 → 滚动全量统计 → 删过期文件 → 逐条复核后清记录）→ unsafeWindow 挂起门 → 恢复后全量下载 → acg 唤起时走完下载即关页（不等 FDM）；FDM 完成后的云端删除走后台异步轮询。按 quarkStatus 快照归纳的列表状态机（loading/empty/bottom/middle）驱动扫描与就绪判断，持续 loading 有上限，扫描未确认自动重试一轮；含 FDM 本地桥（127.0.0.1:8732）、UI、DOM 工具、暂停控制（转存逻辑交给桥接脚本）
 // @match        https://pan.quark.cn/*
 // @downloadURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
 // @updateURL https://github.com/WayneFerdon/acg.ripImprove/raw/refs/heads/main/quarkAutoAssistant.user.js
@@ -1361,33 +1361,30 @@
 
     let lastSig = '';
     let stable = 0;
-    let last = null;
 
     const g = await until(() => {
-      if (isLoadingAnimPresent()) { lastSig = ''; stable = 0; return null; }
-      const empty = isEmptyUiVisible();
-      const rows = document.querySelectorAll('tr.ant-table-row[data-row-key]').length;
+      const state = detectListState();
+      /* loading（首屏/下拉加载下一批）和 unknown（行还没挂上）都继续等 */
+      if (state === 'loading' || state === 'unknown') { lastSig = ''; stable = 0; return null; }
+      const rows = renderedDataRowCount();
       const info = getVirtualScrollInfo(tableBody());
-      /* UI 直证：底部"拖拽/粘贴"灰框已渲染 ⇒ 列表已渲染完（短列表一屏到底也走这条），
-       * 不必再等"签名连续 2 次不变"，更不该等到超时 */
-      if (!empty && isListAtBottom()) {
-        last = { empty, rows, info, uiBottom: true };
-        return last;
-      }
-      if (!empty && rows === 0) { lastSig = ''; stable = 0; return null; }
-      if (!empty && info && !(info.vtHeight > 0)) { lastSig = ''; stable = 0; return null; }
-      const sig = `${empty ? 'E' : 'R'}|${rows}|${info ? Math.round(info.vtHeight) : '-'}`;
-      if (sig === lastSig) stable++;
-      else { lastSig = sig; stable = 1; }
-      last = { empty, rows, info };
-      return stable >= 2 ? last : null;
+      /* 已经渲染出底部灰框 = 看到最后一行，不必再等签名稳定 */
+      if (state === 'bottom') return { state, empty: false, rows, info };
+      /* empty 也要连续 2 拍：切目录时旧占位层可能还没撤、新行还没挂上 */
+      const sig = state === 'empty'
+        ? `E|0|${info ? Math.round(info.vtHeight) : '-'}`
+        : `${rows}|${info ? Math.round(info.vtHeight) : '-'}`;
+      if (sig === lastSig) stable++; else { lastSig = sig; stable = 1; }
+      if (stable < 2) return null;
+      return { state, empty: state === 'empty', rows: state === 'empty' ? 0 : rows, info };
     }, 250, maxWaitMs);
 
     if (!g) {
       warn(`★ [${tag}] 等列表就绪超时（${maxWaitMs}ms）`);
       return { ok: false, reason: 'timeout' };
     }
-    log(`★ [${tag}] 列表就绪：${g.empty ? '空目录' : `${g.rows} 行渲染`}` +
+    const what = g.empty ? '空目录' : `${g.rows} 行渲染${g.state === 'bottom' ? '（已到底）' : ''}`;
+    log(`★ [${tag}] 列表就绪：${what}` +
         `（vt=${g.info ? g.info.vtHeight : '-'}，尾行 ${g.info ? (g.info.extraRows || 0) : 0} 行/${g.info ? Math.round(g.info.extraHeight || 0) : 0}px，` +
         `推断数据行=${g.info ? g.info.dataCount : '-'}）`);
     return { ok: true, empty: g.empty, rows: g.rows, info: g.info, total: getExpectedRowTotal() };
@@ -1440,17 +1437,40 @@
     } catch { return false; }
   }
 
+  /* ===== 列表状态机（依据 quarkStatus/ 的快照归纳） =====
+   * 快照 → 状态：
+   *   「个人页 1 初始加载」  table-loading-wrap + ant-spin-blur + ant-table-empty + 占位层 opacity:0 + vt 0 + 0 行
+   *   「个人页 2 空列表」    无 loading + **没有 [vt]** + 0 行 + 占位层 opacity:1
+   *   「个人页 3 小列表」    无 loading + vt 178 + 2 行（1 文件夹 + 1 文件）+ tr.drag-bottom
+   *   「个人页 4-1 中部」    无 loading + vt 2652 + 31 行 + 无 drag-bottom
+   *   「个人页 4-2 加载中」  table-loading-wrap + ant-spin-blur + 旧行保留 + vt 变大
+   *   「个人页 4-3 底部」    无 loading + vt 3870 + 24 行（只渲染可视窗口）+ tr.drag-bottom
+   *
+   * 结论：
+   *   - 首屏加载和"下拉加载下一批"都表现为整表 loading，统一按 loading 处理；
+   *   - 空目录唯一可靠的标志是"占位层可见"（computed 或内联 opacity），
+   *     ant-table-empty / placeholder 在初始加载时就存在，不能单独当证据；
+   *   - tr.drag-bottom 是虚拟滚动的最后一行，只有滚到末尾才渲染，是"到底"的硬证据；
+   *   - 其余有行状态都是 middle，继续往下滚。 */
+  function detectListState() {
+    if (isLoadingAnimPresent()) return 'loading';
+    const rows = renderedDataRowCount();
+    if (rows === 0) return isEmptyUiVisible() ? 'empty' : 'unknown';
+    if (hasMoreRow()) return 'middle';        /* 老版本会渲染"加载更多"行，兜底 */
+    return hasBottomDropRow() ? 'bottom' : 'middle';
+  }
+
   /* 步骤 1.5：全量滚动采集（列表分批加载 + 虚拟滚动）
    * 目标：**不靠时间预算**，把当前目录的数据行全部收齐（个人页单页只渲染十几行，
    * 且每批只加载 100 行，必须滚到底、等每一批到达）。
    *
-   * 结束判据（全部是 UI 证据，不看耗时）：
-   *   0) 空目录（ant-table-empty / .ant-table-placeholder，0 数据行）连续 2 拍确认；
-   *   1) 渲染出底部灰框（tr.drag-bottom）且没有"加载更多"行，行集合/滚动高度连续 3 轮不变；
-   *   2) 一屏内没有滚动空间（scrollHeight ≈ clientHeight）+ 无"加载更多"行，
-   *      行集合/滚动高度连续多轮不变 → 少量文件时底部灰框可能不渲染，按到底收工；
-   *   3) 几何到底 + 无"加载更多"行，行集合/滚动高度连续多轮不变（分享页兜底）；
-   *   4) "加载更多"行还在但 spinner 已停、连续多轮没有新行 → 加载停滞，标记 complete=false。
+   * 状态由 detectListState() 统一判定（对照 quarkStatus/ 六份快照）：
+   *   0) empty（占位层可见 + 0 数据行）连续 2 拍确认 → 空目录，complete=true；
+   *   1) bottom（渲染出 tr.drag-bottom）行集合/滚动高度稳定 → 到底，complete=true；
+   *   2) middle + 已滚到底但没灰框：一屏内没有滚动空间（scrollHeight ≈ clientHeight）
+   *      → 全部行已渲染，按到底收工；
+   *   3) middle + 到底 + 还有下一批：spinner 在转就等，停转且长期无新行 → 加载停滞；
+   *   4) loading 持续超过 LIST_WAIT_MS(45s) / unknown 持续多拍 → 未确认，complete=false。
    *
    * 返回 files：按列表顺序排列的全量文件（含最后一次读到的 checked 状态），
    * 后续勾选/标记/清除都基于它，不再用"当前渲染的十几行"。
@@ -1471,7 +1491,10 @@
     const allKeys = new Set();          /* 所有已见数据行的 key（含文件夹/无名字行） */
     const files = [];                   /* 全量文件，按首次出现顺序 */
     const addAll = () => {
-      for (const f of scanFileRows()) {
+      /* 只扫当前文件表格：页面其它位置（隐藏表格/弹窗）的行不能混进来，
+       * 否则 allKeys/滚动签名会被污染，空目录和"到底"都判不准。 */
+      const root = tableWrap() || document;
+      for (const f of scanFileRows(root)) {
         const k = f.fid || f.name;
         if (!k) continue;
         if (!byFid.has(k)) { byFid.set(k, f); files.push(f); }
@@ -1482,7 +1505,7 @@
         }
       }
       try {
-        for (const tr of document.querySelectorAll('tr.ant-table-row[data-row-key]')) {
+        for (const tr of root.querySelectorAll('tr.ant-table-row[data-row-key]')) {
           const k = tr.getAttribute('data-row-key');
           if (k) allKeys.add(k);
         }
@@ -1517,13 +1540,15 @@
     let emptyStable = 0;     /* 空目录占位连续确认次数 */
     let emptyConfirmed = false;
     let loadingSince = 0;    /* 整表 loading 从什么时候开始（防止永远等下去） */
+    let unknownTicks = 0;    /* 0 行但占位层不可见的连续拍数 */
 
     for (;;) {
-      /* 整表 loading（刷新/切目录）：行不可信，等它结束；加载更多不算。
-       * 但 loading 不能无限等：账号受限/网络卡住时列表会一直转圈，
-       * 超过一个列表等待周期就按"未确认"收工，让挂起门尽快 blocked，
-       * 而不是把桥接拖到 4 分钟超时（表现就是一直"清理未就绪"）。 */
-      if (isLoadingAnimPresent()) {
+      const state = detectListState();
+
+      /* loading：首屏加载和"下拉加载下一批"都走这里（快照 1 / 4-2），等它结束。
+       * 但不能无限等：账号受限/请求卡住时列表会一直转圈，超过一个列表等待
+       * 周期就按"未确认"收工，让挂起门尽快 blocked。 */
+      if (state === 'loading') {
         const nowTs = Date.now();
         if (!loadingSince) loadingSince = nowTs;
         else if (nowTs - loadingSince >= LIST_WAIT_MS) {
@@ -1531,7 +1556,7 @@
           stalled = true;
           break;
         }
-        stable = 0; emptyStable = 0;
+        stable = 0; emptyStable = 0; unknownTicks = 0;
         await sleep(160, true);
         continue;
       }
@@ -1540,12 +1565,10 @@
       addAll();
       if (report && files.length !== lastReport) { lastReport = files.length; try { report(files.length, allKeys.size); } catch {} }
 
-      /* 空目录：`ant-table-empty` + 占位层（拖拽/粘贴上传），表体高度 0 且
-       * 底部**永远不会**渲染 tr.drag-bottom。不在这里收工，就会掉进下面
-       * "到底但没灰框"的分支，被误判成加载停滞。
-       * 用"当前渲染行数"而不是 allKeys：扫描早段可能收过旧目录的残留行，
+      /* 空目录（快照 2）：占位层可见 + 0 数据行。连续 2 拍确认后收工。
+       * 用当前渲染行数而不是 allKeys：扫描早段可能收过旧目录的残留行，
        * 那些行消失后 allKeys 仍非空，会把空目录挡在门外。 */
-      if (renderedDataRowCount() === 0 && isEmptyUiVisible()) {
+      if (state === 'empty') {
         if (++emptyStable >= 2) {
           emptyConfirmed = true; reachedBottom = true;
           /* 残留行属于已消失的旧状态：清掉，别拿它去比记录/删文件 */
@@ -1557,11 +1580,24 @@
       }
       emptyStable = 0;
 
+      /* 0 行但占位层不可见：通常是加载动画已撤、行还没挂上的过渡帧。
+       * 继续等；等不到按未确认收工 —— 绝不当成空目录（否则会清记录）。 */
+      if (state === 'unknown') {
+        if (++unknownTicks >= stallLimit) {
+          warn(`  [${tag}] 0 数据行且占位层不可见持续 ${unknownTicks} 拍 → 按未确认结束`);
+          stalled = true;
+          break;
+        }
+        await sleep(200, true);
+        continue;
+      }
+      unknownTicks = 0;
+
+      /* 到这里一定有渲染行：middle / bottom */
       const more = hasMoreRow();
       const scrollH = body.scrollHeight;
       const maxTop = Math.max(0, scrollH - body.clientHeight);
       const atBottom = body.scrollTop >= maxTop - 2;
-      const uiBottom = hasBottomDropRow() && !more;
 
       const sig = `${allKeys.size}|${Math.round(scrollH)}`;
       const grew = sig !== lastSig;
@@ -1570,34 +1606,30 @@
       /* 长时间滚动时每 5s 留一条诊断，卡住时能看出卡在"加载更多"还是滚动无效 */
       if (Date.now() - lastDiag >= 5000) {
         lastDiag = Date.now();
-        log(`  [${tag}] 扫描中：文件 ${files.length} / 数据行 ${allKeys.size}，` +
+        log(`  [${tag}] 扫描中：文件 ${files.length} / 数据行 ${allKeys.size} / 状态 ${state}，` +
             `scrollTop=${Math.round(body.scrollTop)}/${Math.round(maxTop)}，更多批次=${more}，加载中=${hasLoadingMore()}`);
       }
 
-      /* 硬证据：底部"拖拽/粘贴"灰框 + 没有更多批次 */
-      if (uiBottom) {
+      /* 底部灰框 = 已渲染到最后一行（快照 3 / 4-3） */
+      if (state === 'bottom') {
         if (!grew) stable++; else stable = 0;
         if (stable >= bottomStable) { reachedBottom = true; break; }
         await sleep(120, true);
         continue;
       }
 
+      /* middle + 已滚到底但没灰框：
+       *  - 一屏内放得下（没有滚动空间）→ 全部行已渲染，按到底收工
+       *    （实测 1 个文件的目录可能不渲染灰框）；
+       *  - 否则等足够久仍无灰框 → 未确认（宁可清理失败，也不误删）。 */
       if (atBottom && !more) {
-        /* 一屏内就放得下（scrollHeight ≈ clientHeight，没有滚动空间）且没有更多批次：
-         * 所有行都已渲染。少量文件时 Quark 可能根本不渲染底部灰框，再等只会永远"未确认"。
-         * 必须有至少 1 个已渲染数据行：0 行时只信空目录结构判据，
-         * 否则切目录的瞬间（行还没挂上）会被误判成"到底了"。 */
-        const contentFits = renderedDataRowCount() > 0 && scrollH <= (body.clientHeight || 0) + 4;
+        const contentFits = scrollH <= (body.clientHeight || 0) + 4;
         if (contentFits) {
           if (!grew) stable++; else stable = 0;
           if (stable >= bottomStable) { reachedBottom = true; break; }
           await sleep(160, true);
           continue;
         }
-        /* 个人页只有"底部灰框"才是到底硬证据。
-         * more 行消失可能只是"批次间隙"（下一批还没到），
-         * 此时判完成会漏掉后面所有批次 → 进而误删记录。
-         * 等足够久仍无灰框，按"未确认"退出（宁可清理失败，也不误删）。 */
         if (!grew) stable++; else stable = 0;
         if (stable >= bottomStable * 8) {
           warn(`  [${tag}] 已滚到底且无更多批次，但始终没有底部灰框 → 按未确认结束`);

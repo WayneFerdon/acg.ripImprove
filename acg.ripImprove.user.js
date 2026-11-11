@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.4.3
-// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时同步刷新面板）
+// @version      1.4.4
+// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序）
 // @author       WayneFerdon
 // @include      *acg.rip*
 // @include      /^https?:\/\/(?:www\.)?(?:bgm|bangumi)\.tv\/subject\/\d+\/?$/
@@ -6052,10 +6052,21 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
 
       if (typeof tr._updateDerived === 'function') tr._updateDerived();
 
+      if (oldVal !== String(newNext)) {
+        /* 自动推进写的是 bangumiData，属于“已保存”的更新，不是用户未保存的编辑：
+         * 同步基线并刷新标记，否则下集列会一直显示成待保存状态。 */
+        if (tr._originalValues) tr._originalValues.下集 = computeRowFieldValue(row, '下集');
+        refreshTempEditedMark(tr);
+        changed = true;
+      }
+
       /* 隐藏的面板不要整表写草稿：面板里的其它字段可能已经过时 */
       if (opts.saveDraft !== false) scheduleDraftSave();
-      if (oldVal !== String(newNext)) changed = true;
       break;
+    }
+    /* 下集变化会影响排序（完结条目下沉 / 分隔行）：面板可见时同步重排 */
+    if (changed && opts.saveDraft !== false && opts.sort !== false) {
+      try { sortMainRows(); } catch (e) {}
     }
     return changed;
   };

@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.5.0
-// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 按钮，数字转 \d+，180 天未命中自动失效））
+// @version      1.5.1
+// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 按钮，数字转 \d+，180 天未命中自动失效；未查看边界的最旧一条用浅蓝色标注））
 // @author       WayneFerdon
 // @include      *acg.rip*
 // @include      /^https?:\/\/(?:www\.)?(?:bgm|bangumi)\.tv\/subject\/\d+\/?$/
@@ -21,7 +21,7 @@
 // ==/UserScript==
 
 const _1s = 1000, _1m = 60 * _1s, _1h = 60 * _1m, _1d = 24 * _1h;
-const colors = { last: 'palegreen', tracking: 'crimson', downloaded: 'rebeccapurple', viewed: 'grey' };
+const colors = { last: 'palegreen', tracking: 'crimson', downloaded: 'rebeccapurple', viewed: 'grey', oldestUnviewed: '#4db8ff' };
 const timeOpt = { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
 const url2num = url => 1 * `${url ?? ''}`.replace('/t/', '');
 const WEEKDAY_LABEL = ['日七', '月一', '火二', '水三', '木四', '金五', '土六'];
@@ -856,7 +856,7 @@ function setTimeHover() {
 }
 
 /* ===== 页面高亮 ===== */
-function setDisplayHighlight({ item, found, href, title }) {
+function setDisplayHighlight({ item, found, href, title, oldestUnviewedHref }) {
   const color = getColor();
   for (const el of [item, ...gE('a', 'all', item)]) {
     if (color) el.style.color = color;
@@ -865,11 +865,27 @@ function setDisplayHighlight({ item, found, href, title }) {
   try { decorateExclude(item, title); } catch (e) { console.error('[exclude] decorate', e); }
   function getColor() {
     switch (true) {
+      /* 「未查看」的最旧一条优先标浅蓝：它是继续浏览的起点，不能被番组状态色盖掉 */
+      case !!href && href === oldestUnviewedHref: return colors.oldestUnviewed;
       case !!found: return isDownloaded(found, href) ? colors.downloaded : colors.tracking;
       case href === last: return colors.last;
       case isViewed(href): return colors.viewed;
     }
   }
+}
+
+/* 最旧的一条「未查看」= 所有 id > lastViewed 里最小的那条 */
+function findOldestUnviewedHref(rows) {
+  if (lastViewed == null) return undefined;      /* 未标记过：全部视为已查看 */
+  const v = url2num(lastViewed);
+  if (!Number.isFinite(v) || v < 0) return undefined;
+  let best, bestN = Infinity;
+  for (const row of (rows || [])) {
+    const n = url2num(row && row.href);
+    if (!Number.isFinite(n) || n <= v) continue;
+    if (n < bestN) { bestN = n; best = row.href; }
+  }
+  return best;
 }
 
 /* ===== 手动点击下载 ===== */
@@ -6360,12 +6376,16 @@ function onHandleItems(method, doc) {
   loadDatas();
   const list = [...gE('tr', 'all', doc ?? document)];
   list.reverse();
+  const rows = [];
   for (const item of list) {
     const a = gE('.title .title a', item); if (!a) continue;
     const [href, title] = [a.getAttribute('href'), a.innerHTML.replace(/\s+/g, ' ')];
     const { found, key } = matchTitle(title);
-    method({ item, a, found, key, title, href });
+    rows.push({ item, a, found, key, title, href });
   }
+  /* 每轮只算一次「最旧的一条未查看」，避免每条各扫一遍 */
+  const oldestUnviewedHref = findOldestUnviewedHref(rows);
+  for (const row of rows) method({ ...row, oldestUnviewedHref });
 }
 function evalFormula(expr, vars) {
   if (expr === '' || expr == null) return NaN;

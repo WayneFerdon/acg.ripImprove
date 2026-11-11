@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.4.5
-// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块）
+// @version      1.5.0
+// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 按钮，数字转 \d+，180 天未命中自动失效））
 // @author       WayneFerdon
 // @include      *acg.rip*
 // @include      /^https?:\/\/(?:www\.)?(?:bgm|bangumi)\.tv\/subject\/\d+\/?$/
@@ -517,6 +517,10 @@ function onHandle() {
   loadInferredCache();
   try { autoReload().catch(e => console.error('autoReload error:', e)); } catch (e) { console.error(e); }
   onHandleItems(setDisplayHighlight);
+  /* 已下载 / 已排除的条目不该占着「未查看」，边界先推到位再刷一次颜色 */
+  try { if (syncViewedBoundary() > 0) onHandleItems(setDisplayHighlight); } catch (e) { console.error('[未查看] 边界同步失败', e); }
+  /* 页面长期开着时也要让 >180 天没命中的规则失效 */
+  try { loadExcludes(); pruneExcludes(); } catch (e) { console.error('[排除] 过期检查失败', e); }
   setTimeHover();
   /* 页内跳转（Turbolinks，无 onload）检测：与链接着色同一触发时机 */
   try { spaUiRestoreTick(); } catch (e) { console.error('[spaUiRestore] tick', e); }
@@ -632,6 +636,208 @@ function updateViewedButton(btn) {
   btn.textContent = '标记已查看';
 }
 
+/* ===== 排除规则（未查看 / 自动下载共用） =====
+ * 列表页每行「下载」按钮旁新增 ⊘：把该条标题转成正则加进排除列表；
+ * 转换时把所有连续数字换成 \d+，于是同一部番的 07/08/12 都命中同一条规则；
+ * 命中排除、或已经下载过的条目不再算「未查看」，未查看边界会自动后移；
+ * 规则每命中一次刷新时间，超过 180 天没再命中就整条删掉。 */
+const EXCLUDE_KEY = 'acgrip_exclude_rules';
+const EXCLUDE_TTL = 180 * _1d;
+let excludeRules = null;
+let _excludeSaveTid = null;
+
+/* 标题 → 正则源码：先转义全部正则元字符，再把任意连续数字替换成 \d+ */
+function titleToExcludePattern(title) {
+  return String(title ?? '')
+    .replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    .replace(/\d+/g, '\\d+');
+}
+
+function loadExcludes() {
+  if (excludeRules) return excludeRules;
+  const raw = getValue(EXCLUDE_KEY);
+  const list = [];
+  if (Array.isArray(raw)) {
+    for (const it of raw) {
+      const re = String((it && it.re) || '').trim();
+      if (!re) continue;
+      list.push({ re, ts: Number(it.ts) || 0, hits: Number(it.hits) || 0, _re: null });
+    }
+  }
+  excludeRules = list;
+  pruneExcludes();
+  return excludeRules;
+}
+
+function saveExcludes() {
+  if (_excludeSaveTid) { clearTimeout(_excludeSaveTid); _excludeSaveTid = null; }
+  setValue(EXCLUDE_KEY, (excludeRules || []).map(r => ({ re: r.re, ts: r.ts, hits: r.hits })));
+}
+
+function scheduleSaveExcludes() {
+  if (_excludeSaveTid) return;
+  _excludeSaveTid = setTimeout(() => { _excludeSaveTid = null; saveExcludes(); }, 1500);
+}
+
+/* 距上次命中超过 180 天的规则连同记录一并删掉 */
+function pruneExcludes() {
+  if (!Array.isArray(excludeRules)) return 0;
+  const now = Date.now();
+  const kept = excludeRules.filter(r => r.ts > 0 && now - r.ts <= EXCLUDE_TTL);
+  const removed = excludeRules.length - kept.length;
+  if (removed) { excludeRules = kept; saveExcludes(); console.log(`[排除] 已删除 ${removed} 条过期规则（>180 天未命中）`); }
+  return removed;
+}
+
+function normExcludeRule(rule) {
+  if (rule._re === undefined || rule._re === null) {
+    try { rule._re = new RegExp(rule.re, 'i'); } catch { rule._re = false; }
+  }
+  return rule._re;
+}
+
+/* 命中判定：touch=true 时刷新该规则的「上次排除时间」与命中次数 */
+function matchExcludeRule(title, touch = true) {
+  const s = String(title ?? '');
+  if (!s) return null;
+  for (const rule of loadExcludes()) {
+    const re = normExcludeRule(rule);
+    if (!re || !re.test(s)) continue;
+    if (touch) { rule.ts = Date.now(); rule.hits = (rule.hits || 0) + 1; scheduleSaveExcludes(); }
+    return rule;
+  }
+  return null;
+}
+
+function isExcludedTitle(title) { return !!matchExcludeRule(title); }
+
+function addExcludeRule(title) {
+  const re = titleToExcludePattern(title);
+  if (!re) return null;
+  loadExcludes();
+  let rule = excludeRules.find(r => r.re === re);
+  if (rule) { rule.ts = Date.now(); }
+  else { rule = { re, ts: Date.now(), hits: 0, _re: null }; excludeRules.push(rule); }
+  saveExcludes();
+  return rule;
+}
+
+function removeExcludeRule(re) {
+  loadExcludes();
+  const i = excludeRules.findIndex(r => r.re === re);
+  if (i < 0) return false;
+  excludeRules.splice(i, 1);
+  saveExcludes();
+  return true;
+}
+
+/* 未查看边界自动后移：从最旧的一条「未查看」开始，只要它已下载过或被排除，
+ * 就把边界推到它上面，直到最旧的一条既没下载、也没被排除。返回推进条数。 */
+function syncViewedBoundary() {
+  if (!IS_ACGRIP_PAGE || lastViewed == null) return 0;
+  const cur = url2num(lastViewed);
+  if (!Number.isFinite(cur) || cur <= 0) return 0;
+
+  const rows = [];
+  for (const tr of gE('tr', 'all')) {
+    const a = gE('.title .title a', tr);
+    if (!a) continue;
+    const href = a.getAttribute('href');
+    const n = url2num(href);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    rows.push({ n, href, title: a.innerHTML.replace(/\s+/g, ' ') });
+  }
+  if (!rows.length) return 0;
+  rows.sort((x, y) => x.n - y.n);   /* 旧 → 新 */
+
+  let boundary = cur, advanced = 0;
+  for (const row of rows) {
+    if (row.n <= boundary) continue;
+    const { found } = matchTitle(row.title);
+    if (!isDownloaded(found, row.href) && !matchExcludeRule(row.title)) break;
+    boundary = row.n;
+    advanced++;
+  }
+  if (!advanced) return 0;
+  const next = idToHref(boundary);
+  if (!next) return 0;
+  lastViewed = next;
+  saveLastData();
+  updateViewedButton();
+  console.log(`[未查看] 边界后移 ${advanced} 条 → ${next}`);
+  return advanced;
+}
+
+/* 每行「下载」按钮旁的 ⊘：加入排除列表 */
+function ensureExcludeButton(item) {
+  if (!item || item.ownerDocument !== document) return null;
+  const action = item.querySelector('td.action') || item.querySelector('.action');
+  if (!action) return null;
+  let btn = action.querySelector('.acgrip-exclude-btn');
+  if (btn) return btn;
+  btn = cE('button');
+  btn.type = 'button';
+  btn.className = 'acgrip-exclude-btn';
+  btn.textContent = '⊘';
+  btn.style.cssText = 'margin-left:6px;padding:1px 5px;font-size:12px;line-height:1.2;background:transparent;border:1px solid #666;border-radius:3px;color:#999;cursor:pointer;vertical-align:middle;';
+  btn.addEventListener('click', (e) => {
+    e.preventDefault(); e.stopPropagation(); e.stopImmediatePropagation();
+    const a = item.querySelector('.title .title a');
+    const title = a ? a.innerHTML.replace(/\s+/g, ' ') : '';
+    if (!title) return;
+    const rule = addExcludeRule(title);
+    if (!rule) return;
+    showToast(`已排除：${rule.re}`);
+    const moved = syncViewedBoundary();
+    onHandleItems(setDisplayHighlight);
+    if (moved) showToast(`未查看边界后移 ${moved} 条`);
+  });
+  action.appendChild(btn);
+  return btn;
+}
+
+function decorateExclude(item, title) {
+  if (!item || item.ownerDocument !== document) return;
+  const btn = ensureExcludeButton(item);
+  const hit = title ? matchExcludeRule(title, false) : null;
+  item.classList.toggle('acgrip-excluded', !!hit);
+  if (hit) item.style.opacity = '0.55'; else item.style.removeProperty('opacity');
+  if (!btn) return;
+  btn.style.color = hit ? '#e06c75' : '#999';
+  btn.style.borderColor = hit ? '#e06c75' : '#666';
+  btn.title = hit
+    ? `已排除：${hit.re}\n再点一次只会刷新排除时间`
+    : '把这条加入排除列表（数字自动换成 \\d+）：不再作为「未查看」，也不触发自动下载';
+}
+
+/* 菜单：查看 / 删除排除规则 */
+function manageExcludeRules() {
+  const list = loadExcludes();
+  if (!list.length) { alert('排除列表为空'); return; }
+  const lines = list.map((r, i) => {
+    const days = Math.max(0, Math.floor((Date.now() - r.ts) / _1d));
+    return `${i + 1}. ${r.re}\n   命中 ${r.hits || 0} 次，上次排除 ${days} 天前`;
+  }).join('\n');
+  let ans;
+  try { ans = prompt(`排除规则（${list.length} 条，超过 180 天未命中会自动删除）：\n\n${lines}\n\n输入要删除的序号（多个用逗号分隔），输入 all 清空，留空取消：`, ''); }
+  catch { ans = null; }
+  if (ans == null || !ans.trim()) return;
+  const v = ans.trim();
+  if (/^all$/i.test(v)) {
+    if (!confirm('清空全部排除规则？')) return;
+    excludeRules = [];
+    saveExcludes();
+    showToast('已清空排除规则');
+  } else {
+    const idxs = v.split(/[,\s]+/).map(n => parseInt(n, 10)).filter(n => Number.isFinite(n));
+    let n = 0;
+    for (const i of idxs) { const r = list[i - 1]; if (r && removeExcludeRule(r.re)) n++; }
+    showToast(`已删除 ${n} 条排除规则`);
+  }
+  onHandleItems(setDisplayHighlight);
+}
+try { GM_registerMenuCommand('排除规则：查看 / 删除', manageExcludeRules); } catch {}
+
 /* ===== 时间悬浮 ===== */
 function setTimeHover() {
   for (const timeObj of gE('time', 'all')) {
@@ -650,12 +856,13 @@ function setTimeHover() {
 }
 
 /* ===== 页面高亮 ===== */
-function setDisplayHighlight({ item, found, href }) {
+function setDisplayHighlight({ item, found, href, title }) {
   const color = getColor();
   for (const el of [item, ...gE('a', 'all', item)]) {
     if (color) el.style.color = color;
     else el.style.removeProperty('color');
   }
+  try { decorateExclude(item, title); } catch (e) { console.error('[exclude] decorate', e); }
   function getColor() {
     switch (true) {
       case !!found: return isDownloaded(found, href) ? colors.downloaded : colors.tracking;
@@ -719,6 +926,8 @@ async function asyncDownloadTorrents() {
       html = page === 1 ? document.documentElement.outerHTML : await $ajax.fetch(`/page/${page}`);
       onHandleItems(({ item, found, key, title, href }) => {
         if (done = (url2num(href) <= url2num(last))) return;
+        /* 命中排除规则：不下载（matchExcludeRule 顺带刷新该规则的排除时间） */
+        if (isExcludedTitle(title)) return;
         if (!found || isDownloaded(found, href)) return;
 
         const bd = getValue('bangumiData') ?? { rows: [] };
@@ -764,6 +973,8 @@ async function asyncDownloadTorrents() {
       const newLast = gE('.title .title a', trs[1])?.getAttribute('href');
       if (newLast && url2num(newLast) > url2num(last)) { last = newLast; saveLastData(); }
     }
+    /* 刚下载/刚被排除的条目不算未查看：边界推到位后重刷颜色 */
+    try { if (syncViewedBoundary() > 0) onHandleItems(setDisplayHighlight); } catch (e) { console.error('[未查看] 边界同步失败', e); }
   } finally { downloadInProgress = false; }
 }
 function extractEpisodeFromRule(key, title) {
@@ -788,6 +999,7 @@ async function downloadSince(sinceUrl, onlyRules = null) {
       if (!Number.isNaN(n) && n < pageMin) pageMin = n;
       if (Number.isNaN(n) || n <= since) return;
       if (onlyRules && !onlyRules.has(key)) return;
+      if (isExcludedTitle(title)) return;
       if (!found || isDownloaded(found, href)) return;
       const torrentLink = item.querySelector('a[href*=".torrent"]');
       if (torrentLink) torrentLink._acgripHandled = true;

@@ -1010,6 +1010,24 @@ def move_to_recycle_bin(filepath):
     result = ctypes.windll.shell32.SHFileOperationW(ctypes.byref(fileop))
     return result == 0
 
+# 重复下载的副本序号：`名字.torrent` 与 `名字 (1).torrent`、`名字 (2).torrent` 视为同一个。
+# 只剥 1~3 位数字：4 位通常是年份（`Show (2024).torrent`），不能当序号，
+# 否则 `Show (2023).torrent` 会被误判成同一条。
+_DUP_SUFFIX_RE = re.compile(r'\s*\((\d{1,3})\)$')
+
+
+def _torrent_match_key(name):
+    """种子文件的匹配键：小写、去 .torrent、去掉末尾的重复下载序号 " (1)"。"""
+    s = (name or '').strip().lower()
+    if s.endswith('.torrent'):
+        s = s[:-len('.torrent')]
+    prev = None
+    while prev != s:                 # 兼容 "(1) (2)" 这种叠加
+        prev = s
+        s = _DUP_SUFFIX_RE.sub('', s)
+    return s.strip()
+
+
 def clean_torrent_files(directory, filename):
     if not filename or not directory:
         return
@@ -1019,7 +1037,10 @@ def clean_torrent_files(directory, filename):
         base_name = filename
         ext = '.torrent'
 
-    pattern = re.compile(rf"^{re.escape(base_name)}(?:\s*\(\d+\))?{re.escape(ext)}$", re.IGNORECASE)
+    # `名字.torrent`、`名字 (1).torrent`、`名字 (2).torrent` 是同一个种子：
+    # 先剥掉记录名自带的尾部序号，再允许最多一个副本序号（1~3 位，4 位当成年份不动）
+    base_name = _DUP_SUFFIX_RE.sub('', base_name.strip())
+    pattern = re.compile(rf"^{re.escape(base_name)}(?:\s*\(\d{{1,3}}\))?{re.escape(ext)}$", re.IGNORECASE)
 
     hit = 0
     try:
@@ -1079,7 +1100,7 @@ def _recycle_original_path(info_path):
 
 
 def _finished_torrent_names():
-    """已完成种子任务对应的 .torrent 文件名（小写 basename）集合。"""
+    """已完成种子任务对应的 .torrent 文件名（小写、已归一化序号）集合。"""
     names = set()
     if not os.path.exists(DB_PATH):
         return names
@@ -1097,11 +1118,11 @@ def _finished_torrent_names():
                     continue
                 base = extract_filename_from_url(raw_url)
                 if base and base.lower().endswith('.torrent'):
-                    names.add(base.lower())
+                    names.add(_torrent_match_key(base))
             for t in (title or '', pref or ''):
                 t = (t or '').strip()
                 if t and t.lower().endswith('.torrent'):
-                    names.add(t.lower())
+                    names.add(_torrent_match_key(t))
     except Exception:
         pass
     finally:
@@ -1116,9 +1137,10 @@ def purge_recycled_torrents(force=False):
     匹配条件（缺一不可）：
       1) 条目原始文件名是 .torrent；
       2) 且命中以下之一：
-         a. 文件名与 FDM 库里已完成种子任务的 .torrent 完全一致；
-         b. 以 "[acgrip]" 开头（acg.rip 自动下载的命名签名，兼容 FDM
-            已从任务列表删掉的历史种子）。
+         a. 归一化后（小写、去 .torrent、忽略末尾 " (1)" 这类副本序号）
+            与 FDM 库里已完成种子任务的 .torrent 一致；
+         b. 归一化后以 "[acgrip]" 开头（acg.rip 自动下载的命名签名，兼容
+            FDM 已从任务列表删掉的历史种子）。
     其余回收站内容一律不动；单次最多 TORRENT_TRASH_PURGE_MAX 个。
     """
     global _torrent_purge_at
@@ -1152,9 +1174,10 @@ def purge_recycled_torrents(force=False):
             if not low.endswith('.torrent'):
                 continue
 
-            matched = low in names
+            key = _torrent_match_key(base)
+            matched = key in names
             if (not matched and PURGE_RECYCLED_TORRENTS_BY_SIGNATURE
-                    and low.startswith(TORRENT_TRASH_SIGNATURE_PREFIX.lower())):
+                    and key.startswith(TORRENT_TRASH_SIGNATURE_PREFIX.lower())):
                 matched = True
             if not matched:
                 continue

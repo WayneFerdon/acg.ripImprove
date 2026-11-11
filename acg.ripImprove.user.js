@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.4.4
-// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序）
+// @version      1.4.5
+// @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块）
 // @author       WayneFerdon
 // @include      *acg.rip*
 // @include      /^https?:\/\/(?:www\.)?(?:bgm|bangumi)\.tv\/subject\/\d+\/?$/
@@ -1752,28 +1752,57 @@ function rowIsEmpty(r) {
     return String(v ?? '').trim() === '';
   });
 }
+/* 首页「在看」模块（#cloumnSubjectInfo）里的 subject id。
+ * 以前是全页抓 /subject/ 链接（[class*=infoWrapper] 命中所有模块，兜底更是全页），
+ * 于是「每日放送」「热门」「他人收藏」都被当成本人在看，凭空加出没在追的条目。
+ * 现在只认 #cloumnSubjectInfo 里的 .epGird，每个 grid 只取它自己的条目链接。 */
+function bgHomeSubjectIdsFromDoc(doc) {
+  const col = (doc && typeof doc.getElementById === 'function') ? doc.getElementById('cloumnSubjectInfo') : null;
+  if (!col) return { ids: [], ok: false, reason: 'no-column' };
+
+  const ids = [];
+  const seen = new Set();
+  const push = (raw) => {
+    const id = String(raw || '').trim();
+    if (!id || !/^\d+$/.test(id) || seen.has(id)) return;
+    seen.add(id);
+    ids.push(id);
+  };
+  const idOf = (a) => {
+    if (!a) return '';
+    const ds = a.dataset && a.dataset.subjectId;
+    if (ds) return ds;
+    const m = String(a.getAttribute('href') || '').match(/\/subject\/(\d+)/);
+    return m ? m[1] : '';
+  };
+
+  const grids = col.querySelectorAll('.epGird');
+  if (grids.length) {
+    for (const g of grids) {
+      push(idOf(
+        g.querySelector('a[data-subject-id][href^="/subject/"]') ||
+        g.querySelector('.tinyHeader a[href^="/subject/"]') ||
+        g.querySelector('a.textTip[href^="/subject/"]') ||
+        g.querySelector('a[href^="/subject/"]')
+      ));
+    }
+    return { ids, ok: ids.length > 0, reason: ids.length ? 'grid' : 'grid-empty' };
+  }
+
+  /* 结构变动兜底：仍然只在这个容器内收链接，不再退回整页 */
+  for (const a of col.querySelectorAll('a[href^="/subject/"]')) push(idOf(a));
+  return { ids, ok: ids.length > 0, reason: ids.length ? 'links' : 'empty' };
+}
+
 async function fetchBangumiHomeIds() {
   const html = await $ajax.fetch('https://bangumi.tv/', null, 'GET');
   const doc = document.implementation.createHTMLDocument('');
   doc.documentElement.innerHTML = html;
-  let containers = doc.querySelectorAll('[class*="infoWrapperContainer"]');
-  if (!containers.length) containers = doc.querySelectorAll('[class*="infoWrapper"]');
-  if (!containers.length) containers = doc.querySelectorAll('.browserFull, .browserCoverList, #browserItemList');
-  let ids = new Set();
-  if (containers.length) {
-    for (const c of containers) for (const a of c.querySelectorAll('a[href^="/subject/"]')) {
-      const m = a.getAttribute('href').match(/\/subject\/(\d+)/);
-      if (m) ids.add(m[1]);
-    }
+  const r = bgHomeSubjectIdsFromDoc(doc);
+  if (!r.ok) {
+    console.warn(`[Bangumi] 首页未解析到「在看」条目（${r.reason}），本轮不新增任何行`);
   }
-  if (!ids.size) {
-    for (const a of doc.querySelectorAll('a[href^="/subject/"]')) {
-      if (a.closest('#headerNeue2, .mainNav, nav, footer, #footer')) continue;
-      const m = a.getAttribute('href').match(/\/subject\/(\d+)/);
-      if (m) ids.add(m[1]);
-    }
-  }
-  return ids.size ? { ids: [...ids], ok: true } : { ids: [], ok: false };
+  return r;
 }
 async function fetchBangumiSubject(id) {
   const html = await $ajax.fetch(`https://bangumi.tv/subject/${id}`, null, 'GET');
@@ -1785,8 +1814,17 @@ async function autoUpdateFromBangumi() {
   setUpdated({ bangumi: Date.now() });
   let homeResult;
   try { homeResult = await fetchBangumiHomeIds(); }
-  catch (e) { console.error('fetchBangumiHomeIds failed:', e); return; }
-  if (!homeResult.ids.length) return;
+  catch (e) {
+    console.error('fetchBangumiHomeIds failed:', e);
+    /* 网络失败：1 小时后再试，别把 24h 的计时直接耗掉 */
+    setUpdated({ bangumi: Date.now() - BANGUMI_INTERVAL + 3600 * 1000 });
+    return;
+  }
+  /* 没解析到「在看」模块：一行都不新增（宁可这次不加，也不能加错），1 小时后再试 */
+  if (!homeResult.ok) {
+    setUpdated({ bangumi: Date.now() - BANGUMI_INTERVAL + 3600 * 1000 });
+    return;
+  }
   const bd = getValue('bangumiData') ?? { rows: [], delay: { rows: [] } };
   if (!Array.isArray(bd.rows)) bd.rows = [];
   const existingIds = new Set();
@@ -1808,7 +1846,12 @@ async function autoUpdateFromBangumi() {
     } catch (e) { console.error('fetchBangumiSubject failed:', id, e); }
     await sleep(_1s);
   }
-  setValue('bangumiData', bd);
+  if (added) {
+    setValue('bangumiData', bd);
+    console.log(`[Bangumi] 在看 ${homeResult.ids.length} 个，新增 ${added} 行`);
+  } else {
+    console.log(`[Bangumi] 在看 ${homeResult.ids.length} 个，均已存在，无新增`);
+  }
 }
 async function autoUpdateQuarter() {
   const now = new Date();
@@ -6213,7 +6256,7 @@ function initAjax() {
  * ===================================================================== */
 if (/^acg\.rip$/i.test(location.hostname)) {
   unsafeWindow.acgripApi = {
-    version: '1.6.0',
+    version: '1.6.1',
 
     getBangumiData: () => getValue('bangumiData'),
 
@@ -6233,6 +6276,29 @@ if (/^acg\.rip$/i.test(location.hostname)) {
 
     getValue,
     setValue,
+
+    /* 诊断用：抓一次 Bangumi 首页，报告「在看」模块的解析情况（不改任何数据）。
+     * 控制台执行 acgripApi.bangumiHomeProbe() 即可确认是不是模块没抓到。 */
+    bangumiHomeProbe: async () => {
+      try {
+        const html = await $ajax.fetch('https://bangumi.tv/', null, 'GET');
+        const doc = document.implementation.createHTMLDocument('');
+        doc.documentElement.innerHTML = html;
+        const r = bgHomeSubjectIdsFromDoc(doc);
+        return {
+          ok: r.ok,
+          reason: r.reason,
+          count: r.ids.length,
+          ids: r.ids.slice(0, 30),
+          htmlLength: html.length,
+          hasColumn: !!doc.getElementById('cloumnSubjectInfo'),
+          epGirdCount: doc.querySelectorAll('.epGird').length,
+          subjectLinkCount: doc.querySelectorAll('a[href^="/subject/"]').length,
+        };
+      } catch (e) {
+        return { ok: false, error: String((e && e.message) || e) };
+      }
+    },
 
     /* ---- 给其它脚本用的行级写接口 ----
      * 记录列备注：{ [规则]: { compact, header, lines } }，整体替换；
@@ -6311,7 +6377,7 @@ if (/^acg\.rip$/i.test(location.hostname)) {
       return changed || panelHit;
     },
   };
-  console.log('[acgripApi] 已暴露 v1.6.0');
+  console.log('[acgripApi] 已暴露 v1.6.1');
 }
 
 /* =====================================================================

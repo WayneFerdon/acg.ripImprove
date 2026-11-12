@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.5.5
+// @version      1.5.6
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -2757,6 +2757,7 @@ function showEditDialog() {
 或 =SUM((@&gt;={8,10,12,14,16})*-1) 表示下集达到 8,10,12,14,16 时各提前 1 天，并累计。
 BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进入编辑，可分别填写文本与 URL。粘贴含链接的富文本时会自动拆到两个 input。
 开播列：输入 &lt;100 的数字视为月份，自动转换为该月 1 号（如 10 → 1001）。
+排除规则表（last.* 表下方）：日期列 MMDD、规则列正则，都可直接改；回车或点别处即生效，并立刻刷新页面配色与未查看边界。
 
 快捷键：
   Esc：退出编辑（编辑中则取消编辑，多行选中则恢复单选，未打开时打开面板）
@@ -2857,8 +2858,8 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     }
   };
 
-  /* 排除规则一览：上一次匹配时间（MMDD）+ 规则，按规则字符串排序。
-   * 24 小时内被取消的规则也列出来（变淡 + 悬停看剩余时间），方便再点回来。 */
+  /* 排除规则一览：上一次匹配时间（MMDD）+ 规则，两个格都能直接改原始值。
+   * 行按规则字符串排序；24 小时内被取消的规则也列出来（变淡 + 悬停看剩余时间），方便再点回来。 */
   const excludeTbody = dialog.querySelector('#excludeRuleTbody');
   let _excludeRendering = false;
   function fmtExcludeMMDD(ts) {
@@ -2868,8 +2869,77 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     if (Number.isNaN(d.getTime())) return '—';
     return String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
   }
+  /* MMDD（也接受 M/D、M-D）→ 时间戳。沿用原来的时分；必须是过去 180 天内 */
+  function parseExcludeMMDD(text, oldTs) {
+    const s = String(text ?? '').trim();
+    let mm, dd, m;
+    if ((m = s.match(/^(\d{2})(\d{2})$/))) { mm = +m[1]; dd = +m[2]; }
+    else if ((m = s.match(/^(\d{1,2})[\/\-.](\d{1,2})$/))) { mm = +m[1]; dd = +m[2]; }
+    else return null;
+    if (mm < 1 || mm > 12 || dd < 1 || dd > 31) return null;
+    const base = oldTs ? new Date(oldTs) : new Date();
+    const hh = base.getHours(), mi = base.getMinutes();
+    const d = new Date(new Date().getFullYear(), mm - 1, dd, hh, mi, 0, 0);
+    if (d.getMonth() !== mm - 1 || d.getDate() !== dd) return null;   /* 0231 这类不存在的日期 */
+    const now = Date.now();
+    const today = new Date();
+    let ts = d.getTime();
+    if (ts > now) {
+      /* 今天但时分超了 → 收到当前时刻；其它未来日期一律拒绝 */
+      if (d.getFullYear() === today.getFullYear() && d.getMonth() === today.getMonth() && d.getDate() === today.getDate()) {
+        ts = now - 60 * 1000;
+      } else return null;
+    }
+    if (now - ts > EXCLUDE_TTL) return null;                           /* 超过 180 天会被自动清理 */
+    return ts;
+  }
+  /* 改完规则/时间后，把页面配色与未查看边界立刻重算 */
+  function applyExcludeEdit() {
+    saveExcludes();
+    try { syncViewedBoundary(); } catch (e) { console.error('[exclude] boundary', e); }
+    try { onHandleItems(setDisplayHighlight); } catch (e) { console.error('[exclude] refresh page', e); }
+  }
+  function commitExcludeEdit(inp) {
+    const tr = inp.closest('tr');
+    if (!tr || !tr.dataset.re) return;
+    const rule = (loadExcludes() || []).find(r => r.re === tr.dataset.re);
+    if (!rule) return;
+    if (inp.classList.contains('ex-time')) {
+      const ts = parseExcludeMMDD(inp.value, rule.ts);
+      if (ts == null) {
+        inp.value = fmtExcludeMMDD(rule.ts);
+        showToast('日期要写成 MMDD，且必须在最近 180 天内');
+        return;
+      }
+      inp.value = fmtExcludeMMDD(ts);
+      if (ts === rule.ts) return;
+      rule.ts = ts;
+      applyExcludeEdit();
+      return;
+    }
+    const v = inp.value.trim();
+    if (!v || v === rule.re) { inp.value = rule.re; return; }
+    if ((loadExcludes() || []).some(r => r !== rule && r.re === v)) {
+      inp.value = rule.re;
+      showToast('已存在相同的规则');
+      return;
+    }
+    try { new RegExp(v, 'i'); } catch (e) {
+      inp.value = rule.re;
+      showToast('正则无效：' + ((e && e.message) || e));
+      return;
+    }
+    rule.re = v;
+    rule._re = null;
+    tr.dataset.re = v;
+    inp.value = v;
+    applyExcludeEdit();
+    showToast('规则已更新');
+  }
   function renderExcludeRuleTable() {
     if (!excludeTbody || _excludeRendering) return;
+    /* 正在这格里输入时不要重建（定时保存会触发刷新），否则光标和半截输入会丢 */
+    if (excludeTbody.contains(document.activeElement)) return;
     _excludeRendering = true;
     try {
       const list = (loadExcludes() || []).slice()
@@ -2885,11 +2955,27 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
       }
       for (const rule of list) {
         const tr = cE('tr');
+        tr.dataset.re = rule.re;
         const tdTime = cE('td'), tdRule = cE('td');
-        tdTime.textContent = fmtExcludeMMDD(rule.ts);
-        tdTime.style.cssText = 'width:92px;white-space:nowrap;color:#cfcfcf;font-variant-numeric:tabular-nums;';
-        tdRule.textContent = rule.re;
-        tdRule.style.cssText = 'color:#d4d4d4;word-break:break-all;';
+        tdTime.style.cssText = 'width:92px;white-space:nowrap;';
+        tdRule.style.cssText = 'word-break:break-all;';
+        const inTime = cE('input');
+        inTime.type = 'text';
+        inTime.className = 'ex-time';
+        inTime.autocomplete = 'off';
+        inTime.value = fmtExcludeMMDD(rule.ts);
+        inTime.style.cssText = 'width:76px;box-sizing:border-box;text-align:center;font-variant-numeric:tabular-nums;padding:1px 2px;';
+        inTime.title = '上一次匹配排除的日期（MMDD，本地时间，沿用原来的时分）。回车或点别处生效，必须在最近 180 天内';
+        const inRule = cE('input');
+        inRule.type = 'text';
+        inRule.className = 'ex-rule';
+        inRule.autocomplete = 'off';
+        inRule.spellcheck = false;
+        inRule.value = rule.re;
+        inRule.style.cssText = 'width:100%;box-sizing:border-box;font-family:Consolas,monospace;padding:1px 4px;';
+        inRule.title = '排除规则（正则，忽略大小写）。回车或点别处生效，改完立即刷新页面配色与未查看边界';
+        tdTime.appendChild(inTime);
+        tdRule.appendChild(inRule);
         if (rule.offAt) {
           tr.style.opacity = '0.45';
           const left = Math.max(0, Math.ceil((EXCLUDE_OFF_TTL - (Date.now() - rule.offAt)) / _1h));
@@ -2900,6 +2986,15 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
       }
     } finally { _excludeRendering = false; }
   }
+  excludeTbody.addEventListener('change', (e) => {
+    const inp = e.target;
+    if (inp && inp.tagName === 'INPUT') commitExcludeEdit(inp);
+  });
+  excludeTbody.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || !e.target || e.target.tagName !== 'INPUT') return;
+    e.preventDefault();          /* 别让 Enter 触发表单"保存" */
+    e.target.blur();             /* blur 会触发 change，由上面的 handler 提交 */
+  });
   renderExcludeRuleTable();
   overlay._refreshExcludeTable = renderExcludeRuleTable;
   const host = dialog.querySelector('#unifiedTableHost');

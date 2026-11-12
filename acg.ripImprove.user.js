@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.6.1
+// @version      1.6.2
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -72,6 +72,19 @@ function spaUiScheduleRestore(delay) {
   if (_spaTimer) clearTimeout(_spaTimer);
   _spaTimer = setTimeout(() => { _spaTimer = null; spaUiRestoreNow(); }, delay > 0 ? delay : 300);
 }
+/* 丢弃一个已经脱离文档的旧面板：摘掉它注册的全局监听，清空闭包引用。
+ * 不这么做的话 _gmEditShow 会一直指向游离节点 —— 按 Esc 只在内存里设 display，
+ * 页面上什么也不会出现；旧面板的 Esc/Ctrl+S 监听还会抢事件。 */
+function cleanupStalePanel() {
+  const ov = _gmEditOverlay;
+  if (ov) {
+    if (typeof ov._acgripDetach === 'function') {
+      try { ov._acgripDetach(); } catch (e) { console.error('[panel] detach', e); }
+    }
+    if (ov.parentNode) ov.parentNode.removeChild(ov);
+  }
+  _gmEditShow = null; _gmEditHide = null; _gmEditRelayout = null; _gmEditOverlay = null;
+}
 function spaUiRestoreNow() {
   if (_spaTimer) { clearTimeout(_spaTimer); _spaTimer = null; }
   if (!IS_ACGRIP_PAGE) return;
@@ -84,10 +97,12 @@ function spaUiRestoreNow() {
     }
     if (display) positionDisplay(display);
     /* 编辑面板：旧实例已随旧 body 一起被丢弃，整体重建（重建时会恢复选中行/焦点格） */
-    if (spaUiPanelShouldReopen()) {
-      if (_gmEditOverlay && _gmEditOverlay.parentNode) _gmEditOverlay.parentNode.removeChild(_gmEditOverlay);
-      _gmEditShow = null; _gmEditOverlay = null; _gmEditHide = null; _gmEditRelayout = null;
+    const needReopen = spaUiPanelShouldReopen();     /* 必须在清引用之前判断 */
+    if (needReopen) {
+      cleanupStalePanel();
       showEditDialog();
+    } else if (_gmEditOverlay && !_gmEditOverlay.isConnected) {
+      cleanupStalePanel();                           /* 关着的旧面板也要把失效引用清掉 */
     }
   } catch (e) {
     console.error('[spaUiRestore]', e);
@@ -173,7 +188,8 @@ window.addEventListener('resize', handleGlobalResize);
 document.addEventListener('keydown', (e) => {
   if (e.key !== 'Escape') return;
   if (!IS_ACGRIP_PAGE) return;
-  if (_gmEditOverlay && _gmEditOverlay.style.display !== 'none') return;
+  /* 必须是「还在文档里」的面板才算已打开：Turbolinks 换 body 后旧引用会变成游离节点 */
+  if (_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none') return;
   if (document.getElementById('importOverlay')) return;
   const ae = document.activeElement;
   if (ae && ae !== document.body && ae !== document.documentElement) {
@@ -2274,8 +2290,12 @@ function buildColumnWidthCss(cols) {
 
 /* ============ 编辑对话框 ============ */
 function showEditDialog() {
+  /* SPA/Turbolinks 换过 body、或脚本被重载过：旧 overlay 已不在文档里，
+   * 先清掉失效的闭包与监听，否则 _gmEditShow() 只是给游离节点设 display，看不见任何东西 */
+  if (_gmEditOverlay && !_gmEditOverlay.isConnected) cleanupStalePanel();
   if (_gmEditShow) { _gmEditShow(); return; }
-  if (document.getElementById('gmEditOverlay')) return;
+  const orphan = document.getElementById('gmEditOverlay');
+  if (orphan) orphan.remove();          /* 没有配套闭包的僵尸节点，删掉重建 */
 
   let bd = getValue('bangumiData') ?? { rows: [], delay: { rows: [] } };
   let draftLast = null;
@@ -6678,6 +6698,13 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   };
   _gmEditHide = hideDialog;
   _gmEditOverlay = overlay;
+  /* 供 cleanupStalePanel() 在面板被 SPA 导航丢弃后摘监听（重建时不会重复累积） */
+  overlay._acgripDetach = () => {
+    try { stopExcludePoll(); } catch {}
+    document.removeEventListener('keydown', escKeyHandler, true);
+    document.removeEventListener('keydown', saveKeyHandler, true);
+    window.removeEventListener('resize', layoutResizeHandler);
+  };
 
   selfAdaptiveTextarea();
   _gmEditShow();

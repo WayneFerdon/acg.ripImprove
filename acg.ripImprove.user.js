@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.5.8
+// @version      1.5.9
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -672,14 +672,20 @@ function loadExcludes() {
   return excludeRules;
 }
 
+/* 编辑面板开着时刷新规则表。force=true 时忽略「正在输入就不重建」的保护，
+ * 用于页面上点了 ⊘ 之后强制同步（此时输入框已经失焦并提交过了）。 */
+function refreshExcludeTableInOverlay(force = false) {
+  const ov = _gmEditOverlay;
+  if (!ov || !ov.isConnected || ov.style.display === 'none') return;
+  if (typeof ov._refreshExcludeTable !== 'function') return;
+  try { ov._refreshExcludeTable(force); } catch (e) { console.error('[exclude] refresh table', e); }
+}
+
 function saveExcludes() {
   if (_excludeSaveTid) { clearTimeout(_excludeSaveTid); _excludeSaveTid = null; }
   setValue(EXCLUDE_KEY, (excludeRules || []).map(r => ({ re: r.re, ts: r.ts, hits: r.hits, offAt: r.offAt || 0 })));
   /* 编辑面板开着时规则表跟着刷新（新增/取消/重新排除都会走到这里） */
-  if (_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none'
-      && typeof _gmEditOverlay._refreshExcludeTable === 'function') {
-    try { _gmEditOverlay._refreshExcludeTable(); } catch (e) { console.error('[exclude] refresh table', e); }
-  }
+  refreshExcludeTableInOverlay();
 }
 
 function scheduleSaveExcludes() {
@@ -848,6 +854,8 @@ function ensureExcludeButton(item) {
       }
     }
     const moved = syncViewedBoundary();
+    /* 分屏时面板和页面同时可见：点完页面上的 ⊘ 立刻把面板里的规则表同步过来 */
+    refreshExcludeTableInOverlay(true);
     onHandleItems(setDisplayHighlight);
     if (moved) showToast(`未查看边界后移 ${moved} 条`);
   });
@@ -862,14 +870,16 @@ function decorateExclude(item, title, href, strongColor = false) {
   /* 文字配色：只有「未查看区间内」的排除才用排除样式；
    * 早于最旧未查看的条目已经翻篇，按正常的已查看/已下载配色显示。
    * 红/紫（需要下载 / 已下载待下）优先于排除 —— 这两种颜色代表「要动手」，
-   * 不能被排除的灰色样式盖掉，只靠红色 ⊘ 表示已排除。
-   * 按钮不受此限制：只要在排除列表里就一直是红色，随时可以点掉。 */
+   * 不能被排除的灰色样式盖掉；是否已排除看 ⊘ 的颜色。 */
   const mark = !!hit && isInUnviewedRegion(href) && !strongColor;
   item.classList.toggle('acgrip-excluded', mark);
   if (mark) item.style.opacity = '0.55'; else item.style.removeProperty('opacity');
   if (!btn) return;
-  btn.style.color = hit ? '#e06c75' : '#999';
-  btn.style.borderColor = hit ? '#e06c75' : '#666';
+  /* ⊘ 的颜色表示「可点」而不是「已排除」：
+   *   还没排除 → 红色（可以点它排除）；已在排除列表 → 灰色（再点是取消）。
+   * 行文字配色只受「未查看区间」与红/紫状态色影响。 */
+  btn.style.color = hit ? '#999' : '#e06c75';
+  btn.style.borderColor = hit ? '#666' : '#e06c75';
   btn.title = !hit
     ? '把这条加入排除列表（数字自动换成 \\d+）：该条不再算「未查看」，但不影响 torrent 下载'
     : (mark

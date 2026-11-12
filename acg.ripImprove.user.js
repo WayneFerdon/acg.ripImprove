@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.5.9
+// @version      1.6.0
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -2773,7 +2773,7 @@ function showEditDialog() {
 或 =SUM((@&gt;={8,10,12,14,16})*-1) 表示下集达到 8,10,12,14,16 时各提前 1 天，并累计。
 BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进入编辑，可分别填写文本与 URL。粘贴含链接的富文本时会自动拆到两个 input。
 开播列：输入 &lt;100 的数字视为月份，自动转换为该月 1 号（如 10 → 1001）。
-排除规则表（last.* 表下方）：日期列 MMDD、规则列正则，都可直接改；清空规则或点行尾 × 即删除；回车或点别处生效，并立刻刷新页面配色与未查看边界。
+排除规则表（last.* 表下方）：日期列 MMDD、规则列正则，都可直接改；顶部空白行输入规则后回车即新增；清空规则或点行尾 × 即删除；回车或点别处生效，并立刻刷新页面配色与未查看边界。
 
 快捷键：
   Esc：退出编辑（编辑中则取消编辑，多行选中则恢复单选，未打开时打开面板）
@@ -2923,9 +2923,45 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     showToast(toast || '已删除规则');
     return true;
   }
+  /* 顶部常驻的空白新增行：输入规则后回车即添加；留空什么都不做（不参与删除流程） */
+  function buildExcludeAddRow() {
+    const tr = cE('tr');
+    tr.dataset.newRow = '1';
+    const tdTime = cE('td');
+    tdTime.textContent = '—';
+    tdTime.style.cssText = 'width:92px;text-align:center;color:#777;';
+    const tdRule = cE('td');
+    const inRule = cE('input');
+    inRule.type = 'text';
+    inRule.className = 'ex-rule ex-new';
+    inRule.autocomplete = 'off';
+    inRule.spellcheck = false;
+    inRule.placeholder = '＋ 输入新规则（正则）后回车添加';
+    inRule.style.cssText = 'width:100%;box-sizing:border-box;font-family:Consolas,monospace;padding:1px 4px;';
+    inRule.title = '在这里输入新规则，回车或点别处即添加；留空不会删除任何东西';
+    tdRule.appendChild(inRule);
+    tr.appendChild(tdTime); tr.appendChild(tdRule);
+    return tr;
+  }
+  function addExcludeRuleFromInput(inp) {
+    const v = inp.value.trim();
+    if (!v) { inp.value = ''; return; }   /* 空白行留空：什么都不做，顺手把空格清掉 */
+    const list = loadExcludes() || [];
+    if (list.some(r => r.re === v)) { showToast('已存在相同的规则'); return; }
+    try { new RegExp(v, 'i'); } catch (e) {
+      showToast('正则无效：' + ((e && e.message) || e));
+      return;
+    }
+    list.push({ re: v, ts: Date.now(), hits: 0, offAt: 0, _re: null });
+    applyExcludeEdit();
+    renderExcludeRuleTable(true);        /* 重新排序，并让顶部再出现一行空白 */
+    showToast('已新增规则：' + v);
+  }
   function commitExcludeEdit(inp) {
     const tr = inp.closest('tr');
-    if (!tr || !tr.dataset.re) return;
+    if (!tr) return;
+    if (tr.dataset.newRow) { addExcludeRuleFromInput(inp); return; }
+    if (!tr.dataset.re) return;
     const rule = (loadExcludes() || []).find(r => r.re === tr.dataset.re);
     if (!rule) return;
     if (inp.classList.contains('ex-time')) {
@@ -2971,14 +3007,8 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
       const list = (loadExcludes() || []).slice()
         .sort((a, b) => (a.re < b.re ? -1 : a.re > b.re ? 1 : 0));
       excludeTbody.textContent = '';
-      if (!list.length) {
-        const tr = cE('tr'), td = cE('td');
-        td.colSpan = 2;
-        td.textContent = '（没有排除规则）';
-        td.style.cssText = 'text-align:center;color:#888;';
-        tr.appendChild(td); excludeTbody.appendChild(tr);
-        return;
-      }
+      excludeTbody.appendChild(buildExcludeAddRow());
+      if (!list.length) return;
       for (const rule of list) {
         const tr = cE('tr');
         tr.dataset.re = rule.re;

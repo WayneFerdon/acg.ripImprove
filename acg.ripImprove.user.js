@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.6.0
+// @version      1.6.1
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -21,6 +21,11 @@
 // ==/UserScript==
 
 const _1s = 1000, _1m = 60 * _1s, _1h = 60 * _1m, _1d = 24 * _1h;
+/* 运行中的脚本版本（面板里显示，方便确认油猴装的是哪一版） */
+const SCRIPT_VERSION = (() => {
+  try { return (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) || 'dev'; }
+  catch { return 'dev'; }
+})();
 const colors = { last: 'palegreen', tracking: 'crimson', downloaded: 'rebeccapurple', viewed: 'grey', oldestUnviewed: '#4db8ff' };
 const timeOpt = { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false };
 const url2num = url => 1 * `${url ?? ''}`.replace('/t/', '');
@@ -692,6 +697,16 @@ function scheduleSaveExcludes() {
   if (_excludeSaveTid) return;
   _excludeSaveTid = setTimeout(() => { _excludeSaveTid = null; saveExcludes(); }, 1500);
 }
+
+/* 另一标签页/另一份脚本实例改了规则：清缓存、刷新面板表格、重算页面
+ * （本实例自己写值时不会触发这个监听，走 saveExcludes 里的同步刷新） */
+try {
+  GM_addValueChangeListener(EXCLUDE_KEY, () => {
+    excludeRules = null;
+    refreshExcludeTableInOverlay(true);
+    try { onHandleItems(setDisplayHighlight); } catch (e) { console.error('[exclude] sync from other tab', e); }
+  });
+} catch {}
 
 /* 清理：
  *  - 已取消排除的规则，满 24 小时整条删除（记录一并删掉）；
@@ -2824,7 +2839,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
           <table id="excludeRuleTable" style="margin-top:8px;">
             <thead><tr>
               <th style="width:92px;">last.excluded</th>
-              <th>rule</th>
+              <th>rule<span style="float:right;font-weight:normal;font-size:9pt;color:#666;">v${SCRIPT_VERSION}</span></th>
             </tr></thead>
             <tbody id="excludeRuleTbody"></tbody>
           </table>
@@ -2878,6 +2893,12 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
    * 行按规则字符串排序；24 小时内被取消的规则也列出来（变淡 + 悬停看剩余时间），方便再点回来。 */
   const excludeTbody = dialog.querySelector('#excludeRuleTbody');
   let _excludeRendering = false;
+  let _excludeSig = '';            /* 上次渲染时存储里的规则快照 */
+  let _excludePollTid = null;
+  /* 直接读 GM 存储而不是内存缓存：另一个标签页/另一份脚本实例改了规则也能发现 */
+  function excludeStorageSig() {
+    try { return JSON.stringify(getValue(EXCLUDE_KEY) || []); } catch { return ''; }
+  }
   function fmtExcludeMMDD(ts) {
     const t = Number(ts) || 0;
     if (t <= 0) return '—';
@@ -3003,6 +3024,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     /* 正在这格里输入时不要重建（定时保存会触发刷新），否则光标和半截输入会丢 */
     if (!force && excludeTbody.contains(document.activeElement)) return;
     _excludeRendering = true;
+    _excludeSig = excludeStorageSig();
     try {
       const list = (loadExcludes() || []).slice()
         .sort((a, b) => (a.re < b.re ? -1 : a.re > b.re ? 1 : 0));
@@ -3077,6 +3099,22 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   });
   renderExcludeRuleTable();
   overlay._refreshExcludeTable = renderExcludeRuleTable;
+  /* 兜底轮询：面板开着时，只要存储里的规则变了就重建一次。
+   * 覆盖「另一标签页点 ⊘」「GM 值变更事件没触发」「上一次刷新被输入焦点挡掉」等情况。 */
+  function startExcludePoll() {
+    if (_excludePollTid) return;
+    _excludePollTid = setInterval(() => {
+      if (overlay.style.display === 'none') return;
+      if (excludeStorageSig() === _excludeSig) return;
+      if (excludeTbody.contains(document.activeElement)) return;   /* 正在输入，下轮再试 */
+      excludeRules = null;                                        /* 丢掉缓存，重新读存储 */
+      try { loadExcludes(); } catch (e) { console.error('[exclude] poll load', e); return; }
+      renderExcludeRuleTable(true);
+    }, 1200);
+  }
+  function stopExcludePoll() {
+    if (_excludePollTid) { clearInterval(_excludePollTid); _excludePollTid = null; }
+  }
   const host = dialog.querySelector('#unifiedTableHost');
   const _activeFloats = new Set();
   let _floatPadRafPending = false;
@@ -6463,6 +6501,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     _gmEditOverlay = null;
     _gmEditHide = null;
     _gmEditRelayout = null;
+    stopExcludePoll();
     if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
     try { localStorage.setItem(PANEL_OPEN_KEY, '1'); } catch {}
     showEditDialog();
@@ -6546,6 +6585,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   hideDialog = () => {
     saveLastCellState();
     flushDraftSave();
+    stopExcludePoll();
     overlay.style.display = 'none';
     try { localStorage.setItem(PANEL_OPEN_KEY, '0'); } catch {}
     document.body.classList.remove('acgrip-split');
@@ -6578,6 +6618,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   window.addEventListener('resize', layoutResizeHandler);
   _gmEditShow = () => {
     overlay.style.display = 'flex';
+    startExcludePoll();
     try { localStorage.setItem(PANEL_OPEN_KEY, '1'); } catch {}
     document.removeEventListener('keydown', escKeyHandler, true);
     document.addEventListener('keydown', escKeyHandler, true);

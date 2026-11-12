@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.5.4
+// @version      1.5.5
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -675,6 +675,11 @@ function loadExcludes() {
 function saveExcludes() {
   if (_excludeSaveTid) { clearTimeout(_excludeSaveTid); _excludeSaveTid = null; }
   setValue(EXCLUDE_KEY, (excludeRules || []).map(r => ({ re: r.re, ts: r.ts, hits: r.hits, offAt: r.offAt || 0 })));
+  /* 编辑面板开着时规则表跟着刷新（新增/取消/重新排除都会走到这里） */
+  if (_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none'
+      && typeof _gmEditOverlay._refreshExcludeTable === 'function') {
+    try { _gmEditOverlay._refreshExcludeTable(); } catch (e) { console.error('[exclude] refresh table', e); }
+  }
 }
 
 function scheduleSaveExcludes() {
@@ -2799,6 +2804,13 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
               <td><input id="inpLastDownload" value="${storedLastDownload}" style="width:100%;box-sizing:border-box;"></td>
             </tr></tbody>
           </table>
+          <table id="excludeRuleTable" style="margin-top:8px;">
+            <thead><tr>
+              <th style="width:92px;">last.excluded</th>
+              <th>rule</th>
+            </tr></thead>
+            <tbody id="excludeRuleTbody"></tbody>
+          </table>
         </div>
       </div>
     </div>
@@ -2844,6 +2856,52 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
       inpLastDownload.value = lastDownload ?? '';
     }
   };
+
+  /* 排除规则一览：上一次匹配时间（MMDD）+ 规则，按规则字符串排序。
+   * 24 小时内被取消的规则也列出来（变淡 + 悬停看剩余时间），方便再点回来。 */
+  const excludeTbody = dialog.querySelector('#excludeRuleTbody');
+  let _excludeRendering = false;
+  function fmtExcludeMMDD(ts) {
+    const t = Number(ts) || 0;
+    if (t <= 0) return '—';
+    const d = new Date(t);
+    if (Number.isNaN(d.getTime())) return '—';
+    return String(d.getMonth() + 1).padStart(2, '0') + String(d.getDate()).padStart(2, '0');
+  }
+  function renderExcludeRuleTable() {
+    if (!excludeTbody || _excludeRendering) return;
+    _excludeRendering = true;
+    try {
+      const list = (loadExcludes() || []).slice()
+        .sort((a, b) => (a.re < b.re ? -1 : a.re > b.re ? 1 : 0));
+      excludeTbody.textContent = '';
+      if (!list.length) {
+        const tr = cE('tr'), td = cE('td');
+        td.colSpan = 2;
+        td.textContent = '（没有排除规则）';
+        td.style.cssText = 'text-align:center;color:#888;';
+        tr.appendChild(td); excludeTbody.appendChild(tr);
+        return;
+      }
+      for (const rule of list) {
+        const tr = cE('tr');
+        const tdTime = cE('td'), tdRule = cE('td');
+        tdTime.textContent = fmtExcludeMMDD(rule.ts);
+        tdTime.style.cssText = 'width:92px;white-space:nowrap;color:#cfcfcf;font-variant-numeric:tabular-nums;';
+        tdRule.textContent = rule.re;
+        tdRule.style.cssText = 'color:#d4d4d4;word-break:break-all;';
+        if (rule.offAt) {
+          tr.style.opacity = '0.45';
+          const left = Math.max(0, Math.ceil((EXCLUDE_OFF_TTL - (Date.now() - rule.offAt)) / _1h));
+          tr.title = `已取消排除，${left} 小时后删除该规则`;
+        }
+        tr.appendChild(tdTime); tr.appendChild(tdRule);
+        excludeTbody.appendChild(tr);
+      }
+    } finally { _excludeRendering = false; }
+  }
+  renderExcludeRuleTable();
+  overlay._refreshExcludeTable = renderExcludeRuleTable;
   const host = dialog.querySelector('#unifiedTableHost');
   const _activeFloats = new Set();
   let _floatPadRafPending = false;

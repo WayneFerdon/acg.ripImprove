@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.5.7
+// @version      1.5.8
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -855,14 +855,16 @@ function ensureExcludeButton(item) {
   return btn;
 }
 
-function decorateExclude(item, title, href) {
+function decorateExclude(item, title, href, strongColor = false) {
   if (!item || item.ownerDocument !== document) return;
   const btn = ensureExcludeButton(item);
   const hit = title ? matchExcludeRule(title, false) : null;
   /* 文字配色：只有「未查看区间内」的排除才用排除样式；
    * 早于最旧未查看的条目已经翻篇，按正常的已查看/已下载配色显示。
+   * 红/紫（需要下载 / 已下载待下）优先于排除 —— 这两种颜色代表「要动手」，
+   * 不能被排除的灰色样式盖掉，只靠红色 ⊘ 表示已排除。
    * 按钮不受此限制：只要在排除列表里就一直是红色，随时可以点掉。 */
-  const mark = !!hit && isInUnviewedRegion(href);
+  const mark = !!hit && isInUnviewedRegion(href) && !strongColor;
   item.classList.toggle('acgrip-excluded', mark);
   if (mark) item.style.opacity = '0.55'; else item.style.removeProperty('opacity');
   if (!btn) return;
@@ -872,7 +874,9 @@ function decorateExclude(item, title, href) {
     ? '把这条加入排除列表（数字自动换成 \\d+）：该条不再算「未查看」，但不影响 torrent 下载'
     : (mark
         ? `已排除：${hit.re}\n点击改为「未排除」（显示与判定立即生效，24 小时后删除该规则）`
-        : `已在排除列表（该条早于最旧未查看，文字按已查看样式显示）\n${hit.re}\n点击可取消排除`);
+        : strongColor
+          ? `已在排除列表，但该条需要下载，保留红/紫配色（只看 ⊘ 判断是否排除）\n${hit.re}\n点击可取消排除`
+          : `已在排除列表（该条早于最旧未查看，文字按已查看样式显示）\n${hit.re}\n点击可取消排除`);
 }
 
 /* 菜单：查看 / 删除排除规则 */
@@ -927,11 +931,13 @@ function setTimeHover() {
 /* ===== 页面高亮 ===== */
 function setDisplayHighlight({ item, found, href, title, oldestUnviewedHref }) {
   const color = getColor();
+  /* 红/紫代表「需要下载 / 已下载待下」，优先级高于排除的灰色样式 */
+  const strongColor = color === colors.tracking || color === colors.downloaded;
   for (const el of [item, ...gE('a', 'all', item)]) {
     if (color) el.style.color = color;
     else el.style.removeProperty('color');
   }
-  try { decorateExclude(item, title, href); } catch (e) { console.error('[exclude] decorate', e); }
+  try { decorateExclude(item, title, href, strongColor); } catch (e) { console.error('[exclude] decorate', e); }
   function getColor() {
     switch (true) {
       /* 「未查看」的最旧一条优先标浅蓝：它是继续浏览的起点，不能被番组状态色盖掉 */

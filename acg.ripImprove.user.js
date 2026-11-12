@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.5.6
+// @version      1.5.7
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -2757,7 +2757,7 @@ function showEditDialog() {
 或 =SUM((@&gt;={8,10,12,14,16})*-1) 表示下集达到 8,10,12,14,16 时各提前 1 天，并累计。
 BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进入编辑，可分别填写文本与 URL。粘贴含链接的富文本时会自动拆到两个 input。
 开播列：输入 &lt;100 的数字视为月份，自动转换为该月 1 号（如 10 → 1001）。
-排除规则表（last.* 表下方）：日期列 MMDD、规则列正则，都可直接改；回车或点别处即生效，并立刻刷新页面配色与未查看边界。
+排除规则表（last.* 表下方）：日期列 MMDD、规则列正则，都可直接改；清空规则或点行尾 × 即删除；回车或点别处生效，并立刻刷新页面配色与未查看边界。
 
 快捷键：
   Esc：退出编辑（编辑中则取消编辑，多行选中则恢复单选，未打开时打开面板）
@@ -2899,6 +2899,14 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     try { syncViewedBoundary(); } catch (e) { console.error('[exclude] boundary', e); }
     try { onHandleItems(setDisplayHighlight); } catch (e) { console.error('[exclude] refresh page', e); }
   }
+  /* 删除一条规则：落盘 → 立刻重建表（绕开"正在输入不重建"的保护）→ 刷新页面 */
+  function deleteExcludeRuleNow(re, toast) {
+    if (!re || !removeExcludeRule(re)) return false;
+    renderExcludeRuleTable(true);
+    applyExcludeEdit();
+    showToast(toast || '已删除规则');
+    return true;
+  }
   function commitExcludeEdit(inp) {
     const tr = inp.closest('tr');
     if (!tr || !tr.dataset.re) return;
@@ -2918,7 +2926,9 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
       return;
     }
     const v = inp.value.trim();
-    if (!v || v === rule.re) { inp.value = rule.re; return; }
+    if (v === rule.re) return;
+    /* 规则清空 = 删除这条（等价于点行尾的 ×） */
+    if (!v) { deleteExcludeRuleNow(rule.re, '规则为空，已删除该条'); return; }
     if ((loadExcludes() || []).some(r => r !== rule && r.re === v)) {
       inp.value = rule.re;
       showToast('已存在相同的规则');
@@ -2936,10 +2946,10 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     applyExcludeEdit();
     showToast('规则已更新');
   }
-  function renderExcludeRuleTable() {
+  function renderExcludeRuleTable(force = false) {
     if (!excludeTbody || _excludeRendering) return;
     /* 正在这格里输入时不要重建（定时保存会触发刷新），否则光标和半截输入会丢 */
-    if (excludeTbody.contains(document.activeElement)) return;
+    if (!force && excludeTbody.contains(document.activeElement)) return;
     _excludeRendering = true;
     try {
       const list = (loadExcludes() || []).slice()
@@ -2972,10 +2982,20 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
         inRule.autocomplete = 'off';
         inRule.spellcheck = false;
         inRule.value = rule.re;
-        inRule.style.cssText = 'width:100%;box-sizing:border-box;font-family:Consolas,monospace;padding:1px 4px;';
-        inRule.title = '排除规则（正则，忽略大小写）。回车或点别处生效，改完立即刷新页面配色与未查看边界';
+        inRule.style.cssText = 'flex:1 1 auto;min-width:0;box-sizing:border-box;font-family:Consolas,monospace;padding:1px 4px;';
+        inRule.title = '排除规则（正则，忽略大小写）。回车或点别处生效；清空后回车即删除这条';
+        const delBtn = cE('button');
+        delBtn.type = 'button';
+        delBtn.className = 'ex-del';
+        delBtn.textContent = '×';
+        delBtn.title = '删除这条排除规则（立即生效并刷新页面）';
+        delBtn.style.cssText = 'flex:0 0 auto;padding:0 6px;line-height:1.2;color:#e88;border-color:#633;';
+        const ruleWrap = cE('div');
+        ruleWrap.style.cssText = 'display:flex;align-items:center;gap:4px;';
+        ruleWrap.appendChild(inRule);
+        ruleWrap.appendChild(delBtn);
         tdTime.appendChild(inTime);
-        tdRule.appendChild(inRule);
+        tdRule.appendChild(ruleWrap);
         if (rule.offAt) {
           tr.style.opacity = '0.45';
           const left = Math.max(0, Math.ceil((EXCLUDE_OFF_TTL - (Date.now() - rule.offAt)) / _1h));
@@ -2994,6 +3014,20 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     if (e.key !== 'Enter' || !e.target || e.target.tagName !== 'INPUT') return;
     e.preventDefault();          /* 别让 Enter 触发表单"保存" */
     e.target.blur();             /* blur 会触发 change，由上面的 handler 提交 */
+  });
+  /* 行尾 ×：删掉这一条。mousedown 阻止默认可避免按钮抢焦点 ——
+   * 否则输入框先 blur 触发 change，可能先把表格重建掉，click 就落空了。 */
+  excludeTbody.addEventListener('mousedown', (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest('button.ex-del') : null;
+    if (btn) e.preventDefault();
+  });
+  excludeTbody.addEventListener('click', (e) => {
+    const btn = e.target && e.target.closest ? e.target.closest('button.ex-del') : null;
+    if (!btn) return;
+    e.preventDefault();
+    const tr = btn.closest('tr');
+    const re = tr && tr.dataset.re;
+    if (re) deleteExcludeRuleNow(re, '已删除规则');
   });
   renderExcludeRuleTable();
   overlay._refreshExcludeTable = renderExcludeRuleTable;

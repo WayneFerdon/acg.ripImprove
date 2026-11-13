@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.6.2
+// @version      1.6.3
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -5752,6 +5752,9 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
       const edited = keys.some(k => computeRowFieldValue(row, k) !== orig[k]);
       td.classList.toggle('cell-temp-edited', edited);
     }
+    /* 行的底色是按 cell-temp-edited 这个 class 用内联样式刷上去的：
+     * 只改 class 不重画，类去掉后蓝底（#1a2f5a）还会留在 td 上。 */
+    try { applyRowBackground(tr); } catch (e) { console.error('[panel] repaint row', e); }
   }
 
   /* ===== 表格骨架 ===== */
@@ -5772,7 +5775,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   updateDelayNameHighlight();
 
   /* ===== 排序 / 分隔 / 高亮 ===== */
-  function sortMainRows() {
+  function sortMainRows(opts = {}) {
     const mainRows = [...tbody.children].filter(tr => tr._row);
     mainRows.sort((a, b) => {
       const ra = a._row, rb = b._row;
@@ -5792,7 +5795,8 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     for (const tr of mainRows) tbody.appendChild(tr);
     rebuildDividerRows();
     adjustAdaptiveColumns();
-    scheduleDraftSave();
+    /* 隐藏的面板不要在排序时把过时数据写回草稿 */
+    if (opts.saveDraft !== false) scheduleDraftSave();
   }
   function makeDividerRow(label, bgColor) {
     const tr = cE('tr'); tr.className = 'divider-row';
@@ -6678,21 +6682,25 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
 
       if (typeof tr._updateDerived === 'function') tr._updateDerived();
 
-      if (oldVal !== String(newNext)) {
+      const nowVal = computeRowFieldValue(row, '下集');
+      const baseline = tr._originalValues ? tr._originalValues.下集 : nowVal;
+      if (oldVal !== String(newNext) || baseline !== nowVal) {
         /* 自动推进写的是 bangumiData，属于“已保存”的更新，不是用户未保存的编辑：
-         * 同步基线并刷新标记，否则下集列会一直显示成待保存状态。 */
-        if (tr._originalValues) tr._originalValues.下集 = computeRowFieldValue(row, '下集');
-        refreshTempEditedMark(tr);
-        changed = true;
+         * 同步基线并刷新标记，否则下集列会一直显示成待保存状态。
+         * 基线也一起对齐 —— 面板停在旧草稿上时 oldVal 可能已经等于新值，
+         * 只比较 oldVal 会漏掉这种“显示正确但标记还在”的情况。 */
+        if (tr._originalValues) tr._originalValues.下集 = nowVal;
+        refreshTempEditedMark(tr);      /* 内部会一并重画底色 */
+        if (oldVal !== String(newNext)) changed = true;
       }
 
       /* 隐藏的面板不要整表写草稿：面板里的其它字段可能已经过时 */
       if (opts.saveDraft !== false) scheduleDraftSave();
       break;
     }
-    /* 下集变化会影响排序（完结条目下沉 / 分隔行）：面板可见时同步重排 */
-    if (changed && opts.saveDraft !== false && opts.sort !== false) {
-      try { sortMainRows(); } catch (e) {}
+    /* 下集变化会影响排序（完结条目下沉 / 分隔行）：与是否写草稿无关，照常重排 */
+    if (changed && opts.sort !== false) {
+      try { sortMainRows({ saveDraft: opts.saveDraft !== false }); } catch (e) { console.error('[panel] sort', e); }
     }
     return changed;
   };
@@ -6941,7 +6949,7 @@ if (/^acg\.rip$/i.test(location.hostname)) {
 
       /* 面板存在就同步这一行（隐藏着也同步，重新打开时不会又变回旧值）。
        * 隐藏时不让面板整表写草稿：它里面的其它字段可能已经过时。 */
-      const panelVisible = !!(_gmEditOverlay && _gmEditOverlay.style.display !== 'none');
+      const panelVisible = !!(_gmEditOverlay && _gmEditOverlay.isConnected && _gmEditOverlay.style.display !== 'none');
       let panelHit = false;
       if (_gmEditOverlay && _gmEditOverlay.isConnected
           && typeof _gmEditOverlay._syncRowUpdate === 'function') {

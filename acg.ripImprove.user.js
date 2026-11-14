@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.6.3
+// @version      1.7.0
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -136,8 +136,8 @@ function spaUiRestoreTick(force) {
     const btn = cE('button');
     btn.id = 'acgrip-open-editor-btn';
     btn.type = 'button';
-    btn.textContent = '⚙ 编辑数据';
-    btn.title = '打开 acg.ripImprove 数据编辑面板';
+    btn.textContent = '⚙ 设置';
+    btn.title = '打开 acg.ripImprove 设置';
     btn.style.cssText = [
       'position:fixed', 'right:14px', 'bottom:14px', 'z-index:9998',
       'background:#2d2d2d', 'color:#d4d4d4', 'border:1px solid #555',
@@ -225,6 +225,64 @@ function idToHref(v) {
   if (v == null || v === '') return undefined;
   const s = String(v).replace(/^\/t\//, '').trim();
   return /^\d+$/.test(s) ? '/t/' + s : undefined;
+}
+
+/* ===== 面板按钮的倒计时（悬浮 title） ===== */
+function fmtLeft(ms) {
+  const sec = Math.max(0, Math.floor(ms / 1000));
+  const d = Math.floor(sec / 86400), h = Math.floor((sec % 86400) / 3600),
+        m = Math.floor((sec % 3600) / 60), s = sec % 60;
+  if (d > 0) return `${d} 天 ${h} 小时`;
+  if (h > 0) return `${h} 小时 ${m} 分`;
+  if (m > 0) return `${m} 分 ${s} 秒`;
+  return `${s} 秒`;
+}
+function fmtClock(ts) {
+  const d = new Date(Number(ts) || 0);
+  return `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+/* 最近的一条「下次播出」：到点页面会刷新并重新匹配调度 */
+function nextAirAt() {
+  let bd;
+  try { bd = getValue('bangumiData'); } catch { return 0; }
+  if (!bd || !Array.isArray(bd.rows) || !bd.rows.length) return 0;
+  const delayData = (bd.delay && Array.isArray(bd.delay.rows)) ? bd.delay : { rows: [] };
+  const now = Date.now();
+  let min = 0;
+  for (const row of bd.rows) {
+    if (!String(row.规则 || '').trim()) continue;
+    let air;
+    try {
+      air = getAirDate(row, parseBGMID(row.BGMID), (r, p) => lookupDelayFromData(r, p, delayData));
+    } catch { continue; }
+    if (!air) continue;
+    const t = air.getTime();
+    if (Number.isFinite(t) && t > now && (!min || t < min)) min = t;
+  }
+  return min;
+}
+function updatePanelAutoTitles(dialog) {
+  const btnUpdate = dialog && dialog.querySelector('#resetBangumiUpdate');
+  if (btnUpdate) {
+    const base = '立即从 Bangumi 抓取更新，并把新条目刷新到表格';
+    const ts = Number(getUpdated().bangumi) || 0;
+    if (!ts) btnUpdate.title = base + '\n下次自动更新：还没有同步记录';
+    else {
+      const next = ts + BANGUMI_INTERVAL;
+      const left = next - Date.now();
+      btnUpdate.title = base + (left > 0
+        ? `\n下次自动更新：${fmtClock(next)}（${fmtLeft(left)} 后）`
+        : '\n下次自动更新：已到点，打开首页时触发');
+    }
+  }
+  const btnMatch = dialog && dialog.querySelector('#resetInferredTimes');
+  if (btnMatch) {
+    const base = '立即重新匹配调度时间，并刷新表格显示';
+    const at = nextAirAt();
+    btnMatch.title = base + (at
+      ? `\n下次播出：${fmtClock(at)}（${fmtLeft(at - Date.now())} 后）；到点会重算调度`
+      : '\n下次播出：没有可推算的条目');
+  }
 }
 
 /* ===== 已下载转换 ===== */
@@ -594,6 +652,12 @@ function getDisplay() {
   }, true);
   const btn = createViewedButton();
   display.appendChild(btn);
+  /* 「标记已查看」后面挂一个未查看条数徽标（没有未查看条目时隐藏） */
+  const unviewedCount = cE('span');
+  unviewedCount.id = 'acgrip-unviewed-count';
+  unviewedCount.title = '当前页未查看的条目数（不含已排除）';
+  unviewedCount.style.cssText = 'display:none;background:#c0392b;color:#fff;border-radius:9px;padding:0 6px;font-size:11px;line-height:15px;font-family:inherit;';
+  display.appendChild(unviewedCount);
   const timeText = cE('span');
   timeText.id = 'acgrip-time-text';
   timeText.style.cssText = 'white-space:pre; text-align:right;';
@@ -619,7 +683,7 @@ function bindDisplayPositioning(disp) {
   const schedule = () => { if (scheduled) return; scheduled = true; requestAnimationFrame(() => { scheduled = false; positionDisplay(disp); }); };
   window.addEventListener('resize', schedule);
   window.addEventListener('scroll', schedule, true);
-  setInterval(schedule, 1000);
+  setInterval(() => { schedule(); try { updateUnviewedCount(); } catch (e) {} }, 1000);
 }
 
 /* ===== 未查看标记 ===== */
@@ -652,8 +716,32 @@ function createViewedButton() {
 }
 function updateViewedButton(btn) {
   btn = btn ?? document.getElementById('acgrip-view-button');
-  if (!btn) return;
-  btn.textContent = '标记已查看';
+  if (btn) btn.textContent = '标记已查看';
+  updateUnviewedCount();
+}
+/* 当前页「未查看」条数：id 大于 lastViewed 且没被排除（排除条目不再算未查看） */
+function updateUnviewedCount() {
+  const el = document.getElementById('acgrip-unviewed-count');
+  if (!el) return;
+  let n = 0;
+  if (lastViewed != null) {
+    const v = url2num(lastViewed);
+    for (const tr of gE('tr', 'all')) {
+      const a = gE('.title .title a', tr);
+      if (!a) continue;
+      const href = a.getAttribute('href');
+      const num = url2num(href);
+      if (!Number.isFinite(num) || num <= v) continue;
+      let excluded = false;
+      try { excluded = !!matchExcludeRule(a.innerHTML.replace(/\s+/g, ' '), false); } catch {}
+      if (!excluded) n++;
+    }
+  }
+  const text = n > 0 ? String(n) : '';
+  if (el.textContent !== text) {
+    el.textContent = text;
+    el.style.display = n > 0 ? 'inline-block' : 'none';
+  }
 }
 
 /* ===== 排除规则（只作用于「未查看」，不影响 torrent 下载） =====
@@ -2801,7 +2889,7 @@ function showEditDialog() {
   form.id = 'gmEditForm';
   form.style.cssText = 'display:flex;flex-direction:column;flex:1;min-height:0;';
   form.innerHTML = `
-        <h2 style="flex-shrink:0;">编辑数据<span class="info-icon" title="资源/规则列：@ 表示当前下集（1、2、10、101），@@ 表示补零两位（01、02、10、101）。
+        <h2 style="flex-shrink:0;">设置<span class="info-icon" title="资源/规则列：@ 表示当前下集（1、2、10、101），@@ 表示补零两位（01、02、10、101）。
 资源列：规则为链接时填“与播出时间的 delta”，格式 DHHMM（5 位：D天 HH时 MM分）。例 00030=+30 分钟、10200=+1 天 2 小时、00000=与播出同时；显示值＝播出时间＋delta。
 规则不是链接时，资源列直接填绝对时间 DHHMM（如 31200＝周三 12:00）。
 延日列：支持算式与函数，@ 表示当前下集数字。如 @*2、@+7、@-5；
@@ -2822,15 +2910,15 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     <div style="display:flex;gap:6px;flex-wrap:wrap;">
       <button type="submit">保存</button>
       <button type="button" id="gmEditCancel">关闭</button>
-      <button type="button" id="discardChangesBtn" style="color:#e88;">放弃更改</button>
+      <button type="button" id="discardChangesBtn" style="color:#e88;">放弃</button>
       <button type="button" id="addUnifiedRow">+ 添加</button>
       <button type="button" id="importTableBtn">导入</button>
       <button type="button" id="openResourceBtn">资源</button>
       <button type="button" id="openBgmBtn">BGM</button>
       <button type="button" id="openBgmIdLinkBtn">链接</button>
       <button type="button" id="deleteSelectedBtn" style="color:#e88;">删除</button>
-      <button type="button" id="resetBangumiUpdate" title="立即从 Bangumi 抓取更新，并把新条目刷新到表格">立即更新</button>
-      <button type="button" id="resetInferredTimes" title="立即重新匹配调度时间，并刷新表格显示">立即匹配</button>
+      <button type="button" id="resetBangumiUpdate" title="立即从 Bangumi 抓取更新，并把新条目刷新到表格">更新</button>
+      <button type="button" id="resetInferredTimes" title="立即重新匹配调度时间，并刷新表格显示">匹配</button>
       <button type="button" id="openAiredResourceBtn" title="打开所有播出时间已过、且有资源链接的条目">已播出</button>
     </div></h2>
 <div id="gmEditScroll" style="flex:1;min-height:0;min-width:0;overflow-y:auto;overflow-x:hidden;margin-top:6px;display:flex;flex-direction:column;">
@@ -3134,6 +3222,17 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   }
   function stopExcludePoll() {
     if (_excludePollTid) { clearInterval(_excludePollTid); _excludePollTid = null; }
+  }
+  /* 「更新 / 匹配」按钮的悬浮倒计时：面板开着时每秒刷新一次 */
+  let _autoTitleTid = null;
+  function startAutoTitleTimer() {
+    if (_autoTitleTid) return;
+    const tick = () => { try { updatePanelAutoTitles(dialog); } catch (e) { console.error('[panel] title', e); } };
+    tick();
+    _autoTitleTid = setInterval(tick, 1000);
+  }
+  function stopAutoTitleTimer() {
+    if (_autoTitleTid) { clearInterval(_autoTitleTid); _autoTitleTid = null; }
   }
   const host = dialog.querySelector('#unifiedTableHost');
   const _activeFloats = new Set();
@@ -3655,7 +3754,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
       refreshDialogTableDisplay();
       showToast('更新完成');
     } catch (e) {
-      console.error('立即更新失败', e);
+      console.error('更新失败', e);
       showToast('更新失败：' + (e && e.message || e));
     } finally {
       _updatingFromBangumi = false;
@@ -3679,7 +3778,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
       refreshDialogTableDisplay();
       showToast(`匹配完成：命中 ${Object.keys(more || {}).length} 条`);
     } catch (e) {
-      console.error('立即匹配失败', e);
+      console.error('匹配失败', e);
       showToast('匹配失败：' + (e && e.message || e));
     } finally {
       _matchingInferred = false;
@@ -6610,6 +6709,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     saveLastCellState();
     flushDraftSave();
     stopExcludePoll();
+    stopAutoTitleTimer();
     overlay.style.display = 'none';
     try { localStorage.setItem(PANEL_OPEN_KEY, '0'); } catch {}
     document.body.classList.remove('acgrip-split');
@@ -6643,6 +6743,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   _gmEditShow = () => {
     overlay.style.display = 'flex';
     startExcludePoll();
+    startAutoTitleTimer();
     try { localStorage.setItem(PANEL_OPEN_KEY, '1'); } catch {}
     document.removeEventListener('keydown', escKeyHandler, true);
     document.addEventListener('keydown', escKeyHandler, true);
@@ -6709,6 +6810,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   /* 供 cleanupStalePanel() 在面板被 SPA 导航丢弃后摘监听（重建时不会重复累积） */
   overlay._acgripDetach = () => {
     try { stopExcludePoll(); } catch {}
+    try { stopAutoTitleTimer(); } catch {}
     document.removeEventListener('keydown', escKeyHandler, true);
     document.removeEventListener('keydown', saveKeyHandler, true);
     window.removeEventListener('resize', layoutResizeHandler);

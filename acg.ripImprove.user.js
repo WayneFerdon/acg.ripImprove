@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.8.1
+// @version      1.8.2
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -3151,7 +3151,9 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
   /* 排序键：忽略开头的 \[...\]、【...】（如【喵萌奶茶屋】）以及左括号 / 转义左括号，
    * 让同名字幕组/同系列规则按真正的标题聚在一起；剥完仍相同再按原始字符串排。
    * 特例：开头的 (...) 里如果**整块**只是 [...] / 【...】 包着的组名（如 (\[C组\])、(【喵萌奶茶屋】)），
-   * 连同右括号一起忽略，否则会剩下一个孤零零的 `)`。 */
+   * 连同右括号一起忽略，否则会剩下一个孤零零的 `)`。
+   * 另：规则里的通配 `.*`/`.+`（含惰性 `.*?`）与空白符不参与排序比较，
+   * 让 `组名.*Apple` 与 `组名 Apple` 排在一起。 */
   function excludeSortKey(re) {
     let s = String(re ?? '');
     for (let i = 0; i < 8; i++) {
@@ -3160,6 +3162,7 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
       s = s.trim();
       if (s === before) break;
     }
+    s = s.replace(/\.[*+]\??/g, '').replace(/\s+/g, '');
     return toSimp(s);
   }
   function renderExcludeRuleTable(force = false) {

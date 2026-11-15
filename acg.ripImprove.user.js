@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.7.0
+// @version      1.7.1
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -3127,6 +3127,18 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     applyExcludeEdit();
     showToast('规则已更新');
   }
+  /* 排序键：忽略开头的 \[...\]、【...】（如【喵萌奶茶屋】）以及左括号 / 转义左括号，
+   * 让同名字幕组/同系列规则按真正的标题聚在一起；剥完仍相同再按原始字符串排。 */
+  function excludeSortKey(re) {
+    let s = String(re ?? '');
+    for (let i = 0; i < 8; i++) {
+      const before = s;
+      s = s.replace(/^(?:\\\[[\s\S]*?\\\]|【[\s\S]*?】|\[[\s\S]*?\]|\\\[|【|\\?\()/, '');
+      s = s.trim();
+      if (s === before) break;
+    }
+    return s;
+  }
   function renderExcludeRuleTable(force = false) {
     if (!excludeTbody || _excludeRendering) return;
     /* 正在这格里输入时不要重建（定时保存会触发刷新），否则光标和半截输入会丢 */
@@ -3135,7 +3147,11 @@ BGMID 列：显示层合并文本 + 链接（🔗），点单元格或 ✎ 进�
     _excludeSig = excludeStorageSig();
     try {
       const list = (loadExcludes() || []).slice()
-        .sort((a, b) => (a.re < b.re ? -1 : a.re > b.re ? 1 : 0));
+        .sort((a, b) => {
+          const ka = excludeSortKey(a.re), kb = excludeSortKey(b.re);
+          if (ka !== kb) return ka < kb ? -1 : 1;
+          return a.re < b.re ? -1 : a.re > b.re ? 1 : 0;
+        });
       excludeTbody.textContent = '';
       excludeTbody.appendChild(buildExcludeAddRow());
       if (!list.length) return;

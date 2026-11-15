@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         acg.ripImprove
 // @namespace    http://tampermonkey.net/
-// @version      1.8.2
+// @version      1.8.3
 // @description  acg.rip torrent auto download（记录列支持外部脚本推送的只读备注；外部脚本更新下集时按“已保存”刷新面板并重新排序；Bangumi 同步只认首页「在看」模块；新增排除规则（⊘ 开关：数字转 \d+、仅作用于「未查看」、再点即取消并 24 小时后删记录、180 天未命中自动失效；仅区间内变暗，未查看边界最旧一条标浅蓝））
 // @author       WayneFerdon
 // @include      *acg.rip*
@@ -607,6 +607,8 @@ function onHandle() {
     return;
   }
   if (window.location.href.replace('page/1', '').endsWith('.rip/')) {
+    /* 绿色「上次已查看」标识的条目被删时移到最新一条（仅最新列表页可判定） */
+    try { if (syncDeletedLastMarker()) onHandleItems(setDisplayHighlight); } catch (e) { console.error('[标识] 删除同步失败', e); }
     autoUpdateFromBangumi().catch(e => console.error(e));
     autoUpdateQuarter().catch(e => console.error(e));
     asyncDownloadTorrents();
@@ -949,6 +951,30 @@ function syncViewedBoundary() {
   updateViewedButton();
   console.log(`[未查看] 边界后移 ${advanced} 条 → ${next}`);
   return advanced;
+}
+
+/* 绿色「上次已查看」标识（lastData.id）指向的条目被站点删除时：
+ * 最新列表页（首页 / page=1）上最大的条目 id 都小于它 → 该条必然已不存在，
+ * 把标识移到当前最新一条，避免绿行凭空消失。返回是否移动。
+ * 只在最新列表页判定：翻页页上 id 小于标识不代表条目被删。 */
+function syncDeletedLastMarker() {
+  if (!IS_ACGRIP_PAGE || last == null) return false;
+  const lastN = url2num(last);
+  if (!Number.isFinite(lastN) || lastN <= 0) return false;
+  let newest, newestN = -Infinity;
+  for (const tr of gE('tr', 'all')) {
+    const a = gE('.title .title a', tr);
+    if (!a) continue;
+    const href = a.getAttribute('href');
+    const n = url2num(href);
+    if (!Number.isFinite(n) || n <= 0) continue;
+    if (n > newestN) { newestN = n; newest = href; }
+  }
+  if (newest === undefined || newestN >= lastN) return false;
+  last = newest;
+  saveLastData();
+  console.log(`[标识] 上次已查看条目已不存在（最新 id ${newestN} < ${lastN}），绿色标识移至最新一条`);
+  return true;
 }
 
 /* 该条是否还在「未查看」区间（早于/等于最旧未查看的条目一律按已查看处理） */
